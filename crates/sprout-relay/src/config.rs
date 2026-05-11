@@ -11,6 +11,9 @@ pub enum ConfigError {
     /// The `SPROUT_BIND_ADDR` environment variable could not be parsed as a socket address.
     #[error("invalid SPROUT_BIND_ADDR: {0}")]
     InvalidBindAddr(String),
+    /// A configuration value failed validation.
+    #[error("invalid config: {0}")]
+    InvalidValue(String),
 }
 
 /// Relay runtime configuration, loaded from environment variables.
@@ -54,11 +57,37 @@ pub struct Config {
     /// TCP port for the Prometheus metrics exporter (`GET /metrics`).
     pub metrics_port: u16,
 
-    /// When true, NIP-42 pubkey-only authentication (no JWT or API token) is
+    /// When true, NIP-42 pubkey-only authentication (no API token) is
     /// restricted to pubkeys in the `pubkey_allowlist` table. Users with valid
-    /// API tokens or Okta JWTs bypass the allowlist entirely.
+    /// API tokens bypass the allowlist entirely.
     /// Applies to all NIP-42 pubkey-only connections, regardless of `require_auth_token`.
     pub pubkey_allowlist_enabled: bool,
+
+    /// When true, every authenticated request must also pass a relay-level
+    /// membership check against the `relay_members` table.
+    /// When false (default), the check is a no-op and all authenticated callers
+    /// are permitted regardless of auth method (API token, NIP-42).
+    pub require_relay_membership: bool,
+
+    /// Optional hex-encoded pubkey of the relay owner.
+    /// When set, this pubkey is automatically bootstrapped into `relay_members`
+    /// with the `owner` role on first startup.
+    pub relay_owner_pubkey: Option<String>,
+
+    /// Allow NIP-OA owner attestation for relay membership.
+    ///
+    /// When `true` and `require_relay_membership` is also `true`, agents
+    /// bearing a valid NIP-OA `auth` tag can authenticate by proving their
+    /// owner is a relay member. The agent gets session-scoped access.
+    ///
+    /// On open relays (`require_relay_membership = false`), NIP-OA owner
+    /// extraction for agent→owner backfill happens unconditionally (the
+    /// signature is cryptographically self-proving). This flag only controls
+    /// whether NIP-OA can grant membership access on closed relays.
+    ///
+    /// Default: `false`. Set via `SPROUT_ALLOW_NIP_OA_AUTH=true`.
+    pub allow_nip_oa_auth: bool,
+
     /// Media storage configuration (S3/MinIO).
     pub media: sprout_media::MediaConfig,
 
@@ -68,6 +97,26 @@ pub struct Config {
     /// Example: `SPROUT_EPHEMERAL_TTL_OVERRIDE=60` → all ephemeral channels expire
     /// 60 seconds after the last message.
     pub ephemeral_ttl_override: Option<i32>,
+
+    // ── Git server configuration ─────────────────────────────────────────────
+    /// Root directory for bare git repositories.
+    /// Repos are stored at `{git_repo_path}/{owner_hex}/{repo_id}.git/`.
+    pub git_repo_path: std::path::PathBuf,
+    /// Maximum pack file size for git push (bytes). Default: 500 MB.
+    pub git_max_pack_bytes: u64,
+    /// Maximum number of repos per pubkey. Default: 100.
+    pub git_max_repos_per_pubkey: u32,
+    /// Maximum concurrent git subprocess operations. Default: 20.
+    pub git_max_concurrent_ops: usize,
+    /// HMAC secret for git pre-receive hook callbacks.
+    /// Used to authenticate internal policy endpoint requests.
+    pub git_hook_hmac_secret: String,
+
+    // ── Web UI serving ────────────────────────────────────────────────────────
+    /// Optional path to the web UI `dist/` directory.
+    /// When set, the relay serves the SPA from this directory for browser requests.
+    /// When unset, no static file serving happens (relay behaves as before).
+    pub web_dir: Option<std::path::PathBuf>,
 }
 
 impl Config {
@@ -116,18 +165,35 @@ impl Config {
             .map(|v| v == "true" || v == "1")
             .unwrap_or(false);
 
-        let mut auth = sprout_auth::AuthConfig::default();
-        auth.okta.require_token = require_auth_token;
+        let require_relay_membership = std::env::var("SPROUT_REQUIRE_RELAY_MEMBERSHIP")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
 
-        if let Ok(issuer) = std::env::var("OKTA_ISSUER") {
-            auth.okta.issuer = issuer;
-        }
-        if let Ok(audience) = std::env::var("OKTA_AUDIENCE") {
-            auth.okta.audience = audience;
-        }
-        if let Ok(jwks_uri) = std::env::var("OKTA_JWKS_URI") {
-            auth.okta.jwks_uri = jwks_uri;
-        }
+        let allow_nip_oa_auth = std::env::var("SPROUT_ALLOW_NIP_OA_AUTH")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false);
+
+        // Note: intentionally not prefixed with SPROUT_ — this is a relay-identity
+        // config that may be shared across multiple services (e.g., ACP agent).
+        let relay_owner_pubkey = std::env::var("RELAY_OWNER_PUBKEY")
+            .ok()
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .and_then(|s| {
+                // Must be exactly 64 lowercase hex characters (32-byte pubkey).
+                let valid = s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit());
+                if valid {
+                    Some(s)
+                } else {
+                    warn!(
+                        "RELAY_OWNER_PUBKEY is not a valid 64-char hex pubkey — ignoring. \
+                         Got: {s:?}"
+                    );
+                    None
+                }
+            });
+
+        let auth = sprout_auth::AuthConfig::default();
 
         if !require_auth_token {
             warn!(
@@ -217,6 +283,58 @@ impl Config {
             );
         }
 
+        // Git server config
+        let git_repo_path: std::path::PathBuf = std::env::var("SPROUT_GIT_REPO_PATH")
+            .unwrap_or_else(|_| "./repos".to_string())
+            .into();
+        let git_max_pack_bytes: u64 = std::env::var("SPROUT_GIT_MAX_PACK_BYTES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(500 * 1024 * 1024); // 500 MB
+        let git_max_repos_per_pubkey: u32 = std::env::var("SPROUT_GIT_MAX_REPOS_PER_PUBKEY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100);
+        let git_max_concurrent_ops: usize = std::env::var("SPROUT_GIT_MAX_CONCURRENT_OPS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(20);
+        let git_hook_hmac_secret: String = std::env::var("SPROUT_GIT_HOOK_HMAC_SECRET")
+            .unwrap_or_else(|_| {
+                // Generate a random secret if not configured (dev mode).
+                let secret: [u8; 32] = rand::random();
+                hex::encode(secret)
+            });
+        // Web UI static file serving
+        let web_dir = std::env::var("SPROUT_WEB_DIR")
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+
+        if let Some(ref dir) = web_dir {
+            if !dir.join("index.html").is_file() {
+                return Err(ConfigError::InvalidValue(format!(
+                    "SPROUT_WEB_DIR={} does not contain index.html",
+                    dir.display()
+                )));
+            }
+            tracing::info!(
+                "SPROUT_WEB_DIR={} — serving web UI from relay",
+                dir.display()
+            );
+        }
+
+        // Reject explicitly-configured secrets that are too short.
+        // The auto-generated fallback is always 64 hex chars (32 bytes), so this
+        // only fires when someone sets SPROUT_GIT_HOOK_HMAC_SECRET to a weak value.
+        if std::env::var("SPROUT_GIT_HOOK_HMAC_SECRET").is_ok() && git_hook_hmac_secret.len() < 32 {
+            return Err(ConfigError::InvalidValue(
+                "SPROUT_GIT_HOOK_HMAC_SECRET must be at least 32 characters (16 bytes hex)"
+                    .to_string(),
+            ));
+        }
+
         Ok(Self {
             bind_addr,
             database_url,
@@ -235,8 +353,17 @@ impl Config {
             health_port,
             metrics_port,
             pubkey_allowlist_enabled,
+            require_relay_membership,
+            relay_owner_pubkey,
+            allow_nip_oa_auth,
             media,
             ephemeral_ttl_override,
+            git_repo_path,
+            git_max_pack_bytes,
+            git_max_repos_per_pubkey,
+            git_max_concurrent_ops,
+            git_hook_hmac_secret,
+            web_dir,
         })
     }
 }
@@ -262,6 +389,18 @@ mod tests {
         assert!(
             !config.pubkey_allowlist_enabled,
             "pubkey_allowlist_enabled should default to false"
+        );
+        assert!(
+            !config.require_relay_membership,
+            "require_relay_membership should default to false"
+        );
+        assert!(
+            config.relay_owner_pubkey.is_none(),
+            "relay_owner_pubkey should default to None"
+        );
+        assert!(
+            !config.allow_nip_oa_auth,
+            "allow_nip_oa_auth should default to false"
         );
     }
 

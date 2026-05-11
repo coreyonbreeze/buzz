@@ -1,3 +1,5 @@
+import { isMacPlatform } from "@/shared/lib/platform";
+
 export type ShortcutCategory =
   | "Navigation"
   | "Messages"
@@ -61,6 +63,14 @@ export const KEYBOARD_SHORTCUTS: KeyboardShortcut[] = [
     description: "Navigate to the next page",
     keys: "⌘]",
     keysWindows: "Alt+→",
+    category: "Navigation",
+  },
+  {
+    id: "find-in-channel",
+    label: "Find in channel",
+    description: "Search messages in current channel",
+    keys: "⌘F",
+    keysWindows: "Ctrl+F",
     category: "Navigation",
   },
   {
@@ -212,10 +222,6 @@ export function getShortcutsByCategory(): Map<
   return map;
 }
 
-function isMac(): boolean {
-  return /mac|iphone|ipad|ipod/i.test(navigator.platform);
-}
-
 export function getPlatformKeys(shortcut: KeyboardShortcut): string {
-  return isMac() ? shortcut.keys : shortcut.keysWindows;
+  return isMacPlatform() ? shortcut.keys : shortcut.keysWindows;
 }

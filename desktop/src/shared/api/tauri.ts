@@ -14,12 +14,11 @@ import type {
   GetHomeFeedInput,
   HomeFeedResponse,
   Identity,
-  MintTokenInput,
-  MintTokenResponse,
-  MintManagedAgentTokenInput,
   ManagedAgent,
   ManagedAgentBackend,
   RelayAgent,
+  RelayMember,
+  RelayMemberRole,
   PresenceLookup,
   PresenceStatus,
   Profile,
@@ -32,8 +31,6 @@ import type {
   SetPresenceResult,
   SetChannelPurposeInput,
   SetChannelTopicInput,
-  Token,
-  TokenScope,
   UpdateProfileInput,
   UpdateChannelInput,
   UserProfileSummary,
@@ -148,6 +145,7 @@ type RawFeedItem = {
   created_at: number;
   channel_id: string | null;
   channel_name: string;
+  channel_type: string;
   tags: string[][];
   category: "mention" | "needs_action" | "activity" | "agent_activity";
 };
@@ -190,31 +188,6 @@ type RawSendChannelMessageResult = {
   created_at: number;
 };
 
-type RawToken = {
-  id: string;
-  name: string;
-  scopes: TokenScope[];
-  channel_ids: string[];
-  created_at: string;
-  expires_at: string | null;
-  last_used_at: string | null;
-  revoked_at: string | null;
-};
-
-type RawListTokensResponse = {
-  tokens: RawToken[];
-};
-
-type RawMintTokenResponse = {
-  id: string;
-  token: string;
-  name: string;
-  scopes: TokenScope[];
-  channel_ids: string[];
-  created_at: string;
-  expires_at: string | null;
-};
-
 type RawRelayAgent = {
   pubkey: string;
   name: string;
@@ -241,7 +214,6 @@ export type RawManagedAgent = {
   system_prompt: string | null;
   model: string | null;
   mcp_toolsets: string | null;
-  has_api_token: boolean;
   status: ManagedAgent["status"];
   pid: number | null;
   created_at: string;
@@ -259,14 +231,8 @@ export type RawManagedAgent = {
 type RawCreateManagedAgentResponse = {
   agent: RawManagedAgent;
   private_key_nsec: string;
-  api_token: string | null;
   profile_sync_error: string | null;
   spawn_error: string | null;
-};
-
-type RawMintManagedAgentTokenResponse = {
-  agent: RawManagedAgent;
-  token: string;
 };
 
 type RawManagedAgentLog = {
@@ -291,6 +257,17 @@ type RawCommandAvailability = {
 type RawManagedAgentPrereqs = {
   acp: RawCommandAvailability;
   mcp: RawCommandAvailability;
+};
+
+type RawRelayMember = {
+  pubkey: string;
+  role: string;
+  added_by: string | null;
+  created_at: string;
+};
+
+type RawListRelayMembersResponse = {
+  members: RawRelayMember[];
 };
 
 type RawCanvasResponse = {
@@ -394,6 +371,7 @@ function fromRawFeedItem(item: RawFeedItem) {
     createdAt: item.created_at,
     channelId: item.channel_id,
     channelName: item.channel_name,
+    channelType: item.channel_type,
     tags: item.tags,
     category: item.category,
   };
@@ -452,6 +430,11 @@ export async function getIdentity(): Promise<Identity> {
 
 export async function getNsec(): Promise<string> {
   return invokeTauri<string>("get_nsec");
+}
+
+export async function importIdentity(nsec: string): Promise<Identity> {
+  const raw = await invokeTauri<RawIdentity>("import_identity", { nsec });
+  return { pubkey: raw.pubkey, displayName: raw.display_name };
 }
 
 export async function getProfile(): Promise<Profile> {
@@ -524,6 +507,10 @@ export async function setPresence(
     status: response.status,
     ttlSeconds: response.ttl_seconds,
   };
+}
+
+export function getDefaultRelayUrl(): Promise<string> {
+  return invokeTauri<string>("get_default_relay_url");
 }
 
 export function getRelayWsUrl(): Promise<string> {
@@ -681,10 +668,11 @@ export async function getHomeFeed(
 export async function searchMessages(
   input: SearchMessagesInput,
 ): Promise<SearchMessagesResponse> {
-  const response = await invokeTauri<RawSearchResponse>(
-    "search_messages",
-    input,
-  );
+  const response = await invokeTauri<RawSearchResponse>("search_messages", {
+    q: input.q,
+    limit: input.limit,
+    channelId: input.channelId,
+  });
 
   return {
     hits: response.hits.map(fromRawSearchHit),
@@ -788,6 +776,7 @@ export async function removeReaction(
 export async function signRelayEvent(input: {
   kind: number;
   content: string;
+  createdAt?: number;
   tags: string[][];
 }): Promise<RelayEvent> {
   const eventJson = await invokeTauri<string>("sign_event", input);
@@ -800,19 +789,6 @@ export async function createAuthEvent(input: {
 }): Promise<RelayEvent> {
   const eventJson = await invokeTauri<string>("create_auth_event", input);
   return JSON.parse(eventJson) as RelayEvent;
-}
-
-function fromRawToken(token: RawToken): Token {
-  return {
-    id: token.id,
-    name: token.name,
-    scopes: token.scopes,
-    channelIds: token.channel_ids,
-    createdAt: token.created_at,
-    expiresAt: token.expires_at,
-    lastUsedAt: token.last_used_at,
-    revokedAt: token.revoked_at,
-  };
 }
 
 function fromRawRelayAgent(agent: RawRelayAgent): RelayAgent {
@@ -844,7 +820,6 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
     systemPrompt: agent.system_prompt,
     model: agent.model,
     mcpToolsets: agent.mcp_toolsets,
-    hasApiToken: agent.has_api_token,
     status: agent.status,
     pid: agent.pid,
     createdAt: agent.created_at,
@@ -880,40 +855,57 @@ function fromRawCommandAvailability(
   };
 }
 
-export async function listTokens(): Promise<Token[]> {
-  const response = await invokeTauri<RawListTokensResponse>("list_tokens");
-  return response.tokens.map(fromRawToken);
-}
+// ── Relay Members ────────────────────────────────────────────────────────────
 
-export async function mintToken(
-  input: MintTokenInput,
-): Promise<MintTokenResponse> {
-  const response = await invokeTauri<RawMintTokenResponse>("mint_token", {
-    name: input.name,
-    scopes: input.scopes,
-    channelIds: input.channelIds,
-    expiresInDays: input.expiresInDays,
-  });
+function fromRawRelayMember(raw: RawRelayMember): RelayMember {
   return {
-    id: response.id,
-    token: response.token,
-    name: response.name,
-    scopes: response.scopes,
-    channelIds: response.channel_ids,
-    createdAt: response.created_at,
-    expiresAt: response.expires_at,
+    pubkey: raw.pubkey,
+    role: raw.role as RelayMemberRole,
+    addedBy: raw.added_by,
+    createdAt: raw.created_at,
   };
 }
 
-export async function revokeToken(tokenId: string): Promise<void> {
-  await invokeTauri("revoke_token", { tokenId });
+export async function listRelayMembers(): Promise<RelayMember[]> {
+  const response =
+    await invokeTauri<RawListRelayMembersResponse>("list_relay_members");
+  return response.members.map(fromRawRelayMember);
 }
 
-export async function revokeAllTokens(): Promise<{ revokedCount: number }> {
-  const response = await invokeTauri<{ revoked_count: number }>(
-    "revoke_all_tokens",
-  );
-  return { revokedCount: response.revoked_count };
+export async function getMyRelayMembership(): Promise<RelayMember | null> {
+  try {
+    const raw = await invokeTauri<RawRelayMember>("get_my_relay_membership");
+    return fromRawRelayMember(raw);
+  } catch (error) {
+    // "relay returned 404 Not Found" = not a relay member — return null so
+    // the UI hides the Members tab. Re-throw real errors (network, auth, 500)
+    // so React Query surfaces them.
+    if (
+      error instanceof Error &&
+      error.message.startsWith("relay returned 404")
+    ) {
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function addRelayMember(
+  targetPubkey: string,
+  role: string,
+): Promise<void> {
+  await invokeTauri("add_relay_member", { targetPubkey, role });
+}
+
+export async function removeRelayMember(targetPubkey: string): Promise<void> {
+  await invokeTauri("remove_relay_member", { targetPubkey });
+}
+
+export async function changeRelayMemberRole(
+  targetPubkey: string,
+  newRole: string,
+): Promise<void> {
+  await invokeTauri("change_relay_member_role", { targetPubkey, newRole });
 }
 
 export async function listRelayAgents(): Promise<RelayAgent[]> {
@@ -948,9 +940,6 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
         systemPrompt: input.systemPrompt,
         avatarUrl: input.avatarUrl,
         model: input.model,
-        mintToken: input.mintToken,
-        tokenScopes: input.tokenScopes,
-        tokenName: input.tokenName,
         spawnAfterCreate: input.spawnAfterCreate,
         startOnAppLaunch: input.startOnAppLaunch,
         backend: input.backend,
@@ -961,7 +950,6 @@ export async function createManagedAgent(input: CreateManagedAgentInput) {
   return {
     agent: fromRawManagedAgent(response.agent),
     privateKeyNsec: response.private_key_nsec,
-    apiToken: response.api_token,
     profileSyncError: response.profile_sync_error,
     spawnError: response.spawn_error,
   };
@@ -989,24 +977,6 @@ export async function deleteManagedAgent(
     pubkey,
     forceRemoteDelete: forceRemoteDelete ?? null,
   });
-}
-
-export async function mintManagedAgentToken(input: MintManagedAgentTokenInput) {
-  const response = await invokeTauri<RawMintManagedAgentTokenResponse>(
-    "mint_managed_agent_token",
-    {
-      input: {
-        pubkey: input.pubkey,
-        tokenName: input.tokenName,
-        scopes: input.scopes,
-      },
-    },
-  );
-
-  return {
-    agent: fromRawManagedAgent(response.agent),
-    token: response.token,
-  };
 }
 
 export async function getManagedAgentLog(pubkey: string, lineCount?: number) {
@@ -1090,6 +1060,18 @@ export async function probeBackendProvider(
   });
 }
 
+// ── NIP-44 encrypt-to-self ───────────────────────────────────────────────────
+
+export async function nip44EncryptToSelf(plaintext: string): Promise<string> {
+  return invokeTauri<string>("nip44_encrypt_to_self", { plaintext });
+}
+
+export async function nip44DecryptFromSelf(
+  ciphertext: string,
+): Promise<string> {
+  return invokeTauri<string>("nip44_decrypt_from_self", { ciphertext });
+}
+
 // ── NIP-AB device pairing ───────────────────────────────────────────────────
 
 export async function startPairing(): Promise<string> {
@@ -1103,3 +1085,18 @@ export async function confirmPairingSas(): Promise<void> {
 export async function cancelPairing(): Promise<void> {
   await invokeTauri("cancel_pairing");
 }
+
+export async function applyWorkspace(
+  relayUrl: string,
+  nsec?: string,
+  token?: string,
+): Promise<void> {
+  await invokeTauri("apply_workspace", {
+    relayUrl,
+    nsec: nsec ?? null,
+    token: token ?? null,
+  });
+}
+
+export const setPreventSleepActive = (active: boolean) =>
+  invokeTauri("set_prevent_sleep_active", { active });

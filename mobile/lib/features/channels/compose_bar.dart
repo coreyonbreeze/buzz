@@ -9,7 +9,10 @@ import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
 import '../profile/user_cache_provider.dart';
 import '../profile/user_profile.dart';
+import 'channel.dart';
 import 'channel_management_provider.dart';
+import 'channels_provider.dart';
+import 'emoji_picker.dart';
 
 /// Rich compose bar with @mention autocomplete, emoji picker, and a markdown
 /// formatting toolbar. Used in both channel and thread views — the caller
@@ -64,9 +67,25 @@ class ComposeBar extends HookConsumerWidget {
     // Used to pass resolved pubkeys directly to onSend, avoiding regex.
     final mentionMap = useRef(<String, String>{});
 
+    // Channel autocomplete state ----------------------------------------------
+    final channelQuery = useState<String?>(null);
+    final channelStartIdx = useState(-1);
+    final channelsAsync = ref.watch(channelsProvider);
+
     final membersAsync = ref.watch(channelMembersProvider(channelId));
     final currentPubkey = ref.watch(currentPubkeyProvider);
     final userCache = ref.watch(userCacheProvider);
+
+    // Preload profiles for channel members so @mention suggestions show names.
+    useEffect(() {
+      final memberList = membersAsync.asData?.value ?? <ChannelMember>[];
+      if (memberList.isNotEmpty) {
+        ref
+            .read(userCacheProvider.notifier)
+            .preload(memberList.map((m) => m.pubkey).toList());
+      }
+      return null;
+    }, [membersAsync.asData?.value.length]);
 
     // Typing indicator broadcast — throttled to one event per 3 seconds.
     final lastTypingSentMs = useRef(0);
@@ -93,32 +112,41 @@ class ComposeBar extends HookConsumerWidget {
 
         if (!sel.isValid || !sel.isCollapsed) {
           mentionQuery.value = null;
+          channelQuery.value = null;
           return;
         }
         final cursor = sel.baseOffset;
         if (cursor < 1) {
           mentionQuery.value = null;
+          channelQuery.value = null;
           return;
         }
 
-        // Walk backward from cursor looking for a bare `@` at a word boundary.
-        int? atPos;
-        for (var i = cursor - 1; i >= 0; i--) {
-          final ch = text[i];
-          if (ch == '\n') break;
-          if (ch == '@') {
-            if (i == 0 || text[i - 1] == ' ' || text[i - 1] == '\n') {
-              atPos = i;
-            }
-            break;
-          }
-        }
+        // Walk backward from cursor looking for trigger characters.
+        // stopAtSpace: false — @mentions support multi-word display names.
+        final atPos = findTrigger(text, cursor, '@', stopAtSpace: false);
 
         if (atPos != null) {
           mentionQuery.value = text.substring(atPos + 1, cursor).toLowerCase();
           mentionStartIdx.value = atPos;
+          channelQuery.value = null;
         } else {
           mentionQuery.value = null;
+        }
+
+        // Channel autocomplete detection — only when no @mention is active.
+        if (mentionQuery.value == null) {
+          final hashPos = findTrigger(text, cursor, '#');
+          if (hashPos != null) {
+            channelQuery.value = text
+                .substring(hashPos + 1, cursor)
+                .toLowerCase();
+            channelStartIdx.value = hashPos;
+          } else {
+            channelQuery.value = null;
+          }
+        } else {
+          channelQuery.value = null;
         }
       }
 
@@ -132,60 +160,56 @@ class ComposeBar extends HookConsumerWidget {
       members,
       mentionQuery.value,
       currentPubkey,
+      userCache,
     );
+
+    // Filter channels against the query.
+    final channels = channelsAsync.asData?.value ?? <Channel>[];
+    final channelSuggestions = filterChannels(channels, channelQuery.value);
 
     // Insert a selected mention into the text field.
     void insertMention(ChannelMember member) {
-      final name = member.displayName?.trim().isNotEmpty == true
-          ? member.displayName!.trim()
-          : member.pubkey.substring(0, 8);
-      final text = controller.text;
-      // Clamp indices to text bounds to guard against stale state.
-      final start = mentionStartIdx.value.clamp(0, text.length);
-      final cursor =
-          (controller.selection.isValid
-                  ? controller.selection.baseOffset
-                  : text.length)
-              .clamp(start, text.length);
-
-      final before = text.substring(0, start);
-      final after = text.substring(cursor);
-      final mention = '@$name ';
-
+      final cached = ref.read(userCacheProvider)[member.pubkey.toLowerCase()];
+      final name = cached?.displayName?.trim().isNotEmpty == true
+          ? cached!.displayName!.trim()
+          : '${member.pubkey.substring(0, 8)}\u2026';
       // Track the resolved pubkey so we can pass it at send time.
       mentionMap.value[name] = member.pubkey;
 
-      controller.text = '$before$mention$after';
-      controller.selection = TextSelection.collapsed(
-        offset: start + mention.length,
+      final start = mentionStartIdx.value.clamp(0, controller.text.length);
+      spliceAndMoveCursor(
+        controller,
+        focusNode,
+        start: start,
+        replacement: '@$name ',
       );
       mentionQuery.value = null;
-      focusNode.requestFocus();
+    }
+
+    // Insert a selected channel into the text field.
+    void insertChannel(Channel channel) {
+      final start = channelStartIdx.value.clamp(0, controller.text.length);
+      spliceAndMoveCursor(
+        controller,
+        focusNode,
+        start: start,
+        replacement: '#${channel.name} ',
+      );
+      channelQuery.value = null;
     }
 
     // Insert `@` at the cursor to manually trigger mention mode.
-    void triggerMention() {
-      final text = controller.text;
-      final cursor = controller.selection.isValid
-          ? controller.selection.baseOffset
-          : text.length;
-      final needsSpace =
-          cursor > 0 && text[cursor - 1] != ' ' && text[cursor - 1] != '\n';
-      final insert = needsSpace ? ' @' : '@';
-      final before = text.substring(0, cursor);
-      final after = text.substring(cursor);
-      controller.text = '$before$insert$after';
-      controller.selection = TextSelection.collapsed(
-        offset: cursor + insert.length,
-      );
-      focusNode.requestFocus();
-    }
+    void triggerMention() => _insertTriggerAtCursor(controller, focusNode, '@');
+
+    // Insert `#` at the cursor to manually trigger channel mode.
+    void triggerChannel() => _insertTriggerAtCursor(controller, focusNode, '#');
 
     void clearComposer() {
       controller.clear();
       attachments.value = [];
       mentionMap.value.clear();
       mentionQuery.value = null;
+      channelQuery.value = null;
       showFormatting.value = false;
       uploadError.value = null;
       focusNode.requestFocus();
@@ -226,13 +250,11 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    Future<void> pickAndUploadAttachment() async {
+    Future<void> pickAndUpload(Future<BlobDescriptor?> Function() pick) async {
       uploadError.value = null;
       uploadingCount.value += 1;
       try {
-        final uploaded = await ref
-            .read(mediaUploadServiceProvider)
-            .pickAndUploadImage();
+        final uploaded = await pick();
         if (uploaded != null && context.mounted) {
           attachments.value = [...attachments.value, uploaded];
         }
@@ -291,9 +313,19 @@ class ComposeBar extends HookConsumerWidget {
 
     // ----- Widget tree ----------------------------------------------------
 
+    final hasSuggestions =
+        suggestions.isNotEmpty || channelSuggestions.isNotEmpty;
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
+        // Channel suggestions (above the compose chrome).
+        if (channelSuggestions.isNotEmpty)
+          _ChannelSuggestions(
+            suggestions: channelSuggestions,
+            onSelect: insertChannel,
+          ),
+
         // Mention suggestions (above the compose chrome).
         if (suggestions.isNotEmpty)
           _MentionSuggestions(
@@ -307,12 +339,12 @@ class ComposeBar extends HookConsumerWidget {
         Container(
           decoration: BoxDecoration(
             color: context.colors.surfaceContainerHighest,
-            borderRadius: suggestions.isEmpty
+            borderRadius: !hasSuggestions
                 ? const BorderRadius.vertical(
                     top: Radius.circular(Radii.dialog),
                   )
                 : BorderRadius.zero,
-            boxShadow: suggestions.isEmpty
+            boxShadow: !hasSuggestions
                 ? [
                     BoxShadow(
                       color: context.colors.shadow.withValues(alpha: 0.08),
@@ -389,11 +421,47 @@ class ComposeBar extends HookConsumerWidget {
                 children: [
                   _ComposeAction(
                     icon: LucideIcons.paperclip,
-                    onTap: pickAndUploadAttachment,
+                    onTap: () {
+                      showModalBottomSheet<void>(
+                        context: context,
+                        showDragHandle: true,
+                        builder: (sheetContext) => SafeArea(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              ListTile(
+                                leading: const Icon(LucideIcons.image),
+                                title: const Text('Photo'),
+                                onTap: () {
+                                  Navigator.of(sheetContext).pop();
+                                  pickAndUpload(
+                                    ref
+                                        .read(mediaUploadServiceProvider)
+                                        .pickAndUploadImage,
+                                  );
+                                },
+                              ),
+                              ListTile(
+                                leading: const Icon(LucideIcons.video),
+                                title: const Text('Video'),
+                                onTap: () {
+                                  Navigator.of(sheetContext).pop();
+                                  pickAndUpload(
+                                    ref
+                                        .read(mediaUploadServiceProvider)
+                                        .pickAndUploadVideo,
+                                  );
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      );
+                    },
                   ),
                   _ComposeAction(
                     icon: LucideIcons.smilePlus,
-                    onTap: () => _showEmojiPicker(
+                    onTap: () => showEmojiPicker(
                       context: context,
                       onSelect: insertEmoji,
                     ),
@@ -402,6 +470,7 @@ class ComposeBar extends HookConsumerWidget {
                     icon: LucideIcons.atSign,
                     onTap: triggerMention,
                   ),
+                  _ComposeAction(icon: LucideIcons.hash, onTap: triggerChannel),
                   _ComposeAction(
                     icon: LucideIcons.aLargeSmall,
                     active: showFormatting.value,
@@ -428,6 +497,84 @@ class ComposeBar extends HookConsumerWidget {
 // ---------------------------------------------------------------------------
 
 const _typingThrottleMs = 3000;
+
+/// Walk backward from [cursor] looking for [trigger] (e.g. `@` or `#`) at a
+/// word boundary. Returns the index of the trigger character, or `null` if none
+/// is found.
+///
+/// When [stopAtSpace] is `true` the walk stops at both spaces and newlines —
+/// appropriate for `#channel` names which are kebab-case slugs without spaces.
+/// When `false`, only newlines stop the walk, allowing multi-word queries like
+/// `@Alice Smith` to match members with multi-word display names.
+@visibleForTesting
+int? findTrigger(
+  String text,
+  int cursor,
+  String trigger, {
+  bool stopAtSpace = true,
+}) {
+  for (var i = cursor - 1; i >= 0; i--) {
+    final ch = text[i];
+    if (ch == '\n') break;
+    if (stopAtSpace && ch == ' ') break;
+    if (ch == trigger) {
+      if (i == 0 || text[i - 1] == ' ' || text[i - 1] == '\n') {
+        return i;
+      }
+      break;
+    }
+  }
+  return null;
+}
+
+/// Replace the range `[start, cursor)` with [replacement] and move the cursor
+/// to the end of the replacement. Used by both mention and channel insertion.
+@visibleForTesting
+void spliceAndMoveCursor(
+  TextEditingController controller,
+  FocusNode focusNode, {
+  required int start,
+  required String replacement,
+}) {
+  final text = controller.text;
+  final cursor =
+      (controller.selection.isValid
+              ? controller.selection.baseOffset
+              : text.length)
+          .clamp(start, text.length);
+
+  final before = text.substring(0, start);
+  final after = text.substring(cursor);
+  controller.text = '$before$replacement$after';
+  controller.selection = TextSelection.collapsed(
+    offset: start + replacement.length,
+  );
+  focusNode.requestFocus();
+}
+
+/// Insert [trigger] (e.g. `@` or `#`) at the cursor position, prefixed with
+/// a space if needed for word separation. Used by `triggerMention` and
+/// `triggerChannel`.
+void _insertTriggerAtCursor(
+  TextEditingController controller,
+  FocusNode focusNode,
+  String trigger,
+) {
+  final text = controller.text;
+  final cursor = controller.selection.isValid
+      ? controller.selection.baseOffset
+      : text.length;
+  final needsSpace =
+      cursor > 0 && text[cursor - 1] != ' ' && text[cursor - 1] != '\n';
+  final insert = needsSpace ? ' $trigger' : trigger;
+  final before = text.substring(0, cursor);
+  final after = text.substring(cursor);
+  controller.text = '$before$insert$after';
+  controller.selection = TextSelection.collapsed(
+    offset: cursor + insert.length,
+  );
+  focusNode.requestFocus();
+}
 
 /// Send a typing indicator over the WebSocket (fire-and-forget).
 ///
@@ -475,304 +622,6 @@ void _sendTypingIndicator(
 }
 
 // ---------------------------------------------------------------------------
-// Emoji picker
-// ---------------------------------------------------------------------------
-
-void _showEmojiPicker({
-  required BuildContext context,
-  required void Function(String emoji) onSelect,
-}) {
-  showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    backgroundColor: Theme.of(context).colorScheme.surfaceContainerHighest,
-    builder: (sheetContext) => _EmojiPickerSheet(
-      onSelect: (emoji) {
-        Navigator.of(sheetContext).pop();
-        onSelect(emoji);
-      },
-    ),
-  );
-}
-
-/// Emoji categories for the picker. System Unicode emoji — no packages needed.
-const _emojiCategories = <({String label, IconData icon, List<String> emoji})>[
-  (
-    label: 'Popular',
-    icon: LucideIcons.clock,
-    emoji: [
-      '\u{1F44D}',
-      '\u{2764}\u{FE0F}',
-      '\u{1F602}',
-      '\u{1F389}',
-      '\u{1F440}',
-      '\u{1F64F}',
-      '\u{1F525}',
-      '\u{2705}',
-    ],
-  ),
-  (
-    label: 'Smileys',
-    icon: LucideIcons.smile,
-    emoji: [
-      '\u{1F600}',
-      '\u{1F603}',
-      '\u{1F604}',
-      '\u{1F601}',
-      '\u{1F605}',
-      '\u{1F602}',
-      '\u{1F923}',
-      '\u{1F607}',
-      '\u{1F60A}',
-      '\u{1F60D}',
-      '\u{1F618}',
-      '\u{1F617}',
-      '\u{1F61A}',
-      '\u{1F619}',
-      '\u{1F60B}',
-      '\u{1F61B}',
-      '\u{1F61D}',
-      '\u{1F61C}',
-      '\u{1F911}',
-      '\u{1F917}',
-      '\u{1F914}',
-      '\u{1F910}',
-      '\u{1F928}',
-      '\u{1F610}',
-      '\u{1F611}',
-      '\u{1F636}',
-      '\u{1F60F}',
-      '\u{1F612}',
-      '\u{1F644}',
-      '\u{1F62C}',
-      '\u{1F925}',
-      '\u{1F60C}',
-      '\u{1F614}',
-      '\u{1F62A}',
-      '\u{1F924}',
-      '\u{1F634}',
-      '\u{1F637}',
-      '\u{1F912}',
-      '\u{1F915}',
-      '\u{1F922}',
-      '\u{1F92E}',
-      '\u{1F927}',
-      '\u{1F975}',
-      '\u{1F976}',
-      '\u{1F974}',
-      '\u{1F635}',
-      '\u{1F92F}',
-      '\u{1F920}',
-      '\u{1F973}',
-      '\u{1F978}',
-    ],
-  ),
-  (
-    label: 'Gestures',
-    icon: LucideIcons.hand,
-    emoji: [
-      '\u{1F44D}',
-      '\u{1F44E}',
-      '\u{1F44A}',
-      '\u{270A}',
-      '\u{1F91B}',
-      '\u{1F91C}',
-      '\u{1F44F}',
-      '\u{1F64C}',
-      '\u{1F450}',
-      '\u{1F64F}',
-      '\u{1F91D}',
-      '\u{270C}\u{FE0F}',
-      '\u{1F91E}',
-      '\u{1F91F}',
-      '\u{1F918}',
-      '\u{1F448}',
-      '\u{1F449}',
-      '\u{1F446}',
-      '\u{1F447}',
-      '\u{261D}\u{FE0F}',
-      '\u{1F4AA}',
-      '\u{1F44B}',
-      '\u{1F590}\u{FE0F}',
-    ],
-  ),
-  (
-    label: 'Objects',
-    icon: LucideIcons.lightbulb,
-    emoji: [
-      '\u{2764}\u{FE0F}',
-      '\u{1F525}',
-      '\u{2B50}',
-      '\u{1F31F}',
-      '\u{1F4A5}',
-      '\u{1F389}',
-      '\u{1F38A}',
-      '\u{1F3C6}',
-      '\u{1F947}',
-      '\u{1F4A1}',
-      '\u{1F4AF}',
-      '\u{2705}',
-      '\u{274C}',
-      '\u{26A0}\u{FE0F}',
-      '\u{1F6A8}',
-      '\u{1F4DD}',
-      '\u{1F4CB}',
-      '\u{1F4CC}',
-      '\u{1F517}',
-      '\u{1F4E3}',
-      '\u{1F514}',
-      '\u{1F3B5}',
-      '\u{1F3B6}',
-      '\u{1F680}',
-    ],
-  ),
-  (
-    label: 'Nature',
-    icon: LucideIcons.sprout,
-    emoji: [
-      '\u{1F331}',
-      '\u{1F332}',
-      '\u{1F333}',
-      '\u{1F334}',
-      '\u{1F335}',
-      '\u{1F33B}',
-      '\u{1F33A}',
-      '\u{1F337}',
-      '\u{1F339}',
-      '\u{1F340}',
-      '\u{1F341}',
-      '\u{1F343}',
-      '\u{1F31E}',
-      '\u{1F308}',
-      '\u{2600}\u{FE0F}',
-      '\u{1F327}\u{FE0F}',
-      '\u{26A1}',
-      '\u{2744}\u{FE0F}',
-      '\u{1F30A}',
-      '\u{1F436}',
-      '\u{1F431}',
-      '\u{1F98A}',
-      '\u{1F42C}',
-      '\u{1F985}',
-    ],
-  ),
-];
-
-class _EmojiPickerSheet extends StatefulWidget {
-  final void Function(String emoji) onSelect;
-
-  const _EmojiPickerSheet({required this.onSelect});
-
-  @override
-  State<_EmojiPickerSheet> createState() => _EmojiPickerSheetState();
-}
-
-class _EmojiPickerSheetState extends State<_EmojiPickerSheet> {
-  /// -1 = "All", 0..N = specific category.
-  int _selectedCategory = -1;
-
-  static final _allEmoji = () {
-    final seen = <String>{};
-    return [
-      for (final cat in _emojiCategories)
-        for (final e in cat.emoji)
-          if (seen.add(e)) e,
-    ];
-  }();
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    final emoji = _selectedCategory < 0
-        ? _allEmoji
-        : _emojiCategories[_selectedCategory].emoji;
-
-    return SizedBox(
-      height: 340,
-      child: Column(
-        children: [
-          // Category icon bar.
-          SizedBox(
-            height: 40,
-            child: Row(
-              children: [
-                const SizedBox(width: Grid.twelve),
-                _CategoryIcon(
-                  icon: LucideIcons.layoutGrid,
-                  selected: _selectedCategory < 0,
-                  onTap: () => setState(() => _selectedCategory = -1),
-                ),
-                for (var i = 0; i < _emojiCategories.length; i++)
-                  _CategoryIcon(
-                    icon: _emojiCategories[i].icon,
-                    selected: _selectedCategory == i,
-                    onTap: () => setState(() => _selectedCategory = i),
-                  ),
-              ],
-            ),
-          ),
-          Divider(height: 1, color: colors.outlineVariant),
-          const SizedBox(height: Grid.xxs),
-          // Emoji grid.
-          Expanded(
-            child: GridView.builder(
-              padding: const EdgeInsets.symmetric(horizontal: Grid.xs),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 8,
-                mainAxisSpacing: Grid.half,
-                crossAxisSpacing: Grid.half,
-              ),
-              itemCount: emoji.length,
-              itemBuilder: (context, index) {
-                final e = emoji[index];
-                return GestureDetector(
-                  onTap: () => widget.onSelect(e),
-                  child: Center(
-                    child: Text(e, style: const TextStyle(fontSize: 28)),
-                  ),
-                );
-              },
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-class _CategoryIcon extends StatelessWidget {
-  final IconData icon;
-  final bool selected;
-  final VoidCallback onTap;
-
-  const _CategoryIcon({
-    required this.icon,
-    required this.selected,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final colors = Theme.of(context).colorScheme;
-    return SizedBox(
-      width: 40,
-      height: 40,
-      child: IconButton(
-        onPressed: onTap,
-        icon: Icon(
-          icon,
-          size: 18,
-          color: selected ? colors.primary : colors.onSurfaceVariant,
-        ),
-        padding: EdgeInsets.zero,
-        visualDensity: VisualDensity.compact,
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Mention suggestions
 // ---------------------------------------------------------------------------
 
@@ -780,6 +629,7 @@ List<ChannelMember> _filterMembers(
   List<ChannelMember> members,
   String? query,
   String? currentPubkey,
+  Map<String, UserProfile> userCache,
 ) {
   if (query == null) return const [];
   final q = query.toLowerCase();
@@ -791,7 +641,9 @@ List<ChannelMember> _filterMembers(
       )
       .where((m) {
         if (q.isEmpty) return true;
-        final name = (m.displayName ?? '').toLowerCase();
+        final profile = userCache[m.pubkey.toLowerCase()];
+        final name = (profile?.displayName ?? m.displayName ?? '')
+            .toLowerCase();
         final firstName = name.split(RegExp(r'\s+')).first;
         return name.startsWith(q) ||
             firstName.startsWith(q) ||
@@ -839,11 +691,16 @@ class _MentionSuggestions extends StatelessWidget {
         separatorBuilder: (_, _) => const SizedBox.shrink(),
         itemBuilder: (context, index) {
           final member = suggestions[index];
-          final name = member.labelFor(currentPubkey);
           final profile = userCache[member.pubkey.toLowerCase()];
+          final name = profile?.displayName?.trim().isNotEmpty == true
+              ? profile!.displayName!.trim()
+              : member.labelFor(currentPubkey);
           final avatarUrl = profile?.avatarUrl;
-          final initial = (member.displayName ?? member.pubkey)[0]
-              .toUpperCase();
+          final initial =
+              (profile?.displayName?.trim().isNotEmpty == true
+                      ? profile!.displayName!.trim()
+                      : member.pubkey)[0]
+                  .toUpperCase();
 
           return ListTile(
             dense: true,
@@ -865,9 +722,91 @@ class _MentionSuggestions extends StatelessWidget {
             ),
             title: Text(name, style: context.textTheme.bodyMedium),
             trailing: member.isBot
-                ? Icon(LucideIcons.bot, size: 14, color: context.colors.outline)
+                ? Icon(
+                    LucideIcons.bot,
+                    size: 14,
+                    color: context.colors.onSurfaceVariant,
+                  )
                 : null,
             onTap: () => onSelect(member),
+          );
+        },
+      ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Channel suggestions
+// ---------------------------------------------------------------------------
+
+@visibleForTesting
+List<Channel> filterChannels(List<Channel> channels, String? query) {
+  if (query == null) return const [];
+  final q = query.toLowerCase();
+  return channels
+      .where((c) => c.channelType != 'dm')
+      .where((c) {
+        if (q.isEmpty) return true;
+        return c.name.toLowerCase().contains(q);
+      })
+      .take(8)
+      .toList();
+}
+
+class _ChannelSuggestions extends StatelessWidget {
+  final List<Channel> suggestions;
+  final void Function(Channel) onSelect;
+
+  const _ChannelSuggestions({
+    required this.suggestions,
+    required this.onSelect,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      constraints: const BoxConstraints(maxHeight: 240),
+      clipBehavior: Clip.hardEdge,
+      decoration: BoxDecoration(
+        color: context.colors.surfaceContainerHighest,
+        borderRadius: const BorderRadius.vertical(
+          top: Radius.circular(Radii.dialog),
+        ),
+        boxShadow: [
+          BoxShadow(
+            color: context.colors.shadow.withValues(alpha: 0.08),
+            blurRadius: 8,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      child: ListView.separated(
+        shrinkWrap: true,
+        padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
+        itemCount: suggestions.length,
+        separatorBuilder: (_, _) => const SizedBox.shrink(),
+        itemBuilder: (context, index) {
+          final channel = suggestions[index];
+          return ListTile(
+            dense: true,
+            visualDensity: VisualDensity.compact,
+            leading: Icon(
+              channel.isForum ? LucideIcons.messageSquare : LucideIcons.hash,
+              size: 18,
+              color: context.colors.onSurfaceVariant,
+            ),
+            title: Text(
+              '#${channel.name}',
+              style: context.textTheme.bodyMedium,
+            ),
+            trailing: Text(
+              channel.channelType,
+              style: context.textTheme.labelSmall?.copyWith(
+                color: context.colors.onSurfaceVariant,
+              ),
+            ),
+            onTap: () => onSelect(channel),
           );
         },
       ),
@@ -1048,6 +987,7 @@ class _AttachmentStrip extends StatelessWidget {
           }
 
           final attachment = attachments[index];
+          final isVideo = attachment.type.startsWith('video/');
           final previewUrl = attachment.thumb ?? attachment.url;
           return Container(
             key: ValueKey('compose-attachment:${attachment.url}'),
@@ -1061,17 +1001,28 @@ class _AttachmentStrip extends StatelessWidget {
               children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(Radii.md),
-                  child: Image.network(
-                    previewUrl,
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, _, _) => ColoredBox(
-                      color: context.colors.surface,
-                      child: Icon(
-                        LucideIcons.image,
-                        color: context.colors.onSurfaceVariant,
-                      ),
-                    ),
-                  ),
+                  child: isVideo
+                      ? ColoredBox(
+                          color: Colors.black,
+                          child: Center(
+                            child: Icon(
+                              LucideIcons.video,
+                              color: Colors.white,
+                              size: 24,
+                            ),
+                          ),
+                        )
+                      : Image.network(
+                          previewUrl,
+                          fit: BoxFit.cover,
+                          errorBuilder: (_, _, _) => ColoredBox(
+                            color: context.colors.surface,
+                            child: Icon(
+                              LucideIcons.image,
+                              color: context.colors.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
                 ),
                 Positioned(
                   top: Grid.quarter,

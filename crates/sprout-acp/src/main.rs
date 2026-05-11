@@ -3,6 +3,7 @@
 mod acp;
 mod config;
 mod filter;
+mod observer;
 mod pool;
 mod queue;
 mod relay;
@@ -17,15 +18,19 @@ use clap::Parser;
 use config::{Config, DedupMode, ModelsArgs, MultipleEventHandling, RespondTo, SubscribeMode};
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
-use nostr::ToBech32;
+use nostr::{PublicKey, ToBech32};
 use pool::{
-    AgentPool, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource, SessionState,
+    AgentPool, CancelMode, OwnedAgent, PromptContext, PromptOutcome, PromptResult, PromptSource,
+    SessionState,
 };
 use queue::{EventQueue, QueuedEvent, ThreadTags};
-use relay::HarnessRelay;
+use relay::{HarnessRelay, RelayEventPublisher};
 use sprout_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
+};
+use sprout_core::observer::{
+    decrypt_observer_payload, encrypt_observer_payload, OBSERVER_FRAME_TELEMETRY,
 };
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -48,246 +53,507 @@ fn is_subcommand(name: &str) -> bool {
 /// Timeout for the `sprout-acp models` subcommand (spawn + init + session/new).
 const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 
-// ── Owner cache ───────────────────────────────────────────────────────────────
+// ── Presence helper ───────────────────────────────────────────────────────────
 
-/// Lazy-resolving cache for the agent's owner pubkey.
+/// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
-/// Replaces the bare `Option<String>` that previously lived in the event loop.
-/// On success, the owner pubkey is cached for the process lifetime (owner
-/// changes require a harness restart). On failure/miss, retries after 60s
-/// to avoid hammering the API.
-struct OwnerCache {
-    pubkey: Option<String>,
-    last_attempt: Option<std::time::Instant>,
+/// Ephemeral kinds (20000-29999) are rejected by the HTTP bridge, so presence
+/// updates must be routed through the WS path.
+///
+/// Content is a bare status string (`"online"`, `"away"`, `"offline"`) matching
+/// the desktop client's format. The relay stores this in Redis and synthesizes
+/// it back on presence queries.
+async fn publish_presence(
+    publisher: &relay::RelayEventPublisher,
+    keys: &nostr::Keys,
+    status: &str,
+) -> Result<(), relay::RelayError> {
+    use nostr::{EventBuilder, Kind};
+    use sprout_core::kind::KIND_PRESENCE_UPDATE;
+
+    let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), status, [])
+        .sign_with_keys(keys)
+        .map_err(|e| relay::RelayError::Http(format!("presence sign error: {e}")))?;
+    publisher.publish_event(event).await?;
+    Ok(())
 }
 
-/// How long to cache a failed owner lookup before retrying.
-const OWNER_CACHE_TTL: Duration = Duration::from_secs(60);
+// ── Owner resolution ──────────────────────────────────────────────────────────
+
+/// Resolve the agent's owner pubkey at startup.
+///
+/// Priority:
+/// 1. `SPROUT_AUTH_TAG` env var — NIP-OA attestation signed by the owner.
+///    Verified against the agent's own pubkey to extract the owner pubkey.
+/// 2. `--agent-owner` CLI flag / `SPROUT_ACP_AGENT_OWNER` env var.
+fn resolve_agent_owner(config: &Config) -> Option<String> {
+    // Try SPROUT_AUTH_TAG first (NIP-OA attestation).
+    if let Ok(auth_tag) = std::env::var("SPROUT_AUTH_TAG") {
+        if !auth_tag.is_empty() {
+            let agent_pk = config.keys.public_key();
+            match sprout_sdk::nip_oa::verify_auth_tag(&auth_tag, &agent_pk) {
+                Ok(owner_pk) => {
+                    let owner_hex = owner_pk.to_hex().to_ascii_lowercase();
+                    tracing::info!("owner resolved from SPROUT_AUTH_TAG: {owner_hex}");
+                    return Some(owner_hex);
+                }
+                Err(e) => {
+                    tracing::warn!("SPROUT_AUTH_TAG verification failed: {e} — falling back");
+                }
+            }
+        }
+    }
+
+    // Fall back to --agent-owner config.
+    config.agent_owner.clone()
+}
+
+// ── Owner cache ───────────────────────────────────────────────────────────────
+
+/// Cache for the agent's owner pubkey.
+///
+/// Owner is now provided via `--agent-owner` config flag (no REST lookup).
+/// Cache for the agent's owner pubkey + sibling lookups.
+///
+/// Siblings are other agents whose NIP-OA auth tag proves the same owner.
+/// Lookup results are cached for the process lifetime (attestations are immutable).
+struct OwnerCache {
+    pubkey: Option<String>,
+    /// author_hex → is_sibling (true = same owner, false = not)
+    siblings: std::sync::Mutex<HashMap<String, bool>>,
+}
 
 impl OwnerCache {
     fn new(initial: Option<String>) -> Self {
-        let last_attempt = if initial.is_some() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         Self {
             pubkey: initial,
-            last_attempt,
+            siblings: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
-    /// Return the cached owner pubkey, or attempt a lazy resolution if stale.
-    async fn get_or_resolve(
-        &mut self,
-        rest_client: &relay::RestClient,
-        agent_pubkey_hex: &str,
-    ) -> Option<&str> {
-        if self.pubkey.is_some() {
-            return self.pubkey.as_deref();
-        }
-        let stale = self
-            .last_attempt
-            .map(|t| t.elapsed() >= OWNER_CACHE_TTL)
-            .unwrap_or(true);
-        if !stale {
-            return None;
-        }
-        self.last_attempt = Some(std::time::Instant::now());
-        let profile_url = format!("/api/users/{agent_pubkey_hex}/profile");
-        match rest_client.get_json(&profile_url).await {
-            Ok(v) => {
-                // Normalize to lowercase hex for consistent comparison with
-                // nostr PublicKey::to_hex() and validated allowlist entries.
-                self.pubkey = v
-                    .get("agent_owner_pubkey")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_ascii_lowercase());
-                if let Some(ref o) = self.pubkey {
-                    tracing::info!("lazy owner resolution succeeded: {o}");
-                }
-            }
-            Err(e) => {
-                tracing::warn!("lazy owner lookup failed: {e}");
-            }
-        }
+    /// Return the cached owner pubkey.
+    fn get(&self) -> Option<&str> {
         self.pubkey.as_deref()
     }
+
+    /// Check if author is a known sibling (cached result).
+    fn is_known_sibling(&self, author: &str) -> Option<bool> {
+        self.siblings.lock().ok()?.get(author).copied()
+    }
+
+    /// Cache a sibling lookup result.
+    fn cache_sibling(&self, author: String, is_sibling: bool) {
+        if let Ok(mut map) = self.siblings.lock() {
+            // Cap at 256 entries to prevent unbounded growth.
+            if map.len() >= 256 {
+                map.clear();
+            }
+            map.insert(author, is_sibling);
+        }
+    }
 }
 
-// ── Sibling cache ─────────────────────────────────────────────────────────────
-
-/// Result of looking up an author's owner via the REST API.
-#[derive(Debug, Clone)]
-enum SiblingLookup {
-    /// Profile resolved; contains the author's `agent_owner_pubkey` (if any),
-    /// normalized to lowercase hex.
-    Resolved(Option<String>),
-    /// REST call failed — treat as "not a sibling" (fail-closed).
-    Failed,
-}
-
-/// Cache of author → owner lookups for the sibling author gate.
+/// Check if `author` is the owner OR a sibling (same owner via NIP-OA).
 ///
-/// When `--respond-to=owner-only`, the harness accepts events from the owner
-/// AND from any pubkey whose `agent_owner_pubkey` matches the owner (siblings).
-/// This cache avoids hitting the REST API on every event from a known author.
-///
-/// TTL is derived at **read time**: a cached `Resolved(Some(owner))` that
-/// matches the expected owner uses `SIBLING_CACHE_HIT_TTL` (5 min); all other
-/// results use `SIBLING_CACHE_MISS_TTL` (1 min). This is correct even if the
-/// agent owner changes (it doesn't — `OwnerCache` is process-stable — but the
-/// design doesn't depend on that).
-struct SiblingCache {
-    /// author_hex → (lookup_result, resolved_at)
-    entries: HashMap<String, (SiblingLookup, std::time::Instant)>,
-}
-
-/// TTL for a cached sibling match (Resolved(Some(owner)) where owner == expected).
-const SIBLING_CACHE_HIT_TTL: Duration = Duration::from_secs(300);
-/// TTL for a cached miss/different-owner/failure.
-const SIBLING_CACHE_MISS_TTL: Duration = Duration::from_secs(60);
-/// Maximum entries before oldest-eviction.
-const SIBLING_CACHE_MAX_ENTRIES: usize = 256;
-
-impl SiblingCache {
-    fn new() -> Self {
-        Self {
-            entries: HashMap::new(),
-        }
-    }
-
-    /// Record a lookup result for `author_hex`. Pure cache mutation — no I/O.
-    ///
-    /// Normalizes any owner pubkey inside `Resolved(Some(_))` to lowercase hex
-    /// so callers of `check()` get consistent comparisons regardless of API
-    /// casing. Evicts the oldest entry when at capacity.
-    fn record(&mut self, author_hex: String, result: SiblingLookup) {
-        // Normalize before caching.
-        let normalized = match result {
-            SiblingLookup::Resolved(Some(owner)) => {
-                SiblingLookup::Resolved(Some(owner.to_ascii_lowercase()))
-            }
-            other => other,
-        };
-
-        if self.entries.len() >= SIBLING_CACHE_MAX_ENTRIES
-            && !self.entries.contains_key(&author_hex)
-        {
-            // Evict oldest entry by resolved_at.
-            if let Some(oldest_key) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (_, ts))| *ts)
-                .map(|(k, _)| k.clone())
-            {
-                self.entries.remove(&oldest_key);
-            }
-        }
-
-        self.entries
-            .insert(author_hex, (normalized, std::time::Instant::now()));
-    }
-
-    /// Check if a cached entry exists and is fresh for the given expected owner.
-    ///
-    /// Returns `Some(true)` if the author is a confirmed sibling (same owner),
-    /// `Some(false)` if confirmed non-sibling, or `None` if the cache entry is
-    /// missing or stale (caller should fetch).
-    fn check(&self, author_hex: &str, expected_owner_hex: &str) -> Option<bool> {
-        let (lookup, resolved_at) = self.entries.get(author_hex)?;
-
-        let is_match = matches!(
-            lookup,
-            SiblingLookup::Resolved(Some(ref o)) if o == expected_owner_hex
-        );
-
-        let ttl = if is_match {
-            SIBLING_CACHE_HIT_TTL
-        } else {
-            SIBLING_CACHE_MISS_TTL
-        };
-
-        if resolved_at.elapsed() >= ttl {
-            return None; // stale
-        }
-
-        Some(is_match)
-    }
-
-    /// Full lookup: check cache, fetch if needed, record result.
-    async fn is_sibling(
-        &mut self,
-        rest_client: &relay::RestClient,
-        author_hex: &str,
-        expected_owner_hex: &str,
-    ) -> bool {
-        if let Some(result) = self.check(author_hex, expected_owner_hex) {
-            return result;
-        }
-
-        let lookup = Self::fetch_owner(rest_client, author_hex).await;
-        // Note: fetch_owner() already lowercases, and record() normalizes too,
-        // so no additional to_ascii_lowercase() needed here.
-        let is_match = matches!(
-            &lookup,
-            SiblingLookup::Resolved(Some(ref o)) if o == expected_owner_hex
-        );
-        self.record(author_hex.to_owned(), lookup);
-        is_match
-    }
-
-    /// Fetch an author's owner from the REST API.
-    async fn fetch_owner(rest_client: &relay::RestClient, author_hex: &str) -> SiblingLookup {
-        let url = format!("/api/users/{author_hex}/profile");
-        match rest_client.get_json(&url).await {
-            Ok(v) => {
-                let owner = v
-                    .get("agent_owner_pubkey")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_ascii_lowercase());
-                tracing::debug!(
-                    author = author_hex,
-                    owner = ?owner,
-                    "sibling cache: resolved author owner"
-                );
-                SiblingLookup::Resolved(owner)
-            }
-            Err(e) => {
-                tracing::warn!(
-                    author = author_hex,
-                    error = %e,
-                    "sibling cache: REST lookup failed — treating as non-sibling"
-                );
-                SiblingLookup::Failed
-            }
-        }
-    }
-}
-
-/// Check if `author` is the owner or a sibling (shares the same owner).
-///
-/// Used by the `OwnerOnly` author gate mode. The owner is the direct match;
-/// siblings are other pubkeys whose `agent_owner_pubkey` equals the owner.
+/// For unknown authors, queries their kind:0 profile to extract the NIP-OA
+/// auth tag and verify the owner matches. Result is cached.
 async fn is_owner_or_sibling(
     author: &str,
-    owner_cache: &mut OwnerCache,
-    sibling_cache: &mut SiblingCache,
+    owner_cache: &OwnerCache,
     rest_client: &relay::RestClient,
-    agent_pubkey_hex: &str,
 ) -> bool {
-    let owner = owner_cache
-        .get_or_resolve(rest_client, agent_pubkey_hex)
-        .await;
-    match owner {
-        Some(o) if author == o => true, // direct owner match
-        Some(o) => {
-            // Check if author is a sibling — another agent with the same owner.
-            // Need to copy `o` because `owner_cache` borrows are released.
-            let o = o.to_owned();
-            sibling_cache.is_sibling(rest_client, author, &o).await
+    let my_owner = match owner_cache.get() {
+        Some(o) => o,
+        None => return false, // no owner configured — fail closed
+    };
+
+    // Direct owner check.
+    if author == my_owner {
+        return true;
+    }
+
+    // Check sibling cache.
+    if let Some(cached) = owner_cache.is_known_sibling(author) {
+        return cached;
+    }
+
+    // Query the author's kind:0 profile to check for NIP-OA auth tag.
+    let is_sibling = check_sibling_via_profile(author, my_owner, rest_client).await;
+    owner_cache.cache_sibling(author.to_string(), is_sibling);
+    is_sibling
+}
+
+/// Query an author's kind:0 profile and check if their NIP-OA auth tag
+/// proves the same owner as us.
+async fn check_sibling_via_profile(
+    author: &str,
+    expected_owner: &str,
+    rest_client: &relay::RestClient,
+) -> bool {
+    let filter = nostr::Filter::new()
+        .kind(nostr::Kind::Metadata)
+        .author(match nostr::PublicKey::from_hex(author) {
+            Ok(pk) => pk,
+            Err(_) => return false,
+        })
+        .limit(1);
+
+    let resp = match tokio::time::timeout(Duration::from_millis(2000), rest_client.query(&[filter]))
+        .await
+    {
+        Ok(Ok(v)) => v,
+        _ => return false, // timeout or error — fail closed
+    };
+
+    // Look for an "auth" tag in the profile event.
+    let events = match resp.as_array() {
+        Some(arr) => arr,
+        None => return false,
+    };
+    let event = match events.first() {
+        Some(e) => e,
+        None => return false,
+    };
+    let tags = match event.get("tags").and_then(|t| t.as_array()) {
+        Some(t) => t,
+        None => return false,
+    };
+
+    // Find ["auth", owner_pk, conditions, sig] and verify the Schnorr signature.
+    // Don't trust the relay — verify ourselves.
+    let agent_pk = match nostr::PublicKey::from_hex(author) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    for tag in tags {
+        let parts = match tag.as_array() {
+            Some(p) if p.len() >= 4 => p,
+            _ => continue,
+        };
+        if parts[0].as_str() != Some("auth") {
+            continue;
         }
-        None => false, // no owner resolved — fail closed
+        let tag_owner = match parts[1].as_str() {
+            Some(o) => o,
+            None => continue,
+        };
+        // Only verify if the owner field matches ours.
+        if !tag_owner.eq_ignore_ascii_case(expected_owner) {
+            continue;
+        }
+        // Cryptographically verify the NIP-OA attestation signature.
+        let tag_json = serde_json::to_string(tag).unwrap_or_default();
+        match sprout_sdk::nip_oa::verify_auth_tag(&tag_json, &agent_pk) {
+            Ok(_) => {
+                tracing::debug!(author, expected_owner, "sibling verified via NIP-OA");
+                return true;
+            }
+            Err(e) => {
+                tracing::debug!(author, "NIP-OA auth tag verification failed: {e}");
+            }
+        }
+    }
+
+    false
+}
+
+fn spawn_relay_observer_publisher(
+    observer: observer::ObserverHandle,
+    publisher: RelayEventPublisher,
+    keys: nostr::Keys,
+    agent_pubkey_hex: String,
+    owner_pubkey_hex: String,
+    owner_pubkey: PublicKey,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut coalescer = ObserverChunkCoalescer::default();
+        for event in observer.snapshot() {
+            for event in coalescer.ingest(event) {
+                publish_relay_observer_event(
+                    &publisher,
+                    &keys,
+                    &agent_pubkey_hex,
+                    &owner_pubkey_hex,
+                    &owner_pubkey,
+                    event,
+                )
+                .await;
+            }
+        }
+
+        let mut rx = observer.subscribe();
+        let mut flush_interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        flush_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                result = rx.recv() => {
+                    match result {
+                        Ok(event) => {
+                            for event in coalescer.ingest(event) {
+                                publish_relay_observer_event(
+                                    &publisher, &keys, &agent_pubkey_hex,
+                                    &owner_pubkey_hex, &owner_pubkey, event,
+                                ).await;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                            for event in coalescer.flush() {
+                                publish_relay_observer_event(
+                                    &publisher, &keys, &agent_pubkey_hex,
+                                    &owner_pubkey_hex, &owner_pubkey, event,
+                                ).await;
+                            }
+                            tracing::warn!(dropped = count, "relay observer publisher lagged");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            for event in coalescer.flush() {
+                                publish_relay_observer_event(
+                                    &publisher, &keys, &agent_pubkey_hex,
+                                    &owner_pubkey_hex, &owner_pubkey, event,
+                                ).await;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ = flush_interval.tick() => {
+                    // Periodic flush ensures live streaming even during continuous chunk delivery.
+                    for event in coalescer.flush() {
+                        publish_relay_observer_event(
+                            &publisher, &keys, &agent_pubkey_hex,
+                            &owner_pubkey_hex, &owner_pubkey, event,
+                        ).await;
+                    }
+                }
+            }
+        }
+    })
+}
+
+#[derive(Default)]
+struct ObserverChunkCoalescer {
+    pending: Vec<PendingObserverChunk>,
+}
+
+struct PendingObserverChunk {
+    key: ObserverChunkKey,
+    event: observer::ObserverEvent,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ObserverChunkKey {
+    update_type: String,
+    message_id: Option<String>,
+    channel_id: Option<String>,
+    session_id: Option<String>,
+    turn_id: Option<String>,
+    agent_index: Option<usize>,
+}
+
+/// Flush coalesced chunks before they exceed the NIP-44 plaintext limit (65,535 bytes).
+/// Leave headroom for the JSON envelope wrapping the text.
+const OBSERVER_CHUNK_MAX_TEXT_BYTES: usize = 60_000;
+
+impl ObserverChunkCoalescer {
+    fn ingest(&mut self, event: observer::ObserverEvent) -> Vec<observer::ObserverEvent> {
+        let Some((key, text)) = observer_chunk_key_and_text(&event) else {
+            let mut events = self.flush();
+            events.push(event);
+            return events;
+        };
+
+        if let Some(pending) = self.pending.iter_mut().find(|pending| pending.key == key) {
+            // Flush before appending if this would exceed the plaintext size limit.
+            if pending.text.len() + text.len() >= OBSERVER_CHUNK_MAX_TEXT_BYTES {
+                let events = self.flush();
+                // Start a new pending entry with the current chunk.
+                self.pending.push(PendingObserverChunk { key, event, text });
+                return events;
+            }
+            pending.text.push_str(&text);
+            pending.event.seq = event.seq;
+            pending.event.timestamp = event.timestamp;
+            return Vec::new();
+        }
+
+        self.pending.push(PendingObserverChunk { key, event, text });
+        Vec::new()
+    }
+
+    fn flush(&mut self) -> Vec<observer::ObserverEvent> {
+        self.pending
+            .drain(..)
+            .map(|mut pending| {
+                set_observer_chunk_text(&mut pending.event.payload, pending.text);
+                pending.event
+            })
+            .collect()
+    }
+}
+
+fn observer_chunk_key_and_text(
+    event: &observer::ObserverEvent,
+) -> Option<(ObserverChunkKey, String)> {
+    let update = event.payload.get("params")?.get("update")?;
+    let update_type = update.get("sessionUpdate")?.as_str()?;
+    if !matches!(
+        update_type,
+        "agent_message_chunk" | "user_message_chunk" | "agent_thought_chunk"
+    ) {
+        return None;
+    }
+
+    let text = update.get("content")?.get("text")?.as_str()?.to_string();
+    let message_id = update
+        .get("messageId")
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned);
+
+    Some((
+        ObserverChunkKey {
+            update_type: update_type.to_string(),
+            message_id,
+            channel_id: event.channel_id.clone(),
+            session_id: event.session_id.clone(),
+            turn_id: event.turn_id.clone(),
+            agent_index: event.agent_index,
+        },
+        text,
+    ))
+}
+
+fn set_observer_chunk_text(payload: &mut serde_json::Value, text: String) {
+    let Some(content) = payload
+        .get_mut("params")
+        .and_then(|params| params.get_mut("update"))
+        .and_then(|update| update.get_mut("content"))
+    else {
+        return;
+    };
+
+    if let Some(content_object) = content.as_object_mut() {
+        content_object.insert("text".to_string(), serde_json::Value::String(text));
+    }
+}
+
+async fn publish_relay_observer_event(
+    publisher: &RelayEventPublisher,
+    keys: &nostr::Keys,
+    agent_pubkey_hex: &str,
+    owner_pubkey_hex: &str,
+    owner_pubkey: &PublicKey,
+    event: observer::ObserverEvent,
+) {
+    let encrypted = match encrypt_observer_payload(keys, owner_pubkey, &event) {
+        Ok(encrypted) => encrypted,
+        Err(error) => {
+            tracing::warn!("failed to encrypt relay observer event: {error}");
+            return;
+        }
+    };
+    let builder = match sprout_sdk::build_agent_observer_frame(
+        owner_pubkey_hex,
+        agent_pubkey_hex,
+        OBSERVER_FRAME_TELEMETRY,
+        &encrypted,
+    ) {
+        Ok(builder) => builder,
+        Err(error) => {
+            tracing::warn!("failed to build relay observer event: {error}");
+            return;
+        }
+    };
+    let signed = match builder.sign_with_keys(keys) {
+        Ok(event) => event,
+        Err(error) => {
+            tracing::warn!("failed to sign relay observer event: {error}");
+            return;
+        }
+    };
+    if let Err(error) = publisher.publish_event(signed).await {
+        tracing::debug!("relay observer event dropped: {error}");
+    }
+}
+
+/// Maximum age (seconds) for an observer control frame to be considered fresh.
+const OBSERVER_CONTROL_FRESHNESS_SECS: i64 = 300;
+
+fn handle_relay_observer_control_event(
+    keys: &nostr::Keys,
+    event: nostr::Event,
+    pool: &mut AgentPool,
+    observer: Option<&observer::ObserverHandle>,
+    owner_pubkey_hex: &str,
+) {
+    // Defense-in-depth: verify signature even though the relay already checked.
+    if let Err(e) = sprout_core::verify_event(&event) {
+        tracing::warn!(error = %e, "observer control frame failed signature verification");
+        return;
+    }
+
+    // Defense-in-depth: verify the sender is the resolved owner.
+    if event.pubkey.to_hex() != owner_pubkey_hex {
+        tracing::warn!(
+            sender = %event.pubkey,
+            expected = %owner_pubkey_hex,
+            "observer control frame from non-owner — dropping"
+        );
+        return;
+    }
+
+    // Freshness: reject stale/replayed frames outside ±5 minute window.
+    let now = chrono::Utc::now().timestamp();
+    let event_ts = event.created_at.as_u64() as i64;
+    if (event_ts - now).unsigned_abs() > OBSERVER_CONTROL_FRESHNESS_SECS as u64 {
+        tracing::warn!(
+            event_ts,
+            now,
+            "observer control frame outside freshness window — dropping"
+        );
+        return;
+    }
+
+    let payload = match decrypt_observer_payload::<serde_json::Value>(keys, &event) {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!("failed to decrypt observer control frame: {error}");
+            return;
+        }
+    };
+
+    let command_type = payload.get("type").and_then(|value| value.as_str());
+    if command_type != Some("cancel_turn") {
+        tracing::debug!(payload = %payload, "ignoring unknown observer control frame");
+        return;
+    }
+
+    let Some(channel_id) = payload
+        .get("channelId")
+        .and_then(|value| value.as_str())
+        .and_then(|value| value.parse::<Uuid>().ok())
+    else {
+        tracing::warn!("observer cancel_turn control frame missing valid channelId");
+        return;
+    };
+
+    let fired = cancel_in_flight_task(pool, channel_id, CancelMode::Stop);
+    let status = if fired { "sent" } else { "no_active_turn" };
+    if let Some(observer) = observer {
+        observer.emit(
+            "control_result",
+            None,
+            &observer::ObserverContext {
+                channel_id: Some(channel_id.to_string()),
+                session_id: None,
+                turn_id: None,
+            },
+            serde_json::json!({
+                "type": "cancel_turn",
+                "status": status,
+            }),
+        );
     }
 }
 
@@ -529,6 +795,24 @@ async fn tokio_main() -> Result<()> {
     let config = Config::from_cli().map_err(|e| anyhow::anyhow!("configuration error: {e}"))?;
     tracing::info!("sprout-acp starting: {}", config.summary());
 
+    let observer = config
+        .relay_observer
+        .then(observer::ObserverHandle::in_process);
+    if let Some(handle) = &observer {
+        handle.emit(
+            "harness_started",
+            None,
+            &observer::ObserverContext::default(),
+            serde_json::json!({
+                "relayUrl": config.relay_url,
+                "agentCommand": config.agent_command,
+                "agentArgs": config.agent_args,
+                "parallelism": config.agents,
+                "relayObserver": config.relay_observer,
+            }),
+        );
+    }
+
     // ── Step 1: Spawn N ACP agent subprocesses and initialize ─────────────────
     //
     // Finding #10: one agent failing to start must not kill the whole pool.
@@ -549,9 +833,17 @@ async fn tokio_main() -> Result<()> {
         .await;
         match spawn_result {
             Ok(mut acp) => {
+                acp.set_observer(observer.clone(), i);
                 match tokio::time::timeout(Duration::from_secs(60), acp.initialize()).await {
                     Ok(Ok(init_result)) => {
                         tracing::info!(agent = i, "agent initialized: {init_result}");
+                        acp.observe(
+                            "agent_initialized",
+                            serde_json::json!({
+                                "agentIndex": i,
+                                "initializeResult": init_result,
+                            }),
+                        );
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -609,14 +901,17 @@ async fn tokio_main() -> Result<()> {
         .as_secs();
 
     let pubkey_hex = config.keys.public_key().to_hex();
-    let mut relay = HarnessRelay::connect(
-        &config.relay_url,
-        &config.keys,
-        config.api_token.as_deref(),
-        &pubkey_hex,
-    )
-    .await
-    .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
+
+    // Parse SPROUT_AUTH_TAG into a nostr::Tag for NIP-OA relay membership delegation.
+    let relay_auth_tag: Option<nostr::Tag> = std::env::var("SPROUT_AUTH_TAG")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .and_then(|s| sprout_sdk::nip_oa::parse_auth_tag(&s).ok());
+
+    let mut relay =
+        HarnessRelay::connect(&config.relay_url, &config.keys, &pubkey_hex, relay_auth_tag)
+            .await
+            .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
     // Finding #22: tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
@@ -636,37 +931,22 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("subscribed to membership notifications");
 
     // ── Step 2c: Set initial presence ─────────────────────────────────────────
-    let rest_client_for_presence = relay.rest_client();
+    let presence_publisher = relay.event_publisher();
+    let presence_keys = config.keys.clone();
     if config.presence_enabled {
-        match rest_client_for_presence
-            .put_json("/api/presence", &serde_json::json!({"status": "online"}))
-            .await
-        {
+        match publish_presence(&presence_publisher, &presence_keys, "online").await {
             Ok(_) => tracing::info!("presence set to online"),
             Err(e) => tracing::warn!("failed to set initial presence: {e}"),
         }
     }
 
-    // ── Step 2d: Query agent owner ──────────────────────────────────────────
-    // Owner lookup is used by !shutdown and the inbound author gate.
-    // Try at startup; OwnerCache retries lazily on cache miss.
-    let startup_owner: Option<String> = {
-        let profile_url = format!("/api/users/{pubkey_hex}/profile");
-        match rest_client_for_presence.get_json(&profile_url).await {
-            Ok(v) => v
-                .get("agent_owner_pubkey")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_ascii_lowercase()),
-            Err(e) => {
-                tracing::warn!("startup owner lookup failed (will retry lazily): {e}");
-                None
-            }
-        }
-    };
+    // ── Step 2d: Resolve agent owner ────────────────────────────────────────
+    // Priority: SPROUT_AUTH_TAG (NIP-OA attestation) → --agent-owner flag.
+    let startup_owner: Option<String> = resolve_agent_owner(&config);
     if let Some(ref owner) = startup_owner {
         tracing::info!("agent owner: {owner}");
     } else {
-        tracing::info!("no agent owner set at startup — will resolve lazily");
+        tracing::info!("no agent owner configured");
     }
     // Warn if owner-dependent mode but no owner resolved yet.
     if startup_owner.is_none() {
@@ -674,7 +954,7 @@ async fn tokio_main() -> Result<()> {
             RespondTo::OwnerOnly => {
                 tracing::warn!(
                     "respond-to=owner-only but no owner is set — all events will be \
-                     dropped until owner is resolved. Set --respond-to=anyone to override."
+                     dropped. Set SPROUT_AUTH_TAG or --agent-owner, or use --respond-to=anyone."
                 );
             }
             RespondTo::Allowlist => {
@@ -687,8 +967,42 @@ async fn tokio_main() -> Result<()> {
             _ => {} // anyone/nobody don't depend on owner
         }
     }
-    let mut owner_cache = OwnerCache::new(startup_owner);
-    let mut sibling_cache = SiblingCache::new();
+    let owner_cache = OwnerCache::new(startup_owner);
+
+    let mut relay_observer_control_rx = None;
+    let mut relay_observer_publisher_task = None;
+    if config.relay_observer {
+        if let (Some(observer), Some(owner_pubkey_hex)) =
+            (observer.clone(), owner_cache.pubkey.clone())
+        {
+            match PublicKey::from_hex(&owner_pubkey_hex) {
+                Ok(owner_pubkey) => {
+                    relay_observer_publisher_task = Some(spawn_relay_observer_publisher(
+                        observer,
+                        relay.event_publisher(),
+                        config.keys.clone(),
+                        pubkey_hex.clone(),
+                        owner_pubkey_hex,
+                        owner_pubkey,
+                    ));
+                    relay
+                        .subscribe_observer_controls()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("observer control subscribe error: {e}"))?;
+                    relay_observer_control_rx = relay.take_observer_control_rx();
+                    tracing::info!("relay observer enabled");
+                }
+                Err(error) => {
+                    tracing::warn!("relay observer disabled: invalid owner pubkey: {error}");
+                }
+            }
+        } else {
+            tracing::warn!(
+                "relay observer requested but no agent owner was resolved at startup; \
+                 observer frames will not be published"
+            );
+        }
+    }
 
     // ── Step 3: Discover channels and build subscription rules ────────────────
     let channel_info_map = relay
@@ -918,9 +1232,10 @@ async fn tokio_main() -> Result<()> {
                 let cmd = config.agent_command.clone();
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
+                let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env).await;
+                    let result = spawn_and_init(&cmd, &args, &env, idx, observer).await;
                     guard.send(result);
                 });
             }
@@ -988,6 +1303,28 @@ async fn tokio_main() -> Result<()> {
                 // are in-flight tasks.
                 Some(Err(e)) = join_set.join_next(), if !join_set.is_empty() => {
                     Some(PoolEvent::Panic(e))
+                }
+                control_event = async {
+                    match relay_observer_control_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    match control_event {
+                        Some(event) => {
+                            if let Some(ref owner_hex) = owner_cache.pubkey {
+                                handle_relay_observer_control_event(&config.keys, event, &mut pool, observer.as_ref(), owner_hex);
+                            } else {
+                                tracing::warn!("observer control frame received but no owner resolved — dropping");
+                            }
+                        }
+                        None => {
+                            relay_observer_control_rx = None;
+                            tracing::warn!("relay observer control channel closed");
+                        }
+                    }
+                    None
                 }
                 // Remaining branches don't touch pool — evaluated when pool is idle.
                 sprout_event = relay.next_event() => {
@@ -1119,12 +1456,7 @@ async fn tokio_main() -> Result<()> {
                                         && t.as_slice().get(1).map(|s| s.as_str()) == Some(pubkey_hex.as_str())
                                 });
                             if is_shutdown {
-                                // Lazy owner resolution via OwnerCache — a relay
-                                // outage during startup doesn't permanently
-                                // disable remote shutdown.
-                                let owner = owner_cache
-                                    .get_or_resolve(&rest_client_for_presence, &pubkey_hex)
-                                    .await;
+                                let owner = owner_cache.get();
                                 if let Some(owner) = owner {
                                     if sprout_event.event.pubkey.to_hex() == *owner {
                                         tracing::info!(
@@ -1157,12 +1489,9 @@ async fn tokio_main() -> Result<()> {
                                         && t.as_slice().get(1).map(|s| s.as_str()) == Some(pubkey_hex.as_str())
                                 });
                             if is_cancel {
-                                let owner = owner_cache
-                                    .get_or_resolve(&rest_client_for_presence, &pubkey_hex)
-                                    .await;
-                                if let Some(owner) = owner {
+                                if let Some(owner) = owner_cache.get() {
                                     if sprout_event.event.pubkey.to_hex() == *owner {
-                                        let fired = cancel_in_flight_task(&mut pool, sprout_event.channel_id);
+                                        let fired = cancel_in_flight_task(&mut pool, sprout_event.channel_id, CancelMode::Stop);
                                         if !fired {
                                             tracing::warn!(
                                                 channel_id = %sprout_event.channel_id,
@@ -1193,22 +1522,10 @@ async fn tokio_main() -> Result<()> {
                                     RespondTo::Anyone => true,
                                     RespondTo::Nobody => false,
                                     RespondTo::OwnerOnly => {
-                                        is_owner_or_sibling(
-                                            &author,
-                                            &mut owner_cache,
-                                            &mut sibling_cache,
-                                            &rest_client_for_presence,
-                                            &pubkey_hex,
-                                        )
-                                        .await
+                                        is_owner_or_sibling(&author, &owner_cache, &ctx.rest_client).await
                                     }
                                     RespondTo::Allowlist => {
-                                        let owner = owner_cache
-                                            .get_or_resolve(
-                                                &rest_client_for_presence,
-                                                &pubkey_hex,
-                                            )
-                                            .await;
+                                        let owner = owner_cache.get();
                                         config.respond_to_allowlist.contains(&author)
                                             || owner == Some(author.as_str())
                                     }
@@ -1262,17 +1579,14 @@ async fn tokio_main() -> Result<()> {
                                     MultipleEventHandling::Queue => false,
                                     MultipleEventHandling::Interrupt => true,
                                     MultipleEventHandling::OwnerInterrupt => {
-                                        let owner = owner_cache
-                                            .get_or_resolve(&rest_client_for_presence, &pubkey_hex)
-                                            .await;
-                                        match owner {
+                                        match owner_cache.get() {
                                             Some(o) => author_hex == *o,
                                             None => false,
                                         }
                                     }
                                 };
                                 if should_cancel {
-                                    cancel_in_flight_task(&mut pool, sprout_event.channel_id);
+                                    cancel_in_flight_task(&mut pool, sprout_event.channel_id, CancelMode::Interrupt);
                                 }
                             }
                             // ── End mode gate ────────────────────────────────
@@ -1325,9 +1639,10 @@ async fn tokio_main() -> Result<()> {
                     if let Some(h) = presence_task.take() {
                         h.abort();
                     }
-                    let rc = rest_client_for_presence.clone();
+                    let pp = presence_publisher.clone();
+                    let pk = presence_keys.clone();
                     presence_task = Some(tokio::spawn(async move {
-                        if let Err(e) = rc.put_json("/api/presence", &serde_json::json!({"status": "online"})).await {
+                        if let Err(e) = publish_presence(&pp, &pk, "online").await {
                             tracing::warn!("presence heartbeat failed: {e}");
                         }
                     }));
@@ -1379,6 +1694,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    observer.clone(),
                 ) == LoopAction::Exit
                 {
                     break;
@@ -1393,6 +1709,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    observer.clone(),
                 ) == LoopAction::Exit
                 {
                     break;
@@ -1414,6 +1731,7 @@ async fn tokio_main() -> Result<()> {
                     &mut crash_history,
                     &respawn_tx,
                     &mut respawn_tasks,
+                    observer.clone(),
                 );
                 if pool.live_count() == 0 && !any_respawn_in_flight(&crash_history) {
                     tracing::error!("all agents dead — exiting");
@@ -1506,8 +1824,7 @@ async fn tokio_main() -> Result<()> {
     if config.presence_enabled {
         match tokio::time::timeout(
             Duration::from_secs(2),
-            rest_client_for_presence
-                .put_json("/api/presence", &serde_json::json!({"status": "offline"})),
+            publish_presence(&presence_publisher, &presence_keys, "offline"),
         )
         .await
         {
@@ -1515,6 +1832,10 @@ async fn tokio_main() -> Result<()> {
             Ok(Err(e)) => tracing::warn!("failed to set offline presence: {e}"),
             Err(_) => tracing::warn!("offline presence timed out"),
         }
+    }
+
+    if let Some(handle) = relay_observer_publisher_task.take() {
+        handle.abort();
     }
 
     // Graceful relay shutdown — sends WebSocket close frame and waits up to 5s
@@ -1537,7 +1858,7 @@ enum LoopAction {
 
 /// Send a cancel signal to the in-flight task for `channel_id`.
 /// Returns `true` if a signal was sent, `false` if no in-flight task was found.
-fn cancel_in_flight_task(pool: &mut AgentPool, channel_id: uuid::Uuid) -> bool {
+fn cancel_in_flight_task(pool: &mut AgentPool, channel_id: uuid::Uuid, mode: CancelMode) -> bool {
     let entry = pool
         .task_map_mut()
         .values_mut()
@@ -1545,7 +1866,7 @@ fn cancel_in_flight_task(pool: &mut AgentPool, channel_id: uuid::Uuid) -> bool {
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.cancel_tx.take() {
-            let _ = tx.send(());
+            let _ = tx.send(mode);
             tracing::info!(channel = %channel_id, "cancel signal sent to in-flight task");
             return true;
         }
@@ -1597,7 +1918,7 @@ fn dispatch_pending(
 
         // Prompt text is now built inside run_prompt_task (needs async for
         // context fetching). Pass None for prompt_text; batch carries the data.
-        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<CancelMode>();
 
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
@@ -1643,6 +1964,7 @@ fn handle_prompt_result(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
 ) -> LoopAction {
     let before = pool.task_map().len();
     let agent_index = result.agent.index;
@@ -1722,6 +2044,7 @@ fn handle_prompt_result(
                 slot_history,
                 respawn_tx,
                 respawn_tasks,
+                observer.clone(),
             ) {
                 // Circuit open — slot stays empty until maintenance refill.
                 if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
@@ -1775,6 +2098,7 @@ fn handle_prompt_result(
                     slot_history,
                     respawn_tx,
                     respawn_tasks,
+                    observer,
                 ) && pool.live_count() == 0
                     && !any_respawn_in_flight(crash_history)
                 {
@@ -1808,6 +2132,7 @@ fn recover_panicked_agent(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
 ) {
     let task_id = join_error.id();
     let Some(meta) = pool.task_map_mut().remove(&task_id) else {
@@ -1874,7 +2199,7 @@ fn recover_panicked_agent(
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env).await;
+        let result = spawn_and_init(&cmd, &args, &env, i, observer).await;
         guard.send(result);
     });
 }
@@ -1892,6 +2217,7 @@ fn drain_ready_join_results(
     crash_history: &mut [SlotCircuit],
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
 ) -> LoopAction {
     while let Some(Some(join_result)) = pool.join_set.join_next().now_or_never() {
         if let Err(join_error) = join_result {
@@ -1907,6 +2233,7 @@ fn drain_ready_join_results(
                 crash_history,
                 respawn_tx,
                 respawn_tasks,
+                observer.clone(),
             );
             if pool.live_count() == 0 && !any_respawn_in_flight(crash_history) {
                 return LoopAction::Exit;
@@ -1991,6 +2318,7 @@ fn spawn_respawn_task(
     slot: &mut SlotCircuit,
     respawn_tx: &mpsc::Sender<RespawnResult>,
     respawn_tasks: &mut tokio::task::JoinSet<()>,
+    observer: Option<observer::ObserverHandle>,
 ) -> bool {
     let index = old_agent.index;
 
@@ -2027,7 +2355,7 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env).await;
+        let result = spawn_and_init(&cmd, &args, &env, index, observer).await;
         guard.send(result);
     });
 
@@ -2044,14 +2372,24 @@ async fn spawn_and_init(
     command: &str,
     args: &[String],
     extra_env: &[(String, String)],
+    agent_index: usize,
+    observer: Option<observer::ObserverHandle>,
 ) -> Result<AcpClient> {
     let mut acp = AcpClient::spawn(command, args, extra_env)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+    acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
         Ok(init_result) => {
             tracing::info!("agent initialized: {init_result}");
+            acp.observe(
+                "agent_initialized",
+                serde_json::json!({
+                    "agentIndex": agent_index,
+                    "initializeResult": init_result,
+                }),
+            );
             Ok(acp)
         }
         Err(e) => {
@@ -2230,12 +2568,6 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                         .expect("secret key bech32 encoding should never fail"),
                 },
             ];
-            if let Some(ref token) = config.api_token {
-                env.push(EnvVar {
-                    name: "SPROUT_API_TOKEN".into(),
-                    value: token.clone(),
-                });
-            }
             // Forward SPROUT_TOOLSETS so the MCP server enables the
             // same toolsets the operator configured for this harness.
             if let Ok(ts) = std::env::var("SPROUT_TOOLSETS") {
@@ -2243,6 +2575,16 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
                     env.push(EnvVar {
                         name: "SPROUT_TOOLSETS".into(),
                         value: ts,
+                    });
+                }
+            }
+            // Forward SPROUT_AUTH_TAG (NIP-OA owner attestation credential)
+            // so the MCP server can attach it to every signed event.
+            if let Ok(auth_tag) = std::env::var("SPROUT_AUTH_TAG") {
+                if !auth_tag.is_empty() {
+                    env.push(EnvVar {
+                        name: "SPROUT_AUTH_TAG".into(),
+                        value: auth_tag,
                     });
                 }
             }
@@ -2260,246 +2602,211 @@ mod owner_cache_tests {
     #[test]
     fn new_with_some_caches_immediately() {
         let cache = OwnerCache::new(Some("abcd".into()));
-        assert_eq!(cache.pubkey.as_deref(), Some("abcd"));
-        assert!(cache.last_attempt.is_some());
+        assert_eq!(cache.get(), Some("abcd"));
     }
 
     #[test]
-    fn new_with_none_has_no_attempt() {
+    fn new_with_none_returns_none() {
         let cache = OwnerCache::new(None);
-        assert!(cache.pubkey.is_none());
-        assert!(cache.last_attempt.is_none());
+        assert!(cache.get().is_none());
     }
 
     #[test]
-    fn get_or_resolve_returns_cached_immediately() {
-        // When pubkey is already cached, get_or_resolve should return it
-        // without any API call. We can verify this by checking the return
-        // value without providing a real RestClient (the method short-circuits
-        // before using it).
+    fn get_returns_cached_value() {
         let cache = OwnerCache::new(Some("ab".repeat(32)));
-        // We can't call get_or_resolve without a RestClient in a sync test,
-        // but we can verify the cache state directly.
-        assert_eq!(cache.pubkey.as_deref(), Some("ab".repeat(32)).as_deref());
-    }
-
-    #[test]
-    fn success_cached_for_process_lifetime() {
-        // After a successful resolution, pubkey stays cached even if
-        // last_attempt is old. The early return `if self.pubkey.is_some()`
-        // means the TTL check is never reached.
-        let mut cache = OwnerCache::new(Some("ab".repeat(32)));
-        // Simulate time passing by backdating last_attempt
-        cache.last_attempt = Some(std::time::Instant::now() - Duration::from_secs(3600));
-        // pubkey is still cached — success is permanent
-        assert!(cache.pubkey.is_some());
-    }
-
-    #[test]
-    fn failure_respects_ttl() {
-        // After a failed lookup, last_attempt is set. A subsequent call
-        // within the TTL window should NOT retry (stale == false).
-        let mut cache = OwnerCache::new(None);
-        cache.last_attempt = Some(std::time::Instant::now());
-        // Within TTL: stale check returns false, so no retry
-        let stale = cache
-            .last_attempt
-            .map(|t| t.elapsed() >= OWNER_CACHE_TTL)
-            .unwrap_or(true);
-        assert!(!stale, "should not be stale within TTL");
-    }
-
-    #[test]
-    fn failure_retries_after_ttl() {
-        // After TTL expires, the cache should consider itself stale.
-        let mut cache = OwnerCache::new(None);
-        cache.last_attempt = Some(std::time::Instant::now() - Duration::from_secs(61));
-        let stale = cache
-            .last_attempt
-            .map(|t| t.elapsed() >= OWNER_CACHE_TTL)
-            .unwrap_or(true);
-        assert!(stale, "should be stale after TTL");
-    }
-
-    #[test]
-    fn no_attempt_is_always_stale() {
-        let cache = OwnerCache::new(None);
-        let stale = cache
-            .last_attempt
-            .map(|t| t.elapsed() >= OWNER_CACHE_TTL)
-            .unwrap_or(true);
-        assert!(stale, "no prior attempt should be considered stale");
+        assert_eq!(cache.get(), Some("ab".repeat(32)).as_deref());
     }
 }
 
 #[cfg(test)]
-mod sibling_cache_tests {
+mod observer_chunk_coalescer_tests {
     use super::*;
 
-    const OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const AUTHOR_1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-    const AUTHOR_2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
-
-    #[test]
-    fn sibling_with_matching_owner_returns_true() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
-        );
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
-    }
-
-    #[test]
-    fn different_owner_returns_false() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_B.into())),
-        );
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(false));
-    }
-
-    #[test]
-    fn no_owner_on_profile_returns_false() {
-        let mut cache = SiblingCache::new();
-        cache.record(AUTHOR_1.into(), SiblingLookup::Resolved(None));
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(false));
-    }
-
-    #[test]
-    fn lookup_failure_returns_false() {
-        let mut cache = SiblingCache::new();
-        cache.record(AUTHOR_1.into(), SiblingLookup::Failed);
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(false));
-    }
-
-    #[test]
-    fn unknown_author_returns_none() {
-        let cache = SiblingCache::new();
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), None);
-    }
-
-    #[test]
-    fn record_normalizes_to_lowercase() {
-        let mut cache = SiblingCache::new();
-        let mixed_case = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(mixed_case.into())),
-        );
-        // Should match lowercase expected owner.
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
-    }
-
-    #[test]
-    fn positive_ttl_holds_within_window() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
-        );
-        // Freshly inserted — should be within 5-minute TTL.
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
-    }
-
-    #[test]
-    fn positive_ttl_expires() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
-        );
-        // Backdate the entry past the hit TTL.
-        if let Some((_, ts)) = cache.entries.get_mut(AUTHOR_1) {
-            *ts = std::time::Instant::now() - SIBLING_CACHE_HIT_TTL - Duration::from_secs(1);
+    fn chunk_event(
+        seq: u64,
+        update_type: &str,
+        message_id: &str,
+        text: &str,
+    ) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            seq,
+            timestamp: format!("2026-04-29T04:00:0{seq}Z"),
+            kind: "acp_read".to_string(),
+            agent_index: Some(0),
+            channel_id: Some("channel-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            payload: serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "session/update",
+                "params": {
+                    "sessionId": "session-1",
+                    "update": {
+                        "sessionUpdate": update_type,
+                        "messageId": message_id,
+                        "content": {
+                            "type": "text",
+                            "text": text,
+                        },
+                    },
+                },
+            }),
         }
-        assert_eq!(
-            cache.check(AUTHOR_1, OWNER_A),
-            None,
-            "should be stale after hit TTL"
-        );
     }
 
-    #[test]
-    fn negative_ttl_expires() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_B.into())),
-        );
-        // Backdate past the miss TTL.
-        if let Some((_, ts)) = cache.entries.get_mut(AUTHOR_1) {
-            *ts = std::time::Instant::now() - SIBLING_CACHE_MISS_TTL - Duration::from_secs(1);
+    fn non_chunk_event(seq: u64) -> observer::ObserverEvent {
+        observer::ObserverEvent {
+            seq,
+            timestamp: format!("2026-04-29T04:00:0{seq}Z"),
+            kind: "turn_started".to_string(),
+            agent_index: Some(0),
+            channel_id: Some("channel-1".to_string()),
+            session_id: Some("session-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            payload: serde_json::json!({ "type": "turn_started" }),
         }
-        assert_eq!(
-            cache.check(AUTHOR_1, OWNER_A),
-            None,
-            "should be stale after miss TTL"
-        );
+    }
+
+    fn chunk_text(event: &observer::ObserverEvent) -> &str {
+        event.payload["params"]["update"]["content"]["text"]
+            .as_str()
+            .expect("chunk text")
     }
 
     #[test]
-    fn negative_ttl_holds_within_window() {
-        let mut cache = SiblingCache::new();
-        cache.record(AUTHOR_1.into(), SiblingLookup::Failed);
-        // Freshly inserted — should be within 1-minute TTL.
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(false));
+    fn coalesces_chunks_until_non_chunk_event() {
+        let mut coalescer = ObserverChunkCoalescer::default();
+
+        assert!(coalescer
+            .ingest(chunk_event(1, "agent_message_chunk", "message-1", "hello "))
+            .is_empty());
+        assert!(coalescer
+            .ingest(chunk_event(2, "agent_message_chunk", "message-1", "world"))
+            .is_empty());
+
+        let events = coalescer.ingest(non_chunk_event(3));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].seq, 2);
+        assert_eq!(chunk_text(&events[0]), "hello world");
+        assert_eq!(events[1].kind, "turn_started");
     }
 
     #[test]
-    fn eviction_when_at_capacity() {
-        let mut cache = SiblingCache::new();
-        // Fill to capacity with unique authors.
-        for i in 0..SIBLING_CACHE_MAX_ENTRIES {
-            let author = format!("{:064x}", i);
-            cache.record(author, SiblingLookup::Resolved(Some(OWNER_A.into())));
+    fn keeps_independent_chunk_streams_separate() {
+        let mut coalescer = ObserverChunkCoalescer::default();
+
+        assert!(coalescer
+            .ingest(chunk_event(1, "agent_message_chunk", "message-1", "answer"))
+            .is_empty());
+        assert!(coalescer
+            .ingest(chunk_event(
+                2,
+                "agent_thought_chunk",
+                "thought-1",
+                "thinking"
+            ))
+            .is_empty());
+
+        let events = coalescer.flush();
+        assert_eq!(events.len(), 2);
+        assert_eq!(chunk_text(&events[0]), "answer");
+        assert_eq!(chunk_text(&events[1]), "thinking");
+    }
+}
+
+#[cfg(test)]
+mod build_mcp_servers_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Env-var-touching tests must run serially — env vars are process-global.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_config() -> Config {
+        Config {
+            keys: nostr::Keys::generate(),
+            relay_url: "ws://localhost:3000".into(),
+            agent_command: "goose".into(),
+            agent_args: vec!["acp".into()],
+            mcp_command: "sprout-mcp-server".into(),
+            idle_timeout_secs: 320,
+            max_turn_duration_secs: 3600,
+            agents: 1,
+            heartbeat_interval_secs: 0,
+            heartbeat_prompt: None,
+            system_prompt: None,
+            initial_message: None,
+            subscribe_mode: config::SubscribeMode::All,
+            dedup_mode: config::DedupMode::Queue,
+            multiple_event_handling: config::MultipleEventHandling::Queue,
+            ignore_self: true,
+            kinds_override: None,
+            channels_override: None,
+            no_mention_filter: false,
+            config_path: std::path::PathBuf::from("./sprout-acp.toml"),
+            context_message_limit: 12,
+            max_turns_per_session: 0,
+            presence_enabled: true,
+            typing_enabled: true,
+            model: None,
+            permission_mode: config::PermissionMode::BypassPermissions,
+            respond_to: config::RespondTo::Anyone,
+            respond_to_allowlist: std::collections::HashSet::new(),
+            persona_env_vars: vec![],
+            relay_observer: false,
+            agent_owner: None,
         }
-        assert_eq!(cache.entries.len(), SIBLING_CACHE_MAX_ENTRIES);
-
-        // Insert one more — should evict the oldest and stay at capacity.
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
-        );
-        assert_eq!(cache.entries.len(), SIBLING_CACHE_MAX_ENTRIES);
-
-        // The new entry should be present.
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
     }
 
     #[test]
-    fn update_existing_entry_refreshes_timestamp() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_B.into())),
-        );
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(false));
+    fn session_new_mcp_server_has_required_fields() {
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        assert_eq!(servers.len(), 1);
+        let server = &servers[0];
+        assert_eq!(server.name, "sprout-mcp");
 
-        // Update with new owner — should overwrite.
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
+        let names: Vec<&str> = server.env.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"SPROUT_RELAY_URL"),
+            "missing SPROUT_RELAY_URL; got {names:?}"
         );
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
+        assert!(
+            names.contains(&"SPROUT_PRIVATE_KEY"),
+            "missing SPROUT_PRIVATE_KEY; got {names:?}"
+        );
     }
 
     #[test]
-    fn multiple_authors_independent() {
-        let mut cache = SiblingCache::new();
-        cache.record(
-            AUTHOR_1.into(),
-            SiblingLookup::Resolved(Some(OWNER_A.into())),
-        );
-        cache.record(
-            AUTHOR_2.into(),
-            SiblingLookup::Resolved(Some(OWNER_B.into())),
-        );
+    fn session_new_mcp_server_forwards_sprout_auth_tag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPROUT_AUTH_TAG", "test-attestation-tag");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("SPROUT_AUTH_TAG");
 
-        assert_eq!(cache.check(AUTHOR_1, OWNER_A), Some(true));
-        assert_eq!(cache.check(AUTHOR_2, OWNER_A), Some(false));
-        assert_eq!(cache.check(AUTHOR_2, OWNER_B), Some(true));
+        let server = &servers[0];
+        let auth_tag_env = server.env.iter().find(|e| e.name == "SPROUT_AUTH_TAG");
+        assert!(
+            auth_tag_env.is_some(),
+            "SPROUT_AUTH_TAG should be forwarded when set"
+        );
+        assert_eq!(auth_tag_env.unwrap().value, "test-attestation-tag");
+    }
+
+    #[test]
+    fn session_new_mcp_server_skips_empty_sprout_auth_tag() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("SPROUT_AUTH_TAG", "");
+        let config = test_config();
+        let servers = build_mcp_servers(&config);
+        std::env::remove_var("SPROUT_AUTH_TAG");
+
+        let server = &servers[0];
+        let has_auth_tag = server.env.iter().any(|e| e.name == "SPROUT_AUTH_TAG");
+        assert!(
+            !has_auth_tag,
+            "empty SPROUT_AUTH_TAG should not be forwarded"
+        );
     }
 }

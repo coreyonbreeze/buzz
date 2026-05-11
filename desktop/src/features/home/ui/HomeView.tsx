@@ -20,7 +20,10 @@ import type { HomeFeedResponse } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 import { Skeleton } from "@/shared/ui/skeleton";
 
-function matchesInboxFilter(item: { categories: InboxFilter[] }, filter: InboxFilter) {
+function matchesInboxFilter(
+  item: { categories: InboxFilter[] },
+  filter: InboxFilter,
+) {
   if (filter === "all") {
     return item.categories.some((category) => category !== "activity");
   }
@@ -80,7 +83,9 @@ export function HomeView({
 }: HomeViewProps) {
   const [filter, setFilter] = React.useState<InboxFilter>("all");
   const [searchValue, setSearchValue] = React.useState("");
-  const [selectedItemId, setSelectedItemId] = React.useState<string | null>(null);
+  const [selectedItemId, setSelectedItemId] = React.useState<string | null>(
+    null,
+  );
   const [isDeletingMessage, setIsDeletingMessage] = React.useState(false);
   const [isSendingReply, setIsSendingReply] = React.useState(false);
   const [localRepliesByItemId, setLocalRepliesByItemId] = React.useState<
@@ -123,30 +128,24 @@ export function HomeView({
       .filter((event) => {
         if (event.id === selectedItemId) return false;
         const ref = getThreadReference(event.tags);
-        return (
-          ref.parentId === selectedItemId || ref.rootId === selectedItemId
-        );
+        return ref.parentId === selectedItemId || ref.rootId === selectedItemId;
       })
       .sort((a, b) => a.created_at - b.created_at);
   }, [channelMessages, selectedItemId]);
 
   const feedProfilePubkeys = React.useMemo(
-    () =>
-      [
-        ...new Set([
-          ...feedItems.map((item) => item.pubkey),
-          ...threadEvents.map((event) => event.pubkey),
-          ...(currentPubkey ? [currentPubkey] : []),
-        ]),
-      ],
+    () => [
+      ...new Set([
+        ...feedItems.map((item) => item.pubkey),
+        ...threadEvents.map((event) => event.pubkey),
+        ...(currentPubkey ? [currentPubkey] : []),
+      ]),
+    ],
     [currentPubkey, feedItems, threadEvents],
   );
-  const feedProfilesQuery = useUsersBatchQuery(
-    feedProfilePubkeys,
-    {
-      enabled: feedProfilePubkeys.length > 0,
-    },
-  );
+  const feedProfilesQuery = useUsersBatchQuery(feedProfilePubkeys, {
+    enabled: feedProfilePubkeys.length > 0,
+  });
   const feedProfiles = feedProfilesQuery.data?.profiles;
   const inboxItems = React.useMemo(
     () =>
@@ -345,8 +344,8 @@ export function HomeView({
                   : "You",
                 avatarUrl:
                   currentPubkey && feedProfiles
-                    ? (feedProfiles[currentPubkey.trim().toLowerCase()]?.avatarUrl ??
-                      null)
+                    ? (feedProfiles[currentPubkey.trim().toLowerCase()]
+                        ?.avatarUrl ?? null)
                     : null,
                 content,
                 fullTimestampLabel: formatInboxFullTimestamp(result.createdAt),

@@ -40,7 +40,10 @@ export function InboxListPane({
 
   return (
     <section className="flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-border/70 bg-background">
-      <div className="border-b border-border/70 px-4 pb-4 pt-8" data-tauri-drag-region>
+      <div
+        className="border-b border-border/70 px-4 pb-4 pt-8"
+        data-tauri-drag-region
+      >
         <div
           className="mb-4 flex min-w-0 items-center gap-2"
           data-tauri-drag-region
@@ -88,7 +91,9 @@ export function InboxListPane({
         {groups.length === 0 ? (
           <div className="flex h-full min-h-64 items-center justify-center px-6 text-center">
             <div>
-              <p className="text-sm font-medium text-foreground">No messages found</p>
+              <p className="text-sm font-medium text-foreground">
+                No messages found
+              </p>
               <p className="mt-1 text-sm text-muted-foreground">
                 Try a different search or switch back to all mail.
               </p>
@@ -96,7 +101,10 @@ export function InboxListPane({
           </div>
         ) : (
           groups.map((group) => (
-            <div className="border-b border-border/60 last:border-b-0" key={group.label}>
+            <div
+              className="border-b border-border/60 last:border-b-0"
+              key={group.label}
+            >
               <div className="sticky top-0 z-10 bg-background px-4 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/95">
                 <p className="text-xs font-semibold uppercase tracking-[0.18em] text-muted-foreground">
                   {group.label}

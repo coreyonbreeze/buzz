@@ -140,6 +140,14 @@ export type PresenceStatus = "online" | "away" | "offline";
 
 export type PresenceLookup = Record<string, PresenceStatus>;
 
+export type UserStatus = {
+  text: string;
+  emoji: string;
+  updatedAt: number;
+};
+
+export type UserStatusLookup = Record<string, UserStatus | null>;
+
 export type SetPresenceResult = {
   status: PresenceStatus;
   ttlSeconds: number;
@@ -178,6 +186,7 @@ export type FeedItem = {
   createdAt: number;
   channelId: string | null;
   channelName: string;
+  channelType?: string;
   tags: string[][];
   category: FeedItemCategory;
 };
@@ -209,6 +218,7 @@ export type GetHomeFeedInput = {
 export type SearchMessagesInput = {
   q: string;
   limit?: number;
+  channelId?: string;
 };
 
 export type SearchHit = {
@@ -227,42 +237,15 @@ export type SearchMessagesResponse = {
   found: number;
 };
 
-export type TokenScope =
-  | "messages:read"
-  | "messages:write"
-  | "channels:read"
-  | "channels:write"
-  | "users:read"
-  | "users:write"
-  | "files:read"
-  | "files:write";
+// ── Relay Members ────────────────────────────────────────────────────────────
 
-export type Token = {
-  id: string;
-  name: string;
-  scopes: TokenScope[];
-  channelIds: string[];
+export type RelayMemberRole = "owner" | "admin" | "member";
+
+export type RelayMember = {
+  pubkey: string;
+  role: RelayMemberRole;
+  addedBy: string | null;
   createdAt: string;
-  expiresAt: string | null;
-  lastUsedAt: string | null;
-  revokedAt: string | null;
-};
-
-export type MintTokenInput = {
-  name: string;
-  scopes: TokenScope[];
-  channelIds?: string[];
-  expiresInDays?: number;
-};
-
-export type MintTokenResponse = {
-  id: string;
-  token: string;
-  name: string;
-  scopes: TokenScope[];
-  channelIds: string[];
-  createdAt: string;
-  expiresAt: string | null;
 };
 
 export type RelayAgent = {
@@ -295,7 +278,6 @@ export type ManagedAgent = {
   systemPrompt: string | null;
   model: string | null;
   mcpToolsets: string | null;
-  hasApiToken: boolean;
   status: "running" | "stopped" | "deployed" | "not_deployed";
   pid: number | null;
   createdAt: string;
@@ -339,9 +321,6 @@ export type CreateManagedAgentInput = {
   avatarUrl?: string;
   model?: string;
   mcpToolsets?: string;
-  mintToken?: boolean;
-  tokenScopes?: TokenScope[];
-  tokenName?: string;
   spawnAfterCreate?: boolean;
   startOnAppLaunch?: boolean;
   backend?: ManagedAgentBackend;
@@ -350,25 +329,17 @@ export type CreateManagedAgentInput = {
 export type CreateManagedAgentResponse = {
   agent: ManagedAgent;
   privateKeyNsec: string;
-  apiToken: string | null;
   profileSyncError: string | null;
   spawnError: string | null;
-};
-
-export type MintManagedAgentTokenInput = {
-  pubkey: string;
-  tokenName?: string;
-  scopes?: TokenScope[];
-};
-
-export type MintManagedAgentTokenResponse = {
-  agent: ManagedAgent;
-  token: string;
 };
 
 export type ManagedAgentLog = {
   content: string;
   logPath: string;
+};
+
+export type CancelManagedAgentTurnResult = {
+  status: "sent" | "no_active_turn";
 };
 
 export type AcpProvider = {
@@ -460,6 +431,7 @@ export type AgentTeam = {
   name: string;
   description: string | null;
   personaIds: string[];
+  isBuiltin: boolean;
   createdAt: string;
   updatedAt: string;
 };

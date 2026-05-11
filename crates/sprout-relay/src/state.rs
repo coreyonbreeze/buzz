@@ -22,7 +22,6 @@ use sprout_pubsub::PubSubManager;
 use sprout_search::SearchService;
 use sprout_workflow::WorkflowEngine;
 
-use crate::api::tokens::MintRateLimiter;
 use crate::audio::AudioRoomManager;
 use crate::config::Config;
 use crate::connection::{ConnectionSubscriptions, SLOW_CLIENT_GRACE_LIMIT};
@@ -181,16 +180,17 @@ pub struct AppState {
     pub conn_semaphore: Arc<Semaphore>,
     /// Semaphore limiting concurrent message handler tasks.
     pub handler_semaphore: Arc<Semaphore>,
+    /// Semaphore limiting concurrent git subprocess operations.
+    pub git_semaphore: Arc<Semaphore>,
+    /// Per-repo mutex map — prevents concurrent pushes to the same bare repo.
+    /// Key: canonical repo path. Value: mutex guarding exclusive push access.
+    pub git_repo_locks: Arc<DashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+
     /// Workflow engine for background processing.
     pub workflow_engine: Arc<WorkflowEngine>,
     /// Relay signing keypair — used to sign system messages (kind 40099).
     pub relay_keypair: nostr::Keys,
-    /// Rate limiter for `POST /api/tokens` — 5 mints per pubkey per hour.
-    pub mint_rate_limiter: Arc<MintRateLimiter>,
-    /// Debounce cache for `last_used_at` token updates — avoids a DB write on every request.
-    /// Entries map token UUID → last time we wrote `last_used_at` to the DB.
-    /// Resets on restart (acceptable — `last_used_at` is informational, not security-critical).
-    pub last_used_cache: Arc<DashMap<Uuid, Instant>>,
+
     /// Recently-published event IDs for local-echo deduplication.
     /// Events fanned out in-process are added here; the Redis subscriber
     /// consumer skips them to avoid double delivery. Entries expire after
@@ -219,6 +219,20 @@ pub struct AppState {
     pub shutting_down: Arc<AtomicBool>,
     /// Process start time — used by `/_status` endpoint.
     pub started_at: Instant,
+    /// NIP-98 replay prevention: recently-seen event IDs.
+    /// 2× the ±60s tolerance window so entries outlive the acceptance window.
+    pub nip98_seen: Arc<moka::sync::Cache<[u8; 32], ()>>,
+
+    /// Per-agent sliding-window rate limiter for observer frames (kind 24200).
+    /// Key: agent pubkey bytes (32). Value: (count, window_start).
+    /// 100 events/sec per agent — prevents relay/DB pressure from bursty telemetry.
+    pub observer_rate_limiter: Arc<DashMap<[u8; 32], (u32, Instant)>>,
+    /// Cache for observer agent-owner authorization (kind 24200).
+    /// Key: (agent_pubkey_bytes, owner_pubkey_bytes). Value: is_owner.
+    /// agent_owner_pubkey is immutable so a long TTL (5 min) is safe.
+    /// Prevents repeated DB lookups from bursty observer traffic.
+    #[allow(clippy::type_complexity)]
+    pub observer_owner_cache: Arc<moka::sync::Cache<(Vec<u8>, Vec<u8>), bool>>,
 }
 
 impl AppState {
@@ -301,6 +315,7 @@ impl AppState {
             tracing::warn!("audit log worker exited (expected on shutdown)");
         });
 
+        let git_max_concurrent_ops = config.git_max_concurrent_ops;
         let state = Self {
             config: Arc::new(config),
             db,
@@ -313,10 +328,11 @@ impl AppState {
             conn_manager: Arc::new(ConnectionManager::new()),
             conn_semaphore: Arc::new(Semaphore::new(max_connections)),
             handler_semaphore: Arc::new(Semaphore::new(max_concurrent_handlers)),
+            git_semaphore: Arc::new(Semaphore::new(git_max_concurrent_ops)),
+            git_repo_locks: Arc::new(DashMap::new()),
             workflow_engine,
             relay_keypair,
-            mint_rate_limiter: Arc::new(MintRateLimiter::new()),
-            last_used_cache: Arc::new(DashMap::new()),
+
             local_event_ids: Arc::new(
                 moka::sync::Cache::builder()
                     .max_capacity(10_000)
@@ -342,6 +358,19 @@ impl AppState {
             audio_rooms: Arc::new(AudioRoomManager::new()),
             shutting_down: Arc::new(AtomicBool::new(false)),
             started_at: Instant::now(),
+            nip98_seen: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(10_000)
+                    .time_to_live(std::time::Duration::from_secs(120))
+                    .build(),
+            ),
+            observer_rate_limiter: Arc::new(DashMap::new()),
+            observer_owner_cache: Arc::new(
+                moka::sync::Cache::builder()
+                    .max_capacity(1_000)
+                    .time_to_live(std::time::Duration::from_secs(300))
+                    .build(),
+            ),
         };
         (
             state,

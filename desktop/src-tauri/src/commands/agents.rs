@@ -1,22 +1,21 @@
 use nostr::{Keys, ToBech32};
+use nostr_compat;
 use tauri::{AppHandle, State};
 
 use crate::{
     app_state::AppState,
     managed_agents::{
-        build_managed_agent_summary, default_token_scopes, discover_provider_candidates,
-        ensure_persona_is_active, find_managed_agent_mut, invoke_provider, load_managed_agents,
-        load_personas, managed_agent_avatar_url, managed_agent_log_path, managed_agents_base_dir,
-        mint_token_via_api, normalize_agent_args, provider_deploy, read_log_tail,
-        resolve_provider_binary, save_managed_agents, start_managed_agent_process,
-        stop_managed_agent_process, sync_managed_agent_processes, validate_provider_config,
-        BackendKind, BackendProviderInfo, CreateManagedAgentRequest, CreateManagedAgentResponse,
-        ManagedAgentLogResponse, ManagedAgentRecord, ManagedAgentSummary,
-        MintManagedAgentTokenRequest, MintManagedAgentTokenResponse, DEFAULT_ACP_COMMAND,
-        DEFAULT_AGENT_COMMAND, DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS,
-        DEFAULT_MCP_COMMAND,
+        build_managed_agent_summary, discover_provider_candidates, ensure_persona_is_active,
+        find_managed_agent_mut, invoke_provider, load_managed_agents, load_personas,
+        managed_agent_avatar_url, managed_agent_log_path, managed_agents_base_dir,
+        normalize_agent_args, provider_deploy, read_log_tail, resolve_provider_binary,
+        save_managed_agents, start_managed_agent_process, stop_managed_agent_process,
+        sync_managed_agent_processes, validate_provider_config, BackendKind, BackendProviderInfo,
+        CreateManagedAgentRequest, CreateManagedAgentResponse, ManagedAgentLogResponse,
+        ManagedAgentRecord, ManagedAgentSummary, DEFAULT_ACP_COMMAND, DEFAULT_AGENT_COMMAND,
+        DEFAULT_AGENT_PARALLELISM, DEFAULT_AGENT_TURN_TIMEOUT_SECONDS, DEFAULT_MCP_COMMAND,
     },
-    relay::{relay_ws_url, sync_managed_agent_profile},
+    relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
 };
 
@@ -26,7 +25,7 @@ fn build_deploy_payload(record: &ManagedAgentRecord) -> serde_json::Value {
         "name": &record.name,
         "relay_url": &record.relay_url,
         "private_key_nsec": &record.private_key_nsec,
-        "api_token": &record.api_token,
+        "auth_tag": &record.auth_tag,
         "agent_command": &record.agent_command,
         "agent_args": &record.agent_args,
         "system_prompt": &record.system_prompt,
@@ -152,18 +151,8 @@ pub async fn create_managed_agent(
         }
     }
 
-    // ── Phase 1: generate keys and collect mint parameters (sync lock) ────────
-    // We do NOT mint here — minting is async and must happen outside the lock.
-    let (
-        agent_keys,
-        private_key_nsec,
-        pubkey,
-        resolved_relay_url,
-        token_scopes,
-        token_name,
-        mint_token,
-        input,
-    ) = {
+    // ── Phase 1: generate keys (sync lock) ────────────────────────────────────
+    let (agent_keys, private_key_nsec, pubkey, resolved_relay_url, input) = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -191,106 +180,38 @@ pub async fn create_managed_agent(
             .to_bech32()
             .map_err(|error| format!("failed to encode private key: {error}"))?;
 
-        let token_scopes = if input.mint_token {
-            let requested = input
-                .token_scopes
-                .iter()
-                .map(|scope| scope.trim().to_string())
-                .filter(|scope| !scope.is_empty())
-                .collect::<Vec<_>>();
-            if requested.is_empty() {
-                default_token_scopes()
-            } else {
-                requested
-            }
-        } else {
-            Vec::new()
-        };
-
-        let token_name = input
-            .token_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or(name.as_str())
-            .to_string();
-
         let resolved_relay_url = input
             .relay_url
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_string)
-            .unwrap_or_else(relay_ws_url);
+            .unwrap_or_else(|| relay_ws_url_with_override(&state));
 
-        let mint_token = input.mint_token;
-        (
-            keys,
-            private_key_nsec,
-            pubkey,
-            resolved_relay_url,
-            token_scopes,
-            token_name,
-            mint_token,
-            input,
-        )
+        (keys, private_key_nsec, pubkey, resolved_relay_url, input)
     };
 
     // ── Pre-Phase 2: validate provider config BEFORE any side effects ────────
     if let BackendKind::Provider { ref config, ref id } = input.backend {
-        // Provider agents MUST mint a token so the relay establishes ownership.
-        // Without ownership the harness ignores !shutdown — the agent becomes
-        // uncontrollable. Reject early rather than deploy an unstoppable agent.
-        if !mint_token {
-            return Err(
-                "provider-backed agents require a minted token (ownership is established during mint)"
-                    .to_string(),
-            );
-        }
-        // Enforce minimum scopes for remote agents. The harness needs users:read
-        // to query its owner (for !shutdown). Without it, the agent is unstoppable.
-        const REQUIRED_PROVIDER_SCOPES: &[&str] = &[
-            "messages:read",
-            "messages:write",
-            "channels:read",
-            "users:read",
-        ];
-        for required in REQUIRED_PROVIDER_SCOPES {
-            if !token_scopes.iter().any(|s| s == required) {
-                return Err(format!(
-                    "provider-backed agents require the '{required}' scope"
-                ));
-            }
-        }
         validate_provider_config(config)?;
         // Validate via discovered candidates — not raw resolve_command.
         resolve_provider_binary(id)?;
     }
 
-    // ── Phase 2: mint token via REST API (async, outside lock) ───────────────
-    // Pass the desktop user's pubkey as the agent owner so the relay records
-    // the ownership chain. Only NIP-98 bootstrap mints can set owner_pubkey.
-    let user_pubkey_hex = {
-        let keys = state.keys.lock().map_err(|e| e.to_string())?;
-        keys.public_key().to_hex()
+    // ── Phase 2: compute NIP-OA auth tag (sync) ──────────────────────────────
+    // Agents authenticate via the auth tag in their kind:0 profile event.
+    // No tokens are minted. Fail closed: bad auth tag → don't create agent.
+    let auth_tag = {
+        let owner_keys = state.keys.lock().map_err(|e| e.to_string())?;
+        // Bridge nostr 0.37 → 0.36 (sprout-sdk) via hex round-trip.
+        let compat_owner = nostr_compat::Keys::parse(&owner_keys.secret_key().to_secret_hex())
+            .map_err(|e| format!("failed to bridge owner keys: {e}"))?;
+        let compat_agent = nostr_compat::PublicKey::from_hex(&agent_keys.public_key().to_hex())
+            .map_err(|e| format!("failed to bridge agent pubkey: {e}"))?;
+        let tag = sprout_sdk::nip_oa::compute_auth_tag(&compat_owner, &compat_agent, "")
+            .map_err(|e| format!("failed to compute NIP-OA auth tag: {e}"))?;
+        Some(tag)
     };
-    let api_token: Option<String> = if mint_token {
-        let token = mint_token_via_api(
-            &state,
-            &agent_keys,
-            &resolved_relay_url,
-            &token_name,
-            &token_scopes,
-            Some(&user_pubkey_hex),
-        )
-        .await?;
-        Some(token)
-    } else {
-        None
-    };
-
-    // Agent ownership is set atomically during token mint via owner_pubkey
-    // in the request body — no separate API call needed.
 
     // ── Phase 3: save record and optionally spawn (sync lock) ─────────────────
     let (agent, spawn_error) = {
@@ -361,7 +282,7 @@ pub async fn create_managed_agent(
             name: name.clone(),
             persona_id: requested_persona_id.clone(),
             private_key_nsec: private_key_nsec.clone(),
-            api_token: api_token.clone(),
+            auth_tag: auth_tag.clone(),
             relay_url: resolved_relay_url.clone(),
             acp_command: input
                 .acp_command
@@ -408,9 +329,7 @@ pub async fn create_managed_agent(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(str::to_string),
-            // Provider agents don't auto-start with the desktop — they're
-            // managed externally. Force false to avoid persisting a flag the
-            // app will never honor.
+            // Provider agents are managed externally — force false.
             start_on_app_launch: if input.backend != BackendKind::Local {
                 false
             } else {
@@ -420,13 +339,9 @@ pub async fn create_managed_agent(
             backend: input.backend.clone(),
             backend_agent_id: None,
             provider_binary_path,
-            // If the persona came from a pack, record the installed pack path
-            // and the persona's internal name within the pack so the runtime
-            // can resolve pack-specific config at startup via ACP.
-            //
-            // Important: persona_name_in_pack must be the internal `name` slug
-            // (e.g., "lep"), NOT the display_name (e.g., "Lep"). ACP's
-            // resolve_persona_by_name() matches on the internal name.
+            // Pack-backed personas: record path + internal slug so the runtime
+            // can resolve pack config at startup. Must be the slug (e.g., "lep"),
+            // NOT the display_name — ACP's resolve_persona_by_name() matches slugs.
             persona_pack_path: pack_metadata.as_ref().map(|(path, _)| path.clone()),
             persona_name_in_pack: pack_metadata.as_ref().map(|(_, name)| name.clone()),
             created_at: now_iso(),
@@ -471,10 +386,9 @@ pub async fn create_managed_agent(
         &state,
         &resolved_relay_url,
         &agent_keys,
-        api_token.as_deref(),
-        &token_scopes,
         &name,
         avatar_url.as_deref(),
+        auth_tag.as_deref(),
     )
     .await)
         .err();
@@ -530,7 +444,6 @@ pub async fn create_managed_agent(
     Ok(CreateManagedAgentResponse {
         agent: final_agent,
         private_key_nsec,
-        api_token,
         profile_sync_error,
         spawn_error,
     })
@@ -700,104 +613,6 @@ pub fn delete_managed_agent(
         return Err(format!("agent {pubkey} not found"));
     }
     save_managed_agents(&app, &records)
-}
-
-#[tauri::command]
-pub async fn mint_managed_agent_token(
-    input: MintManagedAgentTokenRequest,
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<MintManagedAgentTokenResponse, String> {
-    // ── Phase 1: load agent record and collect mint parameters (sync lock) ────
-    let (agent_keys, relay_url, scopes, token_name) = {
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
-        let mut runtimes = state
-            .managed_agent_processes
-            .lock()
-            .map_err(|error| error.to_string())?;
-
-        if sync_managed_agent_processes(&mut records, &mut runtimes) {
-            save_managed_agents(&app, &records)?;
-        }
-        let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
-
-        let scopes = {
-            let requested = input
-                .scopes
-                .into_iter()
-                .map(|scope| scope.trim().to_string())
-                .filter(|scope| !scope.is_empty())
-                .collect::<Vec<_>>();
-            if requested.is_empty() {
-                default_token_scopes()
-            } else {
-                requested
-            }
-        };
-
-        let token_name = input
-            .token_name
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("{}-token", record.name));
-
-        // Reconstruct the agent's keypair from the stored nsec so we can sign
-        // the NIP-98 auth event as the agent (not the desktop user).
-        let agent_keys = Keys::parse(&record.private_key_nsec)
-            .map_err(|e| format!("failed to parse agent secret key: {e}"))?;
-
-        (agent_keys, record.relay_url.clone(), scopes, token_name)
-    };
-
-    // ── Phase 2: mint token via REST API (async, outside lock) ───────────────
-    // Re-minting: do NOT send owner_pubkey. Ownership was established during
-    // the first mint (create flow). Sending it again would be rejected by the
-    // relay if the owner is already set to a different pubkey.
-    let minted_token =
-        mint_token_via_api(&state, &agent_keys, &relay_url, &token_name, &scopes, None).await?;
-
-    // ── Phase 3: persist new token to agent record (sync lock) ───────────────
-    let (agent, api_token) = {
-        let _store_guard = state
-            .managed_agents_store_lock
-            .lock()
-            .map_err(|error| error.to_string())?;
-        let mut records = load_managed_agents(&app)?;
-        let mut runtimes = state
-            .managed_agent_processes
-            .lock()
-            .map_err(|error| error.to_string())?;
-
-        if sync_managed_agent_processes(&mut records, &mut runtimes) {
-            save_managed_agents(&app, &records)?;
-        }
-        let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
-        record.api_token = Some(minted_token.clone());
-        record.updated_at = now_iso();
-        record.last_error = None;
-        let pubkey = record.pubkey.clone();
-
-        save_managed_agents(&app, &records)?;
-
-        let record = records
-            .iter()
-            .find(|record| record.pubkey == pubkey)
-            .ok_or_else(|| format!("agent {pubkey} not found"))?;
-        let agent = build_managed_agent_summary(&app, record, &runtimes)?;
-
-        (agent, minted_token)
-    };
-
-    Ok(MintManagedAgentTokenResponse {
-        agent,
-        token: api_token,
-    })
 }
 
 #[tauri::command]

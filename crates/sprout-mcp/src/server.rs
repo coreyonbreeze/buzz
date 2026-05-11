@@ -1,16 +1,38 @@
-use nostr::EventId;
+use nostr::{Alphabet, EventBuilder, EventId, Filter, JsonUtil, Kind, SingleLetterTag, Tag};
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router, ServerHandler,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::relay_client::RelayClient;
+use sprout_core::kind;
 use sprout_core::PresenceStatus;
+
+/// Helper to create a lowercase single-letter tag for Nostr filter custom_tag.
+fn tag_h() -> SingleLetterTag {
+    SingleLetterTag::lowercase(Alphabet::H)
+}
+fn tag_d() -> SingleLetterTag {
+    SingleLetterTag::lowercase(Alphabet::D)
+}
+fn tag_e() -> SingleLetterTag {
+    SingleLetterTag::lowercase(Alphabet::E)
+}
+fn tag_p() -> SingleLetterTag {
+    SingleLetterTag::lowercase(Alphabet::P)
+}
+
+/// Convert a sprout-core kind constant (u32) to a nostr Kind.
+fn k(kind_num: u32) -> Kind {
+    Kind::Custom(kind_num as u16)
+}
 
 /// Percent-encode a string for safe inclusion in a URL query parameter value.
 /// Encodes all characters except unreserved ones (A-Z a-z 0-9 - _ . ~).
+#[cfg(test)]
 fn percent_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for byte in s.bytes() {
@@ -137,23 +159,53 @@ async fn resolve_content_mentions(
     if names.is_empty() {
         return vec![];
     }
-    let body = client
-        .get(&format!("/api/channels/{channel_id}/members"))
-        .await
-        .unwrap_or_default();
-    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or_default();
-    let Some(members) = parsed["members"].as_array() else {
+    // Query membership list (kind:39002) for this channel.
+    let filter = Filter::new()
+        .kind(k(kind::KIND_NIP29_GROUP_MEMBERS))
+        .custom_tag(tag_d(), [channel_id])
+        .limit(1);
+    let events = match client.query(vec![filter]).await {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
+    let Some(event) = events.first() else {
         return vec![];
     };
+    // Members are in p-tags. We need profiles to match display names.
+    let member_pubkeys: Vec<&str> = event
+        .tags
+        .iter()
+        .filter(|t| t.as_slice().first().map(|v| v.as_str()) == Some("p"))
+        .filter_map(|t| t.as_slice().get(1).map(|v| v.as_str()))
+        .collect();
+    if member_pubkeys.is_empty() {
+        return vec![];
+    }
+    // Fetch profiles for members.
+    let authors: Vec<nostr::PublicKey> = member_pubkeys
+        .iter()
+        .filter_map(|pk| nostr::PublicKey::from_hex(pk).ok())
+        .collect();
+    let profile_filter = Filter::new()
+        .kind(k(kind::KIND_PROFILE))
+        .authors(authors)
+        .limit(member_pubkeys.len());
+    let profiles = match client.query(vec![profile_filter]).await {
+        Ok(e) => e,
+        Err(_) => return vec![],
+    };
     let mut pubkeys = Vec::new();
-    for m in members {
-        let Some(dn) = m["display_name"].as_str() else {
+    for profile in &profiles {
+        let Ok(content) = serde_json::from_str::<serde_json::Value>(&profile.content) else {
             continue;
         };
-        if names.iter().any(|n| n.eq_ignore_ascii_case(dn)) {
-            if let Some(pk) = m["pubkey"].as_str() {
-                pubkeys.push(pk.to_ascii_lowercase());
-            }
+        let display_name = content
+            .get("display_name")
+            .or_else(|| content.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if names.iter().any(|n| n.eq_ignore_ascii_case(display_name)) {
+            pubkeys.push(profile.pubkey.to_hex());
         }
     }
     pubkeys
@@ -178,6 +230,10 @@ pub struct SendMessageParams {
     /// Pubkeys to @mention in the message.
     #[serde(default)]
     pub mention_pubkeys: Option<Vec<String>>,
+    /// Optional file paths to upload and attach as media. Each file is uploaded
+    /// to the relay and included as an imeta tag + markdown image in the message.
+    #[serde(default)]
+    pub file_paths: Option<Vec<String>>,
 }
 fn default_kind() -> Option<u16> {
     Some(sprout_core::kind::KIND_STREAM_MESSAGE as u16)
@@ -805,6 +861,13 @@ fn infer_language(file_path: &str) -> Option<String> {
     Some(lang.to_string())
 }
 
+/// Parameters for the `upload_file` tool.
+#[derive(Debug, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct UploadFileParams {
+    /// Local filesystem path to the file to upload.
+    pub file_path: String,
+}
+
 /// The MCP server that exposes Sprout relay functionality as tools.
 #[derive(Clone)]
 pub struct SproutMcpServer {
@@ -844,16 +907,21 @@ impl SproutMcpServer {
         parent_event_id: &str,
         parent_eid: EventId,
     ) -> Result<sprout_sdk::ThreadRef, String> {
-        let resp = self
+        let filter = Filter::new().id(parent_eid).limit(1);
+        let events = self
             .client
-            .get(&format!("/api/events/{}", parent_event_id))
+            .query(vec![filter])
             .await
             .map_err(|e| format!("failed to fetch parent event: {e}"))?;
 
-        let event_json: serde_json::Value = serde_json::from_str(&resp)
-            .map_err(|e| format!("failed to parse parent event: {e}"))?;
+        let parent_event = events
+            .first()
+            .ok_or_else(|| "parent event not found".to_string())?;
 
-        let root_eid = match find_root_from_tags(&event_json["tags"]) {
+        let tags_json = serde_json::to_value(&parent_event.tags)
+            .map_err(|e| format!("failed to serialize tags: {e}"))?;
+
+        let root_eid = match find_root_from_tags(&tags_json) {
             Some(root_hex) if root_hex != parent_event_id => EventId::from_hex(&root_hex)
                 .map_err(|e| format!("failed to parse root event id: {e}"))?,
             _ => parent_eid,
@@ -938,11 +1006,53 @@ Default kind is 9 (stream message)."
         let mention_refs: Vec<&str> = mentions.iter().map(String::as_str).collect();
         let broadcast = p.broadcast_to_channel.unwrap_or(false);
 
+        // Upload files and build media tags
+        let mut media_tags: Vec<Vec<String>> = Vec::new();
+        let mut media_content = String::new();
+        if let Some(ref paths) = p.file_paths {
+            for path in paths {
+                match crate::upload::upload_file(
+                    self.client.http_client(),
+                    self.client.keys(),
+                    &self.client.relay_http_url(),
+                    self.client.server_domain().as_deref(),
+                    path,
+                    self.client.auth_tag_json().as_deref(),
+                )
+                .await
+                {
+                    Ok(desc) => {
+                        media_tags.push(crate::upload::build_imeta_tag(&desc));
+                        if desc.mime_type.starts_with("video/") {
+                            media_content.push_str("\n![video](");
+                        } else {
+                            media_content.push_str("\n![image](");
+                        }
+                        media_content.push_str(&desc.url);
+                        media_content.push(')');
+                    }
+                    Err(e) => {
+                        return format!("Error uploading {}: {e}", path);
+                    }
+                }
+            }
+        }
+        let final_content = if media_content.is_empty() {
+            p.content.clone()
+        } else {
+            format!("{}{}", p.content, media_content)
+        };
+
         // Build the event builder via SDK, routing by kind.
         let builder = match kind_num as u32 {
             sprout_core::kind::KIND_FORUM_POST => {
                 // kind 45001: forum post (no thread ref, no broadcast)
-                match sprout_sdk::build_forum_post(channel_uuid, &p.content, &mention_refs, &[]) {
+                match sprout_sdk::build_forum_post(
+                    channel_uuid,
+                    &final_content,
+                    &mention_refs,
+                    &media_tags,
+                ) {
                     Ok(b) => b,
                     Err(e) => return format!("Error: {e}"),
                 }
@@ -964,10 +1074,10 @@ Default kind is 9 (stream message)."
                 };
                 match sprout_sdk::build_forum_comment(
                     channel_uuid,
-                    &p.content,
+                    &final_content,
                     &thread_ref,
                     &mention_refs,
-                    &[],
+                    &media_tags,
                 ) {
                     Ok(b) => b,
                     Err(e) => return format!("Error: {e}"),
@@ -989,11 +1099,11 @@ Default kind is 9 (stream message)."
                 };
                 match sprout_sdk::build_message(
                     channel_uuid,
-                    &p.content,
+                    &final_content,
                     thread_ref.as_ref(),
                     &mention_refs,
                     broadcast && p.parent_event_id.is_some(),
-                    &[],
+                    &media_tags,
                 ) {
                     Ok(b) => b,
                     Err(e) => return format!("Error: {e}"),
@@ -1001,7 +1111,7 @@ Default kind is 9 (stream message)."
             }
         };
 
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign message event: {e}"),
         };
@@ -1115,7 +1225,7 @@ The diff is rendered with GitHub-quality visualization in the desktop client."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign diff event: {e}"),
         };
@@ -1166,7 +1276,7 @@ The diff is rendered with GitHub-quality visualization in the desktop client."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign edit event: {e}"),
         };
@@ -1199,28 +1309,21 @@ The diff is rendered with GitHub-quality visualization in the desktop client."
         };
 
         // Fetch the event to extract its channel_id (h-tag) — required by build_delete_message.
-        let resp = match self
-            .client
-            .get(&format!("/api/events/{}", p.event_id))
-            .await
-        {
-            Ok(r) => r,
+        let filter = Filter::new().id(target_eid).limit(1);
+        let fetched = match self.client.query(vec![filter]).await {
+            Ok(e) => e,
             Err(e) => return format!("Error: failed to fetch event: {e}"),
         };
-        let event_json: serde_json::Value = match serde_json::from_str(&resp) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: failed to parse event: {e}"),
+        let fetched_event = match fetched.first() {
+            Some(e) => e,
+            None => return format!("Error: event '{}' not found", p.event_id),
         };
-        let channel_id_str = match event_json["tags"].as_array().and_then(|tags| {
-            tags.iter().find_map(|t| {
-                let parts = t.as_array()?;
-                if parts.first()?.as_str() == Some("h") {
-                    parts.get(1)?.as_str().map(|s| s.to_string())
-                } else {
-                    None
-                }
-            })
-        }) {
+        let channel_id_str = match fetched_event
+            .tags
+            .iter()
+            .find(|t| t.as_slice().first().map(|v| v.as_str()) == Some("h"))
+            .and_then(|t| t.as_slice().get(1).map(|v| v.to_string()))
+        {
             Some(id) => id,
             None => return "Error: could not find channel_id (h-tag) on event".to_string(),
         };
@@ -1233,7 +1336,7 @@ The diff is rendered with GitHub-quality visualization in the desktop client."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign delete event: {e}"),
         };
@@ -1263,33 +1366,56 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             return format!("Error: {e}");
         }
 
-        const MAX_HISTORY_LIMIT: u32 = 200;
-        let limit = p.limit.unwrap_or(50).min(MAX_HISTORY_LIMIT);
+        const MAX_HISTORY_LIMIT: usize = 200;
+        let limit = p.limit.unwrap_or(50).min(MAX_HISTORY_LIMIT as u32) as usize;
 
-        // Use the REST endpoint so callers get the canonical history payload.
-        // Note: with_threads is legacy — summaries are always included server-side.
-        let with_threads = p.with_threads.unwrap_or(false);
-        let mut query_parts: Vec<String> = Vec::new();
-        if with_threads {
-            query_parts.push("with_threads=true".to_string());
-        }
-        query_parts.push(format!("limit={limit}"));
+        // Build filter for channel messages (stream messages, edits, diffs, forum posts/comments).
+        let message_kinds: Vec<Kind> = if let Some(ref kinds_str) = p.kinds {
+            kinds_str
+                .split(',')
+                .filter_map(|s| s.trim().parse::<u16>().ok())
+                .map(Kind::from)
+                .collect()
+        } else {
+            vec![
+                k(kind::KIND_STREAM_MESSAGE),
+                k(kind::KIND_STREAM_MESSAGE_V2),
+                k(kind::KIND_STREAM_MESSAGE_DIFF),
+                k(kind::KIND_FORUM_POST),
+                k(kind::KIND_FORUM_COMMENT),
+            ]
+        };
+
+        let mut filter = Filter::new()
+            .kinds(message_kinds)
+            .custom_tag(tag_h(), [&p.channel_id])
+            .limit(limit);
+
         if let Some(before) = p.before {
-            query_parts.push(format!("before={before}"));
+            filter = filter.until(nostr::Timestamp::from(before as u64));
         }
         if let Some(since) = p.since {
-            query_parts.push(format!("since={since}"));
+            filter = filter.since(nostr::Timestamp::from(since as u64));
         }
-        if let Some(ref kinds) = p.kinds {
-            query_parts.push(format!("kinds={}", percent_encode(kinds)));
-        }
-        let path = format!(
-            "/api/channels/{}/messages?{}",
-            p.channel_id,
-            query_parts.join("&")
-        );
-        match self.client.get(&path).await {
-            Ok(body) => body,
+
+        match self.client.query(vec![filter]).await {
+            Ok(mut events) => {
+                events.sort_by_key(|e| e.created_at);
+                let result: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "kind": e.kind.as_u16(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "tags": e.tags.iter().map(|t| t.as_slice()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&result).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1300,16 +1426,49 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         description = "List Sprout channels accessible to this agent"
     )]
     pub async fn list_channels(&self, Parameters(p): Parameters<ListChannelsParams>) -> String {
-        // Use the REST endpoint — faster and simpler than a WebSocket subscription.
-        let path = if let Some(ref vis) = p.visibility {
-            // percent-encode the visibility value to prevent query-string injection
-            let encoded = percent_encode(vis);
-            format!("/api/channels?visibility={encoded}")
-        } else {
-            "/api/channels".to_string()
-        };
-        match self.client.get(&path).await {
-            Ok(body) => body,
+        // Query channel metadata events (kind:41 = NIP-29 group metadata).
+        let filter = Filter::new()
+            .kind(k(kind::KIND_CHANNEL_METADATA))
+            .limit(500);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let channels: Vec<serde_json::Value> = events
+                    .iter()
+                    .filter(|e| {
+                        if let Some(ref vis) = p.visibility {
+                            // Filter by visibility tag if specified
+                            e.tags
+                                .iter()
+                                .any(|t| {
+                                    let s = t.as_slice();
+                                    s.first().map(|v| v.as_str()) == Some("visibility")
+                                        && s.get(1).map(|v| v.as_str()) == Some(vis.as_str())
+                                })
+                        } else {
+                            true
+                        }
+                    })
+                    .map(|e| {
+                        let content: serde_json::Value =
+                            serde_json::from_str(&e.content).unwrap_or(serde_json::json!({}));
+                        let channel_id = e
+                            .tags
+                            .iter()
+                            .find(|t| t.as_slice().first().map(|v| v.as_str()) == Some("d"))
+                            .and_then(|t| t.as_slice().get(1))
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "channel_id": channel_id,
+                            "name": content.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                            "description": content.get("about").and_then(|v| v.as_str()).unwrap_or(""),
+                            "created_at": e.created_at.as_u64(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&channels).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1349,7 +1508,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign create_channel event: {e}"),
         };
@@ -1374,18 +1533,17 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if let Err(e) = validate_uuid(&p.channel_id) {
             return format!("Error: {e}");
         }
-        match self.client.get_canvas(&p.channel_id).await {
-            Ok(body) => {
-                // Parse REST JSON and return just the content string.
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
-                    match v.get("content").and_then(|c| c.as_str()) {
-                        Some(content) => content.to_string(),
-                        None => "No canvas set for this channel.".to_string(),
-                    }
-                } else {
-                    body
-                }
-            }
+        // Canvas is kind:40100 with #h tag = channel_id
+        let filter = Filter::new()
+            .kind(k(kind::KIND_CANVAS))
+            .custom_tag(tag_h(), [&p.channel_id])
+            .limit(1);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => match events.first() {
+                Some(event) => event.content.clone(),
+                None => "No canvas set for this channel.".to_string(),
+            },
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1407,7 +1565,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign set_canvas event: {e}"),
         };
@@ -1433,12 +1591,34 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.channel_id).is_err() {
             return format!("Error: channel_id '{}' is not a valid UUID", p.channel_id);
         }
-        match self
-            .client
-            .get(&format!("/api/channels/{}/workflows", p.channel_id))
-            .await
-        {
-            Ok(body) => body,
+        // Workflows are kind:30620 (param-replaceable) with #h tag = channel_id
+        let filter = Filter::new()
+            .kind(k(kind::KIND_WORKFLOW_DEF))
+            .custom_tag(tag_h(), [&p.channel_id])
+            .limit(100);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let workflows: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        let d_tag = e
+                            .tags
+                            .iter()
+                            .find(|t| t.as_slice().first().map(|v| v.as_str()) == Some("d"))
+                            .and_then(|t| t.as_slice().get(1))
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "workflow_id": d_tag,
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "pubkey": e.pubkey.to_hex(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&workflows).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1452,13 +1632,26 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.channel_id).is_err() {
             return format!("Error: channel_id '{}' is not a valid UUID", p.channel_id);
         }
-        let body = serde_json::json!({ "yaml_definition": p.yaml_definition });
-        match self
-            .client
-            .post(&format!("/api/channels/{}/workflows", p.channel_id), &body)
-            .await
-        {
-            Ok(b) => b,
+        // Workflow definition is a kind:30620 (param-replaceable) event.
+        // d-tag = workflow UUID, h-tag = channel_id, content = YAML.
+        let workflow_id = uuid::Uuid::new_v4().to_string();
+        let tags = vec![
+            Tag::parse(&["d", &workflow_id]).unwrap(),
+            Tag::parse(&["h", &p.channel_id]).unwrap(),
+        ];
+        let builder = EventBuilder::new(k(kind::KIND_WORKFLOW_DEF), &p.yaml_definition, tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign workflow event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "workflow_id": workflow_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1472,13 +1665,20 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.workflow_id).is_err() {
             return format!("Error: workflow_id '{}' is not a valid UUID", p.workflow_id);
         }
-        let body = serde_json::json!({ "yaml_definition": p.yaml_definition });
-        match self
-            .client
-            .put(&format!("/api/workflows/{}", p.workflow_id), &body)
-            .await
-        {
-            Ok(b) => b,
+        // Publish a new kind:30620 event with the same d-tag to replace the existing one.
+        let tags = vec![Tag::parse(&["d", &p.workflow_id]).unwrap()];
+        let builder = EventBuilder::new(k(kind::KIND_WORKFLOW_DEF), &p.yaml_definition, tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign workflow event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1489,12 +1689,22 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.workflow_id).is_err() {
             return format!("Error: workflow_id '{}' is not a valid UUID", p.workflow_id);
         }
-        match self
-            .client
-            .delete(&format!("/api/workflows/{}", p.workflow_id))
-            .await
-        {
-            Ok(_) => "Workflow deleted.".to_string(),
+        // Delete via kind:5 event referencing the workflow's d-tag coordinate.
+        let coordinate = format!(
+            "{}:{}:{}",
+            kind::KIND_WORKFLOW_DEF,
+            self.client.pubkey_hex(),
+            p.workflow_id
+        );
+        let tags = vec![Tag::parse(&["a", &coordinate]).unwrap()];
+        let builder = EventBuilder::new(k(kind::KIND_DELETION), "", tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign deletion event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) if ok.accepted => "Workflow deleted.".to_string(),
+            Ok(ok) => format!("Error: relay rejected deletion: {}", ok.message),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1511,15 +1721,23 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.workflow_id).is_err() {
             return format!("Error: workflow_id '{}' is not a valid UUID", p.workflow_id);
         }
-        let body = serde_json::json!({
-            "inputs": p.inputs.unwrap_or(serde_json::Value::Object(Default::default()))
-        });
-        match self
-            .client
-            .post(&format!("/api/workflows/{}/trigger", p.workflow_id), &body)
-            .await
-        {
-            Ok(b) => b,
+        let inputs = p
+            .inputs
+            .unwrap_or(serde_json::Value::Object(Default::default()));
+        let content = serde_json::to_string(&inputs).unwrap_or_default();
+        let tags = vec![Tag::parse(&["d", &p.workflow_id]).unwrap()];
+        let builder = EventBuilder::new(k(kind::KIND_WORKFLOW_TRIGGER), &content, tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign trigger event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1536,16 +1754,33 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if uuid::Uuid::parse_str(&p.workflow_id).is_err() {
             return format!("Error: workflow_id '{}' is not a valid UUID", p.workflow_id);
         }
-        let limit = p.limit.unwrap_or(20).min(100);
-        match self
-            .client
-            .get(&format!(
-                "/api/workflows/{}/runs?limit={}",
-                p.workflow_id, limit
-            ))
-            .await
-        {
-            Ok(b) => b,
+        let limit = p.limit.unwrap_or(20).min(100) as usize;
+        // Query workflow execution events (kind:46001–46010) referencing this workflow.
+        let filter = Filter::new()
+            .kinds(vec![
+                k(kind::KIND_WORKFLOW_TRIGGERED),
+                k(kind::KIND_WORKFLOW_TRIGGERED + 1), // completed
+                k(kind::KIND_WORKFLOW_TRIGGERED + 2), // failed
+            ])
+            .custom_tag(tag_d(), [&p.workflow_id])
+            .limit(limit);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let runs: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "event_id": e.id.to_hex(),
+                            "kind": e.kind.as_u16(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "tags": e.tags.iter().map(|t| t.as_slice()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&runs).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1562,14 +1797,27 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
                 p.approval_token
             );
         }
-        let route = if p.approved {
-            format!("/api/approvals/{}/grant", p.approval_token)
+        let kind_num = if p.approved {
+            kind::KIND_APPROVAL_GRANT
         } else {
-            format!("/api/approvals/{}/deny", p.approval_token)
+            kind::KIND_APPROVAL_DENY
         };
-        let body = serde_json::json!({ "note": p.note });
-        match self.client.post(&route, &body).await {
-            Ok(b) => b,
+        let content = p.note.as_deref().unwrap_or("");
+        // The relay expects d-tag = hex(SHA256(token)), not the raw token UUID.
+        let token_hash = hex::encode(Sha256::digest(p.approval_token.as_bytes()));
+        let tags = vec![Tag::parse(&["d", &token_hash]).unwrap()];
+        let builder = EventBuilder::new(k(kind_num), content, tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign approval event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1584,26 +1832,38 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
                        Equivalent to what a human sees on the Home tab in the desktop app."
     )]
     pub async fn get_feed(&self, Parameters(p): Parameters<GetFeedParams>) -> String {
-        const MAX_FEED_LIMIT: u32 = 50;
-        let base = format!("{}/api/feed", self.client.relay_http_url());
-        let mut query_parts: Vec<String> = Vec::new();
+        const MAX_FEED_LIMIT: usize = 50;
+        let limit = p
+            .limit
+            .map(|l| l.min(MAX_FEED_LIMIT as u32) as usize)
+            .unwrap_or(MAX_FEED_LIMIT);
+
+        // Query events that mention this agent (p-tag) or are in channels we're in.
+        let my_pubkey = self.client.pubkey_hex();
+        let mut filter = Filter::new().custom_tag(tag_p(), [&my_pubkey]).limit(limit);
+
         if let Some(since) = p.since {
-            query_parts.push(format!("since={since}"));
+            filter = filter.since(nostr::Timestamp::from(since as u64));
         }
-        if let Some(limit) = p.limit {
-            query_parts.push(format!("limit={}", limit.min(MAX_FEED_LIMIT)));
-        }
-        if let Some(types) = &p.types {
-            // percent-encode to prevent query-string injection (e.g. values containing & or ?)
-            query_parts.push(format!("types={}", percent_encode(types)));
-        }
-        let url = if query_parts.is_empty() {
-            base
-        } else {
-            format!("{base}?{}", query_parts.join("&"))
-        };
-        match self.client.get_api(&url).await {
-            Ok(body) => body,
+
+        match self.client.query(vec![filter]).await {
+            Ok(mut events) => {
+                events.sort_by_key(|e| std::cmp::Reverse(e.created_at));
+                let feed: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "kind": e.kind.as_u16(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "tags": e.tags.iter().map(|t| t.as_slice()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&feed).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error fetching feed: {e}"),
         }
     }
@@ -1643,7 +1903,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign add_member event: {e}"),
         };
@@ -1678,7 +1938,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign remove_member event: {e}"),
         };
@@ -1705,12 +1965,32 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if let Err(e) = validate_uuid(&p.channel_id) {
             return format!("Error: {e}");
         }
-        match self
-            .client
-            .get(&format!("/api/channels/{}/members", p.channel_id))
-            .await
-        {
-            Ok(b) => b,
+        // Query membership list event (kind:39002 = NIP-29 group members) for this channel.
+        let filter = Filter::new()
+            .kind(k(kind::KIND_NIP29_GROUP_MEMBERS))
+            .custom_tag(tag_d(), [&p.channel_id])
+            .limit(1);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => match events.first() {
+                Some(event) => {
+                    // Members are in p-tags: ["p", "<pubkey>", "<role>"]
+                    let members: Vec<serde_json::Value> = event
+                        .tags
+                        .iter()
+                        .filter(|t| t.as_slice().first().map(|v| v.as_str()) == Some("p"))
+                        .map(|t| {
+                            let s = t.as_slice();
+                            serde_json::json!({
+                                "pubkey": s.get(1).map(|v| v.as_str()).unwrap_or(""),
+                                "role": s.get(2).map(|v| v.as_str()).unwrap_or("member"),
+                            })
+                        })
+                        .collect();
+                    serde_json::to_string(&members).unwrap_or_else(|e| format!("Error: {e}"))
+                }
+                None => "[]".to_string(),
+            },
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1732,7 +2012,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign join event: {e}"),
         };
@@ -1764,7 +2044,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign leave event: {e}"),
         };
@@ -1788,12 +2068,28 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
         if let Err(e) = validate_uuid(&p.channel_id) {
             return format!("Error: {e}");
         }
-        match self
-            .client
-            .get(&format!("/api/channels/{}", p.channel_id))
-            .await
-        {
-            Ok(b) => b,
+        // Query channel metadata (kind:41) with d-tag = channel_id.
+        let filter = Filter::new()
+            .kind(k(kind::KIND_CHANNEL_METADATA))
+            .custom_tag(tag_d(), [&p.channel_id])
+            .limit(1);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => match events.first() {
+                Some(event) => {
+                    let content: serde_json::Value =
+                        serde_json::from_str(&event.content).unwrap_or(serde_json::json!({}));
+                    serde_json::json!({
+                        "channel_id": p.channel_id,
+                        "name": content.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                        "description": content.get("about").and_then(|v| v.as_str()).unwrap_or(""),
+                        "created_at": event.created_at.as_u64(),
+                        "pubkey": event.pubkey.to_hex(),
+                    })
+                    .to_string()
+                }
+                None => format!("Error: channel '{}' not found", p.channel_id),
+            },
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -1821,7 +2117,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign update_channel event: {e}"),
         };
@@ -1856,7 +2152,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign set_topic event: {e}"),
         };
@@ -1891,7 +2187,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign set_purpose event: {e}"),
         };
@@ -1923,7 +2219,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign archive event: {e}"),
         };
@@ -1958,7 +2254,7 @@ are not returned — use `get_thread` to fetch the full reply tree for a specifi
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign unarchive event: {e}"),
         };
@@ -1987,31 +2283,39 @@ with kind:45003 comments)."
             return format!("Error: {e}");
         }
 
-        let mut query_parts: Vec<String> = Vec::new();
-        if let Some(depth) = p.depth_limit {
-            query_parts.push(format!("depth_limit={depth}"));
-        }
-        if let Some(limit) = p.limit {
-            query_parts.push(format!("limit={}", limit.min(200)));
-        }
+        let limit = p.limit.map(|l| l.min(200) as usize).unwrap_or(100);
 
-        let encoded_event_id = percent_encode(&p.event_id);
-        let path = if query_parts.is_empty() {
-            format!(
-                "/api/channels/{}/threads/{}",
-                p.channel_id, encoded_event_id
-            )
-        } else {
-            format!(
-                "/api/channels/{}/threads/{}?{}",
-                p.channel_id,
-                encoded_event_id,
-                query_parts.join("&")
-            )
+        // Query events that reference the root event via e-tag.
+        let filter = Filter::new()
+            .custom_tag(tag_e(), [&p.event_id])
+            .custom_tag(tag_h(), [&p.channel_id])
+            .limit(limit);
+
+        // Also fetch the root event itself.
+        let root_eid = match EventId::from_hex(&p.event_id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid event_id: {e}"),
         };
+        let root_filter = Filter::new().id(root_eid).limit(1);
 
-        match self.client.get(&path).await {
-            Ok(b) => b,
+        match self.client.query(vec![filter, root_filter]).await {
+            Ok(mut events) => {
+                events.sort_by_key(|e| e.created_at);
+                let result: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "kind": e.kind.as_u16(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "tags": e.tags.iter().map(|t| t.as_slice()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&result).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2034,9 +2338,29 @@ with kind:45003 comments)."
                 p.pubkeys.len()
             );
         }
-        let body = serde_json::json!({ "pubkeys": p.pubkeys });
-        match self.client.post("/api/dms", &body).await {
-            Ok(b) => b,
+        // Command event kind:41010 with p-tags for each participant.
+        let mut tags: Vec<Tag> = p
+            .pubkeys
+            .iter()
+            .filter_map(|pk| Tag::parse(&["p", pk]).ok())
+            .collect();
+        // Add a unique d-tag so the relay can deduplicate.
+        let dm_id = uuid::Uuid::new_v4().to_string();
+        tags.push(Tag::parse(&["d", &dm_id]).unwrap());
+
+        let builder = EventBuilder::new(k(kind::KIND_DM_OPEN), "", tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign open_dm event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "dm_id": dm_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2050,13 +2374,23 @@ with kind:45003 comments)."
         if let Err(e) = validate_uuid(&p.channel_id) {
             return format!("Error: {e}");
         }
-        let body = serde_json::json!({ "pubkeys": [p.pubkey] });
-        match self
-            .client
-            .post(&format!("/api/dms/{}/members", p.channel_id), &body)
-            .await
-        {
-            Ok(b) => b,
+        // Command event kind:41011 with h-tag = DM channel, p-tag = new member.
+        let tags = vec![
+            Tag::parse(&["h", &p.channel_id]).unwrap(),
+            Tag::parse(&["p", &p.pubkey]).unwrap(),
+        ];
+        let builder = EventBuilder::new(k(kind::KIND_DM_ADD_MEMBER), "", tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign add_dm_member event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "event_id": ok.event_id,
+                "accepted": ok.accepted,
+                "message": ok.message,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2067,8 +2401,40 @@ with kind:45003 comments)."
         description = "List all direct message channels the agent is a participant in."
     )]
     pub async fn list_dms(&self) -> String {
-        match self.client.get("/api/dms").await {
-            Ok(b) => b,
+        // Query DM-created events (kind:41001) where we are a participant (p-tag).
+        let my_pubkey = self.client.pubkey_hex();
+        let filter = Filter::new()
+            .kind(k(kind::KIND_DM_CREATED))
+            .custom_tag(tag_p(), [&my_pubkey])
+            .limit(100);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let dms: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        let participants: Vec<&str> = e
+                            .tags
+                            .iter()
+                            .filter(|t| t.as_slice().first().map(|v| v.as_str()) == Some("p"))
+                            .filter_map(|t| t.as_slice().get(1).map(|v| v.as_str()))
+                            .collect();
+                        let dm_id = e
+                            .tags
+                            .iter()
+                            .find(|t| t.as_slice().first().map(|v| v.as_str()) == Some("d"))
+                            .and_then(|t| t.as_slice().get(1))
+                            .map(|s| s.to_string())
+                            .unwrap_or_default();
+                        serde_json::json!({
+                            "dm_id": dm_id,
+                            "participants": participants,
+                            "created_at": e.created_at.as_u64(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&dms).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2082,21 +2448,16 @@ with kind:45003 comments)."
         if let Err(e) = validate_uuid(&p.channel_id) {
             return format!("Error: {e}");
         }
-        match self
-            .client
-            .post(
-                &format!("/api/dms/{}/hide", p.channel_id),
-                &serde_json::json!({}),
-            )
-            .await
-        {
-            Ok(b) => {
-                if b.is_empty() {
-                    "DM hidden successfully.".to_string()
-                } else {
-                    b
-                }
-            }
+        // Command event kind:41012 with h-tag = DM channel.
+        let tags = vec![Tag::parse(&["h", &p.channel_id]).unwrap()];
+        let builder = EventBuilder::new(k(kind::KIND_DM_HIDE), "", tags);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign hide_dm event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) if ok.accepted => "DM hidden successfully.".to_string(),
+            Ok(ok) => format!("Error: relay rejected: {}", ok.message),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2117,7 +2478,7 @@ with kind:45003 comments)."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign reaction event: {e}"),
         };
@@ -2138,55 +2499,32 @@ with kind:45003 comments)."
         description = "Remove an emoji reaction from a Sprout message."
     )]
     pub async fn remove_reaction(&self, Parameters(p): Parameters<RemoveReactionParams>) -> String {
-        // Fetch the reactions list to find the current user's reaction event ID for this emoji.
-        let encoded_event_id = percent_encode(&p.event_id);
-        let my_pubkey = self.client.keys().public_key().to_hex();
-        let reactions_resp = match self
-            .client
-            .get(&format!("/api/messages/{}/reactions", encoded_event_id))
-            .await
-        {
-            Ok(r) => r,
+        // Validate event_id format.
+        if EventId::from_hex(&p.event_id).is_err() {
+            return format!("Error: invalid event_id: {}", p.event_id);
+        }
+        let my_pubkey_parsed = self.client.keys().public_key();
+        let filter = Filter::new()
+            .kind(k(kind::KIND_REACTION))
+            .author(my_pubkey_parsed)
+            .custom_tag(tag_e(), [&p.event_id])
+            .limit(50);
+
+        let events = match self.client.query(vec![filter]).await {
+            Ok(e) => e,
             Err(e) => return format!("Error: failed to fetch reactions: {e}"),
         };
-        let reactions: serde_json::Value = match serde_json::from_str(&reactions_resp) {
-            Ok(v) => v,
-            Err(e) => return format!("Error: failed to parse reactions: {e}"),
-        };
 
-        // Parse the grouped response: { "reactions": [ { "emoji": "...", "users": [ { "pubkey": "...", "reaction_event_id": "..." } ] } ] }
-        let reaction_event_id_hex = reactions
-            .get("reactions")
-            .and_then(|r| r.as_array())
-            .and_then(|groups| {
-                groups.iter().find_map(|group| {
-                    let group_emoji = group.get("emoji")?.as_str()?;
-                    if group_emoji != p.emoji {
-                        return None;
-                    }
-                    group.get("users")?.as_array()?.iter().find_map(|user| {
-                        let pubkey = user.get("pubkey")?.as_str()?;
-                        if pubkey != my_pubkey {
-                            return None;
-                        }
-                        user.get("reaction_event_id")?
-                            .as_str()
-                            .map(|s| s.to_string())
-                    })
-                })
-            });
+        // Find the reaction with matching emoji content.
+        let reaction_event = events.iter().find(|e| e.content == p.emoji);
 
-        match reaction_event_id_hex {
-            Some(hex) => {
-                let reaction_eid = match EventId::from_hex(&hex) {
-                    Ok(id) => id,
-                    Err(e) => return format!("Error: invalid reaction event_id: {e}"),
-                };
-                let builder = match sprout_sdk::build_remove_reaction(reaction_eid) {
+        match reaction_event {
+            Some(re) => {
+                let builder = match sprout_sdk::build_remove_reaction(re.id) {
                     Ok(b) => b,
                     Err(e) => return format!("Error: {e}"),
                 };
-                let event = match builder.sign_with_keys(self.client.keys()) {
+                let event = match self.client.sign_event(builder) {
                     Ok(e) => e,
                     Err(e) => return format!("Error: failed to sign remove_reaction event: {e}"),
                 };
@@ -2200,8 +2538,8 @@ with kind:45003 comments)."
                     Err(e) => format!("Error: {e}"),
                 }
             }
-            None => "Error: could not find your reaction event ID for this emoji. \
-                 The reaction may not exist or the relay has not recorded the event ID."
+            None => "Error: could not find your reaction event for this emoji. \
+                 The reaction may not exist."
                 .to_string(),
         }
     }
@@ -2212,13 +2550,36 @@ with kind:45003 comments)."
         description = "Get all emoji reactions for a Sprout message."
     )]
     pub async fn get_reactions(&self, Parameters(p): Parameters<GetReactionsParams>) -> String {
-        let encoded_event_id = percent_encode(&p.event_id);
-        match self
-            .client
-            .get(&format!("/api/messages/{}/reactions", encoded_event_id))
-            .await
-        {
-            Ok(b) => b,
+        // Query kind:7 reactions referencing this event via e-tag.
+        let filter = Filter::new()
+            .kind(k(kind::KIND_REACTION))
+            .custom_tag(tag_e(), [&p.event_id])
+            .limit(200);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                // Group reactions by emoji content.
+                let mut grouped: std::collections::HashMap<String, Vec<String>> =
+                    std::collections::HashMap::new();
+                for e in &events {
+                    grouped
+                        .entry(e.content.clone())
+                        .or_default()
+                        .push(e.pubkey.to_hex());
+                }
+                let reactions: Vec<serde_json::Value> = grouped
+                    .into_iter()
+                    .map(|(emoji, pubkeys)| {
+                        serde_json::json!({
+                            "emoji": emoji,
+                            "count": pubkeys.len(),
+                            "pubkeys": pubkeys,
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&serde_json::json!({ "reactions": reactions }))
+                    .unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2232,12 +2593,18 @@ with kind:45003 comments)."
     )]
     pub async fn set_profile(&self, Parameters(p): Parameters<SetProfileParams>) -> String {
         // Read-merge-write: fetch current profile, merge desired changes, sign kind:0.
-        let current_profile: serde_json::Value =
-            match self.client.get("/api/users/me/profile").await {
-                Ok(body) => serde_json::from_str(&body)
-                    .unwrap_or(serde_json::Value::Object(Default::default())),
-                Err(_) => serde_json::Value::Object(Default::default()),
-            };
+        let my_pubkey = self.client.keys().public_key();
+        let filter = Filter::new()
+            .kind(k(kind::KIND_PROFILE))
+            .author(my_pubkey)
+            .limit(1);
+        let current_profile: serde_json::Value = match self.client.query(vec![filter]).await {
+            Ok(events) => events
+                .first()
+                .and_then(|e| serde_json::from_str(&e.content).ok())
+                .unwrap_or(serde_json::Value::Object(Default::default())),
+            Err(_) => serde_json::Value::Object(Default::default()),
+        };
 
         // Resolve each field: use new value if provided, else keep existing.
         let display_name = p
@@ -2262,7 +2629,7 @@ with kind:45003 comments)."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign profile event: {e}"),
         };
@@ -2295,25 +2662,42 @@ with kind:45003 comments)."
                 );
             }
         }
-        match pubkeys.len() {
-            0 => match self.client.get("/api/users/me/profile").await {
-                Ok(body) => body,
-                Err(e) => format!("Error fetching profile: {e}"),
-            },
-            1 => {
-                let path = format!("/api/users/{}/profile", percent_encode(&pubkeys[0]));
-                match self.client.get(&path).await {
-                    Ok(body) => body,
-                    Err(e) => format!("Error fetching profile: {e}"),
+
+        // If no pubkeys specified, fetch our own profile.
+        let authors: Vec<nostr::PublicKey> = if pubkeys.is_empty() {
+            vec![self.client.keys().public_key()]
+        } else {
+            pubkeys
+                .iter()
+                .filter_map(|pk| nostr::PublicKey::from_hex(pk).ok())
+                .collect()
+        };
+
+        let filter = Filter::new()
+            .kind(k(kind::KIND_PROFILE))
+            .authors(authors)
+            .limit(pubkeys.len().max(1));
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let profiles: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        let mut profile: serde_json::Value =
+                            serde_json::from_str(&e.content).unwrap_or(serde_json::json!({}));
+                        if let Some(obj) = profile.as_object_mut() {
+                            obj.insert("pubkey".to_string(), serde_json::json!(e.pubkey.to_hex()));
+                        }
+                        profile
+                    })
+                    .collect();
+                if profiles.len() == 1 {
+                    serde_json::to_string(&profiles[0]).unwrap_or_else(|e| format!("Error: {e}"))
+                } else {
+                    serde_json::to_string(&profiles).unwrap_or_else(|e| format!("Error: {e}"))
                 }
             }
-            _ => {
-                let body = serde_json::json!({ "pubkeys": pubkeys });
-                match self.client.post("/api/users/batch", &body).await {
-                    Ok(resp) => resp,
-                    Err(e) => format!("Error fetching profiles: {e}"),
-                }
-            }
+            Err(e) => format!("Error fetching profile: {e}"),
         }
     }
 
@@ -2323,10 +2707,36 @@ with kind:45003 comments)."
         description = "Full-text search across messages in accessible channels. Returns matching messages with channel context. Powered by Typesense."
     )]
     pub async fn search(&self, Parameters(p): Parameters<SearchParams>) -> String {
-        let limit = p.limit.unwrap_or(20).min(100);
-        let path = format!("/api/search?q={}&limit={}", percent_encode(&p.q), limit);
-        match self.client.get(&path).await {
-            Ok(body) => body,
+        let limit = p.limit.unwrap_or(20).min(100) as usize;
+        // Use NIP-50 search filter if the relay supports it.
+        // The `search` field in a filter is a NIP-50 extension.
+        let filter = Filter::new()
+            .kinds(vec![
+                k(kind::KIND_STREAM_MESSAGE),
+                k(kind::KIND_STREAM_MESSAGE_V2),
+                k(kind::KIND_FORUM_POST),
+                k(kind::KIND_FORUM_COMMENT),
+            ])
+            .search(&p.q)
+            .limit(limit);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let results: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "kind": e.kind.as_u16(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                            "tags": e.tags.iter().map(|t| t.as_slice()).collect::<Vec<_>>(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&results).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error searching: {e}"),
         }
     }
@@ -2337,9 +2747,37 @@ with kind:45003 comments)."
         description = "Get presence status (online/away/offline) for one or more users by pubkey. Pass comma-separated hex pubkeys."
     )]
     pub async fn get_presence(&self, Parameters(p): Parameters<GetPresenceParams>) -> String {
-        let path = format!("/api/presence?pubkeys={}", percent_encode(&p.pubkeys));
-        match self.client.get(&path).await {
-            Ok(body) => body,
+        // Query ephemeral presence events (kind:20001) for the given pubkeys.
+        let authors: Vec<nostr::PublicKey> = p
+            .pubkeys
+            .split(',')
+            .filter_map(|pk| nostr::PublicKey::from_hex(pk.trim()).ok())
+            .collect();
+
+        if authors.is_empty() {
+            return "Error: no valid pubkeys provided".to_string();
+        }
+
+        // Presence snapshots are kind:40902 (relay-generated, latest state).
+        let filter = Filter::new()
+            .kind(k(kind::KIND_PRESENCE_SNAPSHOT))
+            .authors(authors)
+            .limit(200);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let presence: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "pubkey": e.pubkey.to_hex(),
+                            "status": e.content,
+                            "updated_at": e.created_at.as_u64(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&presence).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error fetching presence: {e}"),
         }
     }
@@ -2350,9 +2788,19 @@ with kind:45003 comments)."
         description = "Set the agent's presence status. Valid values: 'online', 'away', 'offline'. Presence auto-expires after 90 seconds — call periodically to stay online."
     )]
     pub async fn set_presence(&self, Parameters(p): Parameters<SetPresenceParams>) -> String {
-        let body = serde_json::json!({ "status": p.status });
-        match self.client.put("/api/presence", &body).await {
-            Ok(b) => b,
+        // Validate status value.
+        // Publish ephemeral presence event (kind:20001).
+        let builder = EventBuilder::new(k(kind::KIND_PRESENCE_UPDATE), p.status.as_str(), []);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign presence event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "status": p.status,
+                "accepted": ok.accepted,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2372,13 +2820,19 @@ with kind:45003 comments)."
                 p.policy
             );
         }
-        let body = serde_json::json!({ "channel_add_policy": p.policy });
-        match self
-            .client
-            .put("/api/users/me/channel-add-policy", &body)
-            .await
-        {
-            Ok(b) => b,
+        // Store as a kind:10100 (agent profile) replaceable event with the policy in content.
+        let content = serde_json::json!({ "channel_add_policy": p.policy }).to_string();
+        let builder = EventBuilder::new(k(kind::KIND_AGENT_PROFILE), &content, []);
+        let event = match self.client.sign_event(builder) {
+            Ok(e) => e,
+            Err(e) => return format!("Error: failed to sign agent profile event: {e}"),
+        };
+        match self.client.send_event(event).await {
+            Ok(ok) => serde_json::json!({
+                "policy": p.policy,
+                "accepted": ok.accepted,
+            })
+            .to_string(),
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2415,7 +2869,7 @@ with kind:45003 comments)."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign vote event: {e}"),
         };
@@ -2447,7 +2901,7 @@ with kind:45003 comments)."
             Ok(b) => b,
             Err(e) => return format!("Error: {e}"),
         };
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign delete_channel event: {e}"),
         };
@@ -2490,7 +2944,7 @@ with kind:45003 comments)."
             Err(e) => return format!("Error: {e}"),
         };
 
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign event: {e}"),
         };
@@ -2532,7 +2986,7 @@ with kind:45003 comments)."
             Err(e) => return format!("Error: {e}"),
         };
 
-        let event = match builder.sign_with_keys(self.client.keys()) {
+        let event = match self.client.sign_event(builder) {
             Ok(e) => e,
             Err(e) => return format!("Error: failed to sign event: {e}"),
         };
@@ -2557,9 +3011,16 @@ with kind:45003 comments)."
         if let Err(e) = validate_hex64(&p.event_id, "event_id") {
             return e;
         }
-        let path = format!("/api/events/{}", p.event_id);
-        match self.client.get(&path).await {
-            Ok(body) => body,
+        let eid = match EventId::from_hex(&p.event_id) {
+            Ok(id) => id,
+            Err(e) => return format!("Error: invalid event_id: {e}"),
+        };
+        let filter = Filter::new().id(eid).limit(1);
+        match self.client.query(vec![filter]).await {
+            Ok(events) => match events.first() {
+                Some(event) => event.as_json(),
+                None => format!("Error: event '{}' not found", p.event_id),
+            },
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2573,31 +3034,35 @@ with kind:45003 comments)."
         if let Err(e) = validate_hex64(&p.pubkey, "pubkey") {
             return e;
         }
-        if let Some(ref bid) = p.before_id {
-            if let Err(e) = validate_hex64(bid, "before_id") {
-                return e;
-            }
-        }
-        if p.before_id.is_some() && p.before.is_none() {
-            return "Error: before_id requires before".to_string();
-        }
-        let mut url = format!("/api/users/{}/notes", p.pubkey);
-        let mut query_parts = vec![];
-        if let Some(limit) = p.limit {
-            query_parts.push(format!("limit={limit}"));
-        }
+        let author = match nostr::PublicKey::from_hex(&p.pubkey) {
+            Ok(pk) => pk,
+            Err(e) => return format!("Error: invalid pubkey: {e}"),
+        };
+        let limit = p.limit.unwrap_or(20).min(200) as usize;
+        let mut filter = Filter::new()
+            .kind(k(kind::KIND_TEXT_NOTE))
+            .author(author)
+            .limit(limit);
+
         if let Some(before) = p.before {
-            query_parts.push(format!("before={before}"));
+            filter = filter.until(nostr::Timestamp::from(before as u64));
         }
-        if let Some(ref before_id) = p.before_id {
-            query_parts.push(format!("before_id={before_id}"));
-        }
-        if !query_parts.is_empty() {
-            url.push('?');
-            url.push_str(&query_parts.join("&"));
-        }
-        match self.client.get(&url).await {
-            Ok(body) => body,
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => {
+                let notes: Vec<serde_json::Value> = events
+                    .iter()
+                    .map(|e| {
+                        serde_json::json!({
+                            "id": e.id.to_hex(),
+                            "pubkey": e.pubkey.to_hex(),
+                            "content": e.content,
+                            "created_at": e.created_at.as_u64(),
+                        })
+                    })
+                    .collect();
+                serde_json::to_string(&notes).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }
@@ -2614,9 +3079,48 @@ with kind:45003 comments)."
         if let Err(e) = validate_hex64(&p.pubkey, "pubkey") {
             return e;
         }
-        let path = format!("/api/users/{}/contact-list", p.pubkey);
-        match self.client.get(&path).await {
-            Ok(body) => body,
+        let author = match nostr::PublicKey::from_hex(&p.pubkey) {
+            Ok(pk) => pk,
+            Err(e) => return format!("Error: invalid pubkey: {e}"),
+        };
+        // Kind:3 is replaceable — query latest.
+        let filter = Filter::new()
+            .kind(k(kind::KIND_CONTACT_LIST))
+            .author(author)
+            .limit(1);
+
+        match self.client.query(vec![filter]).await {
+            Ok(events) => match events.first() {
+                Some(event) => event.as_json(),
+                None => format!("Error: no contact list found for {}", p.pubkey),
+            },
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    /// Upload a local file to the Sprout relay.
+    #[tool(
+        name = "upload_file",
+        description = "Upload a local file (image or video) to the Sprout relay. \
+Returns a BlobDescriptor with the URL, hash, dimensions, and other metadata. \
+Supported types: JPEG, PNG, GIF, WebP, MP4. \
+The returned URL can be included in messages, or use the file_paths parameter \
+on send_message to upload and attach in one step."
+    )]
+    pub async fn upload_file(&self, Parameters(p): Parameters<UploadFileParams>) -> String {
+        match crate::upload::upload_file(
+            self.client.http_client(),
+            self.client.keys(),
+            &self.client.relay_http_url(),
+            self.client.server_domain().as_deref(),
+            &p.file_path,
+            self.client.auth_tag_json().as_deref(),
+        )
+        .await
+        {
+            Ok(desc) => {
+                serde_json::to_string_pretty(&desc).unwrap_or_else(|e| format!("Error: {e}"))
+            }
             Err(e) => format!("Error: {e}"),
         }
     }

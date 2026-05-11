@@ -25,6 +25,8 @@ pub mod feed;
 pub mod partition;
 /// Reaction persistence.
 pub mod reaction;
+/// Relay-level membership persistence (NIP-43).
+pub mod relay_members;
 /// Thread metadata persistence.
 pub mod thread;
 /// User profile persistence.
@@ -197,6 +199,14 @@ impl Db {
         sqlx::query("SELECT 1").execute(&self.pool).await.is_ok()
     }
 
+    /// Begin a database transaction for atomic multi-statement operations.
+    ///
+    /// Returns a `'static` transaction because `PgPool` is `Arc`-backed internally.
+    /// The transaction holds an owned pool handle, not a borrow.
+    pub async fn begin_transaction(&self) -> Result<sqlx::Transaction<'static, sqlx::Postgres>> {
+        self.pool.begin().await.map_err(Into::into)
+    }
+
     // ── Events ───────────────────────────────────────────────────────────────
 
     /// Inserts an event. Returns `(StoredEvent, was_inserted)` — `false` on duplicate.
@@ -217,6 +227,11 @@ impl Db {
     /// Queries events matching the given filter parameters.
     pub async fn query_events(&self, q: &EventQuery) -> Result<Vec<StoredEvent>> {
         event::query_events(&self.pool, q).await
+    }
+
+    /// Count events matching the given query (NIP-45 COUNT support).
+    pub async fn count_events(&self, q: &EventQuery) -> Result<i64> {
+        event::count_events(&self.pool, q).await
     }
 
     /// Fetch the latest replaceable event for a (kind, pubkey) pair.
@@ -1123,6 +1138,16 @@ impl Db {
         workflow::delete_workflow(&self.pool, id).await
     }
 
+    /// Find a workflow by owner pubkey and name. Used for NIP-09 a-tag deletion
+    /// where the d-tag is the workflow name (not UUID).
+    pub async fn find_workflow_by_owner_and_name(
+        &self,
+        owner_pubkey: &[u8],
+        name: &str,
+    ) -> Result<Option<workflow::WorkflowRecord>> {
+        workflow::find_by_owner_and_name(&self.pool, owner_pubkey, name).await
+    }
+
     /// Create a new workflow run.
     pub async fn create_workflow_run(
         &self,
@@ -1309,6 +1334,75 @@ impl Db {
             });
         }
         Ok(out)
+    }
+
+    // ── Relay Members (NIP-43) ───────────────────────────────────────────────
+
+    /// Returns `true` if `pubkey` (64-char hex) is in the relay member list.
+    pub async fn is_relay_member(&self, pubkey: &str) -> Result<bool> {
+        relay_members::is_relay_member(&self.pool, pubkey).await
+    }
+
+    /// Returns the relay member record for `pubkey`, or `None` if not found.
+    pub async fn get_relay_member(
+        &self,
+        pubkey: &str,
+    ) -> Result<Option<relay_members::RelayMember>> {
+        relay_members::get_relay_member(&self.pool, pubkey).await
+    }
+
+    /// Returns all relay members ordered by `created_at` ascending.
+    pub async fn list_relay_members(&self) -> Result<Vec<relay_members::RelayMember>> {
+        relay_members::list_relay_members(&self.pool).await
+    }
+
+    /// Adds a new relay member. No-ops silently if the pubkey already exists (idempotent).
+    /// Adds a new relay member.
+    ///
+    /// Returns `true` if the row was actually inserted, `false` if the pubkey
+    /// already existed (idempotent — `ON CONFLICT DO NOTHING`).
+    pub async fn add_relay_member(
+        &self,
+        pubkey: &str,
+        role: &str,
+        added_by: Option<&str>,
+    ) -> Result<bool> {
+        relay_members::add_relay_member(&self.pool, pubkey, role, added_by).await
+    }
+
+    /// Removes a relay member atomically, refusing to delete the owner.
+    pub async fn remove_relay_member(&self, pubkey: &str) -> Result<relay_members::RemoveResult> {
+        relay_members::remove_relay_member(&self.pool, pubkey).await
+    }
+
+    /// Removes a relay member only if their current role matches `expected_role`.
+    ///
+    /// Atomic conditional delete — eliminates the TOCTOU race between a
+    /// prior role read and the delete. See [`relay_members::remove_relay_member_if_role`].
+    pub async fn remove_relay_member_if_role(
+        &self,
+        pubkey: &str,
+        expected_role: &str,
+    ) -> Result<relay_members::RemoveResult> {
+        relay_members::remove_relay_member_if_role(&self.pool, pubkey, expected_role).await
+    }
+
+    /// Updates the role of an existing relay member. Returns `true` if updated.
+    pub async fn update_relay_member_role(&self, pubkey: &str, new_role: &str) -> Result<bool> {
+        relay_members::update_relay_member_role(&self.pool, pubkey, new_role).await
+    }
+
+    /// Ensures the owner pubkey exists with role `"owner"`. Called at startup.
+    pub async fn bootstrap_owner(&self, owner_pubkey: &str) -> Result<()> {
+        relay_members::bootstrap_owner(&self.pool, owner_pubkey).await
+    }
+
+    /// Migrates existing `pubkey_allowlist` entries into `relay_members`.
+    ///
+    /// Idempotent — uses `ON CONFLICT DO NOTHING`. Returns the number of rows
+    /// inserted, or 0 if the `pubkey_allowlist` table doesn't exist.
+    pub async fn backfill_from_allowlist(&self) -> Result<u64> {
+        relay_members::backfill_from_allowlist(&self.pool).await
     }
 
     // ── Discovery events ─────────────────────────────────────────────────────

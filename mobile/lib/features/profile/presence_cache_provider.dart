@@ -1,83 +1,86 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
 import '../../shared/relay/relay.dart';
 
-/// In-memory cache of other users' presence, fetched in batches.
-/// Periodically refreshes to keep presence status up to date.
+/// In-memory cache of other users' presence.
+///
+/// Subscribes to kind:20001 presence events over the relay WebSocket for
+/// real-time updates. There is no longer a REST backstop — agents that
+/// publish presence purely over WS are fine, and TTL expiry will be handled
+/// by the relay-side `presence:true` filter extension when that lands.
 class PresenceCacheNotifier extends Notifier<Map<String, String>> {
-  static const _refreshInterval = Duration(seconds: 30);
-
   final Set<String> _tracked = {};
-  final Set<String> _pending = {};
-  Timer? _batchTimer;
-  Timer? _refreshTimer;
+  void Function()? _presenceUnsub;
+  int _subscriptionVersion = 0;
 
   @override
   Map<String, String> build() {
-    ref.watch(relayClientProvider);
+    final sessionState = ref.watch(relaySessionProvider);
+
     ref.onDispose(() {
-      _batchTimer?.cancel();
-      _batchTimer = null;
-      _refreshTimer?.cancel();
-      _refreshTimer = null;
+      _presenceUnsub?.call();
+      _presenceUnsub = null;
     });
+
+    if (sessionState.status == SessionStatus.connected) {
+      _subscribePresenceUpdates();
+    }
+
     return {};
   }
 
-  /// Track presence for [pubkeys]. Fetches immediately if not cached,
-  /// and includes them in periodic refreshes.
+  /// Track presence for [pubkeys].
+  ///
+  /// Currently a no-op for the actual fetch — we rely on live kind:20001
+  /// events. The tracked set is still used to filter incoming events so the
+  /// cache doesn't grow unbounded.
   void track(List<String> pubkeys) {
     final normalized = pubkeys.map((pk) => pk.toLowerCase()).toList();
-    final uncached = normalized
-        .where((pk) => !state.containsKey(pk) && !_pending.contains(pk))
-        .toList();
-
     _tracked.addAll(normalized);
-    _ensureRefreshTimer();
-
-    if (uncached.isEmpty) return;
-    _pending.addAll(uncached);
-    _batchTimer ??= Timer(const Duration(milliseconds: 50), _flushPending);
+    // TODO(presence): once the relay supports a `presence:true` filter
+    // extension, issue a one-shot fetch here for the latest known state per
+    // pubkey. Until then, presence is "online whenever they publish".
   }
 
-  void _ensureRefreshTimer() {
-    _refreshTimer ??= Timer.periodic(_refreshInterval, (_) => _refreshAll());
-  }
+  /// Subscribe to kind:20001 presence events over WebSocket.
+  Future<void> _subscribePresenceUpdates() async {
+    _presenceUnsub?.call();
+    _presenceUnsub = null;
+    _subscriptionVersion++;
+    final version = _subscriptionVersion;
 
-  Future<void> _refreshAll() async {
-    if (_tracked.isEmpty) return;
-    await _fetchPresence(_tracked.toList());
-  }
-
-  Future<void> _flushPending() async {
-    _batchTimer = null;
-    if (_pending.isEmpty) return;
-
-    final pubkeys = _pending.toList();
-    _pending.clear();
-    await _fetchPresence(pubkeys);
-  }
-
-  Future<void> _fetchPresence(List<String> pubkeys) async {
+    final session = ref.read(relaySessionProvider.notifier);
     try {
-      final client = ref.read(relayClientProvider);
-      final json =
-          await client.get(
-                '/api/presence',
-                queryParams: {'pubkeys': pubkeys.join(',')},
-              )
-              as Map<String, dynamic>;
-
-      final updated = Map<String, String>.from(state);
-      for (final pk in pubkeys) {
-        updated[pk] = (json[pk] as String?) ?? 'offline';
+      final unsub = await session.subscribe(
+        const NostrFilter(kinds: [EventKind.presenceUpdate], limit: 0),
+        _handlePresenceEvent,
+      );
+      // Guard: if build() re-fired while we were awaiting, discard this
+      // subscription to avoid leaking it.
+      if (version != _subscriptionVersion) {
+        unsub();
+        return;
       }
-      state = updated;
-    } catch (_) {
-      // Silently fail — default to offline.
+      _presenceUnsub = unsub;
+    } catch (error) {
+      debugPrint(
+        '[PresenceCacheNotifier] presence subscription failed: $error',
+      );
     }
+  }
+
+  void _handlePresenceEvent(NostrEvent event) {
+    final pubkey = event.pubkey.toLowerCase();
+    if (!_tracked.contains(pubkey)) return;
+    final status = event.content;
+    if (status != 'online' && status != 'away' && status != 'offline') return;
+    if (state[pubkey] == status) return;
+    final updated = Map<String, String>.from(state);
+    updated[pubkey] = status;
+    state = updated;
   }
 }
 

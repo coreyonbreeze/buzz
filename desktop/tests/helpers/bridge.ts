@@ -55,21 +55,9 @@ type MockBridgeOptions = {
     acp?: MockCommandAvailability;
     mcp?: MockCommandAvailability;
   };
-  mintTokenError?: string;
   profileReadDelayMs?: number;
   profileReadError?: string;
   profileUpdateError?: string;
-  seededTokens?: Array<{
-    id: string;
-    name: string;
-    scopes: string[];
-    channel_ids: string[];
-    created_at: string;
-    expires_at: string | null;
-    last_used_at: string | null;
-    revoked_at: string | null;
-    token?: string;
-  }>;
 };
 
 type BridgeOptions = {
@@ -84,6 +72,7 @@ type BridgeOptions = {
 const ONBOARDING_COMPLETION_STORAGE_KEY_PREFIX =
   "sprout-onboarding-complete.v1:";
 const DEFAULT_MOCK_PUBKEY = "deadbeef".repeat(8);
+const DEFAULT_RELAY_WS_URL = "ws://localhost:3000";
 
 async function seedOnboardingCompletionForKnownIdentities(page: Page) {
   const pubkeys = [
@@ -100,12 +89,35 @@ async function seedOnboardingCompletionForKnownIdentities(page: Page) {
   );
 }
 
+async function seedDefaultWorkspace(page: Page, relayWsUrl?: string) {
+  await page.addInitScript(
+    ({ relayUrl }) => {
+      const workspaceId = "e2e-default-workspace";
+      const workspace = {
+        id: workspaceId,
+        name: "E2E Test",
+        relayUrl,
+        addedAt: new Date().toISOString(),
+      };
+      window.localStorage.setItem(
+        "sprout-workspaces",
+        JSON.stringify([workspace]),
+      );
+      window.localStorage.setItem("sprout-active-workspace-id", workspaceId);
+    },
+    { relayUrl: relayWsUrl ?? DEFAULT_RELAY_WS_URL },
+  );
+}
+
 export async function installBridge(page: Page, options: BridgeOptions) {
   const identity =
     options.mode === "relay"
       ? TEST_IDENTITIES[options.user ?? "tyler"]
       : undefined;
 
+  // Always seed a workspace so useWorkspaceInit doesn't show WelcomeSetup.
+  // skipOnboardingSeed only controls the onboarding-completion flag.
+  await seedDefaultWorkspace(page, options.relayWsUrl);
   if (!options.skipOnboardingSeed) {
     await seedOnboardingCompletionForKnownIdentities(page);
   }

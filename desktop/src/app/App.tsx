@@ -1,10 +1,22 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider } from "@tanstack/react-router";
-import { useLayoutEffect } from "react";
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useState,
+} from "react";
 
 import { router } from "@/app/router";
 import { useAppOnboardingState } from "@/features/onboarding/hooks";
 import { OnboardingFlow } from "@/features/onboarding/ui/OnboardingFlow";
+import { useWorkspaceInit } from "@/features/workspaces/useWorkspaceInit";
+import { useWorkspaces } from "@/features/workspaces/useWorkspaces";
+import { WelcomeSetup } from "@/features/workspaces/ui/WelcomeSetup";
+import { createSproutQueryClient } from "@/shared/api/queryClient";
+import { listenForDeepLinks } from "@/shared/deep-link";
 
 function AppLoadingGate() {
   return (
@@ -24,11 +36,15 @@ function AppLoadingGate() {
   );
 }
 
-export function App() {
-  useLayoutEffect(() => {
-    void getCurrentWindow().show();
-  }, []);
+function WorkspaceQueryProvider({ children }: { children: ReactNode }) {
+  const [queryClient] = useState(createSproutQueryClient);
 
+  return (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
+}
+
+function AppReady() {
   const onboarding = useAppOnboardingState();
 
   if (onboarding.stage === "onboarding") {
@@ -37,7 +53,6 @@ export function App() {
         actions={onboarding.flow.actions}
         initialProfile={onboarding.flow.initialProfile}
         key={onboarding.currentPubkey ?? "anonymous"}
-        notifications={onboarding.flow.notifications}
       />
     );
   }
@@ -47,4 +62,63 @@ export function App() {
   }
 
   return <RouterProvider router={router} />;
+}
+
+export function App() {
+  useLayoutEffect(() => {
+    void getCurrentWindow().show();
+  }, []);
+
+  const {
+    activeWorkspace,
+    reinitKey,
+    addWorkspace,
+    switchWorkspace,
+    reconnectWorkspace,
+  } = useWorkspaces();
+
+  useEffect(() => {
+    const unlisten = listenForDeepLinks({
+      addWorkspace,
+      switchWorkspace,
+      reconnectWorkspace,
+    });
+    return () => {
+      void unlisten.then((fn) => fn());
+    };
+  }, [addWorkspace, switchWorkspace, reconnectWorkspace]);
+  // Composite key: changes when workspace ID changes OR when
+  // the active workspace's config is updated (relayUrl/token).
+  const workspaceKey = `${activeWorkspace?.id ?? "none"}-${reinitKey}`;
+  const workspace = useWorkspaceInit(activeWorkspace, workspaceKey);
+
+  const handleSetupComplete = useCallback(() => {
+    // Force a full reload so useWorkspaces re-initializes from localStorage.
+    // This only runs once — during first-run setup when no workspace existed.
+    window.location.reload();
+  }, []);
+
+  // Show welcome setup for first-run users with no workspaces
+  if (workspace.needsSetup) {
+    return (
+      <WelcomeSetup
+        defaultRelayUrl={workspace.defaultRelayUrl}
+        onComplete={handleSetupComplete}
+      />
+    );
+  }
+
+  // Wait for this exact workspace config to be applied to the backend before
+  // rendering anything that connects to the relay. The appliedKey check avoids
+  // a one-render race where React sees the new active workspace while the Tauri
+  // backend is still configured for the previous one.
+  if (!workspace.isReady || workspace.appliedKey !== workspaceKey) {
+    return <AppLoadingGate />;
+  }
+
+  return (
+    <WorkspaceQueryProvider key={workspaceKey}>
+      <AppReady key={workspaceKey} />
+    </WorkspaceQueryProvider>
+  );
 }

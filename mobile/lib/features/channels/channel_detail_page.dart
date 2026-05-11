@@ -1,48 +1,79 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/relay/relay.dart';
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/frosted_app_bar.dart';
+import '../../shared/widgets/frosted_scaffold.dart';
 import '../profile/presence_cache_provider.dart';
 import '../profile/profile_provider.dart';
 import '../profile/user_cache_provider.dart';
 import '../profile/user_profile.dart';
 import '../forum/forum_posts_view.dart';
 import 'channel.dart';
+import 'agent_activity/working_bots_provider.dart';
 import 'channel_management_provider.dart';
 import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channels_provider.dart';
 import 'compose_bar.dart';
+import 'date_formatters.dart';
+import 'day_divider.dart';
+import 'manage_channel_sheet.dart';
+import 'members_sheet.dart';
+import 'message_actions.dart';
 import 'message_content.dart';
+import 'read_state/deferred_read_state_update.dart';
+import 'read_state/read_state_provider.dart';
+import 'read_state/read_state_time.dart';
+import 'reaction_row.dart';
 import 'send_message_provider.dart';
+import '../profile/user_profile_sheet.dart';
+import 'small_avatar.dart';
 import 'thread_detail_page.dart';
 import 'timeline_message.dart';
 
 /// Fetch channel members and preload their profiles into the user cache.
 Future<void> _preloadMembers(WidgetRef ref, String channelId) async {
   // Capture references before async gap to avoid using disposed ref.
-  final client = ref.read(relayClientProvider);
   final notifier = ref.read(userCacheProvider.notifier);
   try {
-    final json =
-        await client.get('/api/channels/$channelId/members')
-            as Map<String, dynamic>;
-    final members = json['members'] as List<dynamic>? ?? [];
-    final pubkeys = members
-        .map((m) => (m as Map<String, dynamic>)['pubkey'] as String)
-        .toList();
+    final members = await ref.read(channelMembersProvider(channelId).future);
+    final pubkeys = members.map((m) => m.pubkey).toList();
     if (pubkeys.isNotEmpty) {
       notifier.preload(pubkeys);
     }
   } catch (_) {
     // Non-fatal — mentions will just fall back to cache from messages.
   }
+}
+
+int? _channelReadTimestamp({
+  required Channel channel,
+  required AsyncValue<List<NostrEvent>> messagesState,
+}) {
+  if (channel.isForum) {
+    return dateTimeToUnixSeconds(channel.lastMessageAt);
+  }
+
+  final events = messagesState.value;
+  if (events != null && events.isNotEmpty) {
+    var latest = 0;
+    for (final event in events) {
+      if (event.createdAt > latest) {
+        latest = event.createdAt;
+      }
+    }
+    if (latest > 0) {
+      return latest;
+    }
+  }
+
+  return dateTimeToUnixSeconds(channel.lastMessageAt);
 }
 
 class ChannelDetailPage extends HookConsumerWidget {
@@ -55,15 +86,21 @@ class ChannelDetailPage extends HookConsumerWidget {
     final detailsAsync = ref.watch(channelDetailsProvider(channel.id));
     final channelsAsync = ref.watch(channelsProvider);
     final messagesState = ref.watch(channelMessagesProvider(channel.id));
-    // Only show channel-level typing (exclude thread-scoped entries).
-    final typingEntries = ref
-        .watch(channelTypingProvider(channel.id))
-        .where((e) => e.threadHeadId == null)
-        .toList();
+    final readState = ref.watch(readStateProvider);
     final currentPubkey = ref
         .watch(profileProvider)
         .whenData((value) => value?.pubkey)
         .value;
+    // Only show channel-level typing (exclude thread-scoped entries and self).
+    final typingEntries = ref
+        .watch(channelTypingProvider(channel.id))
+        .where((e) => e.threadHeadId == null)
+        .where(
+          (e) =>
+              currentPubkey == null ||
+              e.pubkey.toLowerCase() != currentPubkey.toLowerCase(),
+        )
+        .toList();
     final baseChannel =
         channelsAsync
             .whenData(
@@ -76,6 +113,10 @@ class ChannelDetailPage extends HookConsumerWidget {
         channel;
     final resolvedChannel =
         detailsAsync.whenData(baseChannel.mergeDetails).value ?? baseChannel;
+    final readTimestamp = _channelReadTimestamp(
+      channel: resolvedChannel,
+      messagesState: messagesState,
+    );
 
     // Preload channel member profiles so @mentions resolve correctly.
     useEffect(() {
@@ -83,8 +124,19 @@ class ChannelDetailPage extends HookConsumerWidget {
       return null;
     }, [channel.id]);
 
-    return Scaffold(
-      appBar: AppBar(
+    useEffect(() {
+      if (!readState.isReady || readTimestamp == null) {
+        return null;
+      }
+      return deferReadStateUpdate(context, () {
+        ref
+            .read(readStateProvider.notifier)
+            .markContextRead(channel.id, readTimestamp);
+      });
+    }, [channel.id, readState.isReady, readTimestamp]);
+
+    return FrostedScaffold(
+      appBar: FrostedAppBar(
         title: resolvedChannel.isDm
             ? _DmAppBarTitle(
                 channel: resolvedChannel,
@@ -99,30 +151,37 @@ class ChannelDetailPage extends HookConsumerWidget {
                   ),
                   const SizedBox(width: Grid.half),
                   Expanded(
-                    child: Text(
-                      resolvedChannel.displayLabel(
-                        currentPubkey: currentPubkey,
-                      ),
-                      overflow: TextOverflow.ellipsis,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          resolvedChannel.displayLabel(
+                            currentPubkey: currentPubkey,
+                          ),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        if (resolvedChannel.isStream)
+                          Text(
+                            resolvedChannel.description.isNotEmpty
+                                ? resolvedChannel.description
+                                : '${resolvedChannel.memberCount} member${resolvedChannel.memberCount == 1 ? '' : 's'}',
+                            style: context.textTheme.bodySmall?.copyWith(
+                              color: context.colors.onSurfaceVariant,
+                            ),
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                      ],
                     ),
                   ),
                 ],
               ),
         actions: [
-          IconButton(
-            onPressed: () {
-              showModalBottomSheet<void>(
-                context: context,
-                isScrollControlled: true,
-                showDragHandle: true,
-                builder: (_) => _MembersSheet(
-                  channel: resolvedChannel,
-                  currentPubkey: currentPubkey,
-                ),
-              );
-            },
-            tooltip: 'View members',
-            icon: const Icon(LucideIcons.users),
+          _MembersButton(
+            channelId: resolvedChannel.id,
+            channel: resolvedChannel,
+            currentPubkey: currentPubkey,
           ),
           if (!resolvedChannel.isDm)
             IconButton(
@@ -131,7 +190,7 @@ class ChannelDetailPage extends HookConsumerWidget {
                   context: context,
                   isScrollControlled: true,
                   showDragHandle: true,
-                  builder: (_) => _ManageChannelSheet(channel: resolvedChannel),
+                  builder: (_) => ManageChannelSheet(channel: resolvedChannel),
                 );
                 if (shouldClose == true && context.mounted) {
                   Navigator.of(context).pop();
@@ -151,13 +210,22 @@ class ChannelDetailPage extends HookConsumerWidget {
                     currentPubkey: currentPubkey,
                   )
                 : messagesState.when(
-                    loading: () =>
-                        const Center(child: CircularProgressIndicator()),
-                    error: (e, _) => Center(
-                      child: Text(
-                        'Failed to load messages',
-                        style: context.textTheme.bodyMedium?.copyWith(
-                          color: context.colors.error,
+                    loading: () => Padding(
+                      padding: EdgeInsets.only(
+                        top: frostedAppBarHeight(context),
+                      ),
+                      child: const Center(child: CircularProgressIndicator()),
+                    ),
+                    error: (e, _) => Padding(
+                      padding: EdgeInsets.only(
+                        top: frostedAppBarHeight(context),
+                      ),
+                      child: Center(
+                        child: Text(
+                          'Failed to load messages',
+                          style: context.textTheme.bodyMedium?.copyWith(
+                            color: context.colors.error,
+                          ),
                         ),
                       ),
                     ),
@@ -177,6 +245,9 @@ class ChannelDetailPage extends HookConsumerWidget {
                       );
                     },
                   ),
+          ),
+          _DetailConnectionBanner(
+            status: ref.watch(relaySessionProvider).status,
           ),
           if (!resolvedChannel.isForum && typingEntries.isNotEmpty)
             _TypingIndicator(entries: typingEntries),
@@ -226,20 +297,51 @@ class _MessageList extends HookConsumerWidget {
     required this.isArchived,
   });
 
+  static const _fetchOlderThreshold = 200.0;
+  static const _latestThreshold = 48.0;
+
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     // Pagination: fetch older messages when scrolling near the top.
     final scrollController = useScrollController();
     final isLoadingOlder = useState(false);
+    final isAtLatest = useState(true);
+    final latestEntryId = entries.isEmpty ? null : entries.last.message.id;
+    final previousLatestEntryId = useRef<String?>(null);
+
+    bool nearLatest() {
+      if (!scrollController.hasClients) return true;
+      return scrollController.position.pixels <= _latestThreshold;
+    }
+
+    void updateLatestState() {
+      final next = nearLatest();
+      if (isAtLatest.value != next) {
+        isAtLatest.value = next;
+      }
+    }
+
+    Future<void> scrollToLatest() async {
+      if (!scrollController.hasClients) return;
+      await scrollController.animateTo(
+        0,
+        duration: const Duration(milliseconds: 220),
+        curve: Curves.easeOutCubic,
+      );
+      if (context.mounted) {
+        isAtLatest.value = true;
+      }
+    }
 
     useEffect(() {
       void onScroll() {
+        updateLatestState();
         if (isLoadingOlder.value) return;
         final notifier = ref.read(channelMessagesProvider(channelId).notifier);
         if (notifier.reachedOldest) return;
         // In a reversed ListView, maxScrollExtent is the oldest messages.
         final pos = scrollController.position;
-        if (pos.pixels >= pos.maxScrollExtent - 200) {
+        if (pos.pixels >= pos.maxScrollExtent - _fetchOlderThreshold) {
           isLoadingOlder.value = true;
           notifier.fetchOlder().whenComplete(
             () => isLoadingOlder.value = false,
@@ -249,7 +351,36 @@ class _MessageList extends HookConsumerWidget {
 
       scrollController.addListener(onScroll);
       return () => scrollController.removeListener(onScroll);
-    }, [scrollController]);
+    }, [channelId, scrollController]);
+
+    useEffect(() {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!context.mounted) return;
+        updateLatestState();
+      });
+      return null;
+    }, [entries.length, scrollController]);
+
+    useEffect(() {
+      final previous = previousLatestEntryId.value;
+      previousLatestEntryId.value = latestEntryId;
+      if (previous == null ||
+          latestEntryId == null ||
+          previous == latestEntryId ||
+          !isAtLatest.value) {
+        return null;
+      }
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!context.mounted || !scrollController.hasClients) return;
+        scrollController.animateTo(
+          0,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOutCubic,
+        );
+      });
+      return null;
+    }, [latestEntryId, scrollController]);
 
     if (entries.isEmpty) {
       return Center(
@@ -259,7 +390,7 @@ class _MessageList extends HookConsumerWidget {
             Icon(
               LucideIcons.messageSquare,
               size: Grid.xl,
-              color: context.colors.outline,
+              color: context.colors.onSurfaceVariant,
             ),
             const SizedBox(height: Grid.xxs),
             Text(
@@ -272,7 +403,7 @@ class _MessageList extends HookConsumerWidget {
             Text(
               'Be the first to say something!',
               style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.outline,
+                color: context.colors.onSurfaceVariant,
               ),
             ),
           ],
@@ -289,73 +420,118 @@ class _MessageList extends HookConsumerWidget {
       }
     });
 
-    return ListView.builder(
-      controller: scrollController,
-      reverse: true,
-      padding: const EdgeInsets.symmetric(
-        horizontal: Grid.xs,
-        vertical: Grid.xxs,
-      ),
-      itemCount: entries.length + (isLoadingOlder.value ? 1 : 0),
-      itemBuilder: (context, index) {
-        // Loading indicator at the top (last index in reversed list).
-        if (index >= entries.length) {
-          return const Padding(
-            padding: EdgeInsets.symmetric(vertical: Grid.xs),
+    return Stack(
+      children: [
+        ListView.builder(
+          key: const ValueKey('channel-message-list'),
+          controller: scrollController,
+          reverse: true,
+          padding: EdgeInsets.only(
+            left: Grid.xs,
+            right: Grid.xs,
+            top: frostedAppBarHeight(context),
+            bottom: Grid.xxs,
+          ),
+          itemCount: entries.length + (isLoadingOlder.value ? 1 : 0),
+          itemBuilder: (context, index) {
+            // Loading indicator at the top (last index in reversed list).
+            if (index >= entries.length) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: Grid.xs),
+                child: Center(
+                  child: SizedBox(
+                    width: 20,
+                    height: 20,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  ),
+                ),
+              );
+            }
+
+            // Reversed list: index 0 = newest (bottom of screen).
+            final chronIdx = entries.length - 1 - index;
+            final entry = entries[chronIdx];
+            final message = entry.message;
+
+            // Day boundary check — applies to all messages including system.
+            final prevEntry = chronIdx > 0 ? entries[chronIdx - 1] : null;
+            final prevMessage = prevEntry?.message;
+            final showDayDivider =
+                prevMessage == null ||
+                !isSameDay(prevMessage.createdAt, message.createdAt);
+
+            final showAuthor =
+                !message.isSystem &&
+                (prevMessage == null ||
+                    prevMessage.isSystem ||
+                    showDayDivider ||
+                    prevMessage.pubkey.toLowerCase() !=
+                        message.pubkey.toLowerCase() ||
+                    (message.createdAt - prevMessage.createdAt) > 300);
+
+            return Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (showDayDivider)
+                  DayDivider(label: formatDayHeading(message.createdAt)),
+                if (message.isSystem)
+                  _SystemMessageRow(
+                    message: message,
+                    channelId: channelId,
+                    currentPubkey: currentPubkey,
+                    allMessages: null,
+                    isMember: isMember,
+                    isArchived: isArchived,
+                  )
+                else ...[
+                  _MessageBubble(
+                    message: message,
+                    showAuthor: showAuthor,
+                    channelNames: channelNamesMap,
+                    currentChannelId: channelId,
+                    currentPubkey: currentPubkey,
+                    allMessages: allMessages,
+                    isMember: isMember,
+                    isArchived: isArchived,
+                  ),
+                  if (entry.summary != null)
+                    _ThreadSummaryRow(
+                      summary: entry.summary!,
+                      message: message,
+                      allMessages: allMessages,
+                      channelId: channelId,
+                      currentPubkey: currentPubkey,
+                      isMember: isMember,
+                      isArchived: isArchived,
+                    ),
+                ],
+              ],
+            );
+          },
+        ),
+        if (!isAtLatest.value)
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: Grid.xs,
             child: Center(
-              child: SizedBox(
-                width: 20,
-                height: 20,
-                child: CircularProgressIndicator(strokeWidth: 2),
+              child: FilledButton.icon(
+                key: const ValueKey('channel-jump-to-latest'),
+                onPressed: scrollToLatest,
+                style: FilledButton.styleFrom(
+                  backgroundColor: context.colors.primaryContainer,
+                  foregroundColor: context.colors.onPrimaryContainer,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: Grid.xs,
+                    vertical: Grid.xxs,
+                  ),
+                ),
+                icon: const Icon(LucideIcons.arrowDown, size: 16),
+                label: const Text('Latest'),
               ),
             ),
-          );
-        }
-
-        // Reversed list: index 0 = newest (bottom of screen).
-        final chronIdx = entries.length - 1 - index;
-        final entry = entries[chronIdx];
-        final message = entry.message;
-
-        if (message.isSystem) {
-          return _SystemMessageRow(message: message);
-        }
-
-        // The message visually above is the one earlier in time.
-        final prevEntry = chronIdx > 0 ? entries[chronIdx - 1] : null;
-        final prevMessage = prevEntry?.message;
-        final showAuthor =
-            prevMessage == null ||
-            prevMessage.isSystem ||
-            prevMessage.pubkey.toLowerCase() != message.pubkey.toLowerCase() ||
-            (message.createdAt - prevMessage.createdAt) > 300;
-
-        return Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            _MessageBubble(
-              message: message,
-              showAuthor: showAuthor,
-              channelNames: channelNamesMap,
-              currentChannelId: channelId,
-              currentPubkey: currentPubkey,
-              allMessages: allMessages,
-              isMember: isMember,
-              isArchived: isArchived,
-            ),
-            if (entry.summary != null)
-              _ThreadSummaryRow(
-                summary: entry.summary!,
-                message: message,
-                allMessages: allMessages,
-                channelId: channelId,
-                currentPubkey: currentPubkey,
-                isMember: isMember,
-                isArchived: isArchived,
-              ),
-          ],
-        );
-      },
+          ),
+      ],
     );
   }
 }
@@ -366,8 +542,20 @@ class _MessageList extends HookConsumerWidget {
 
 class _SystemMessageRow extends ConsumerWidget {
   final TimelineMessage message;
+  final String channelId;
+  final String? currentPubkey;
+  final List<TimelineMessage>? allMessages;
+  final bool isMember;
+  final bool isArchived;
 
-  const _SystemMessageRow({required this.message});
+  const _SystemMessageRow({
+    required this.message,
+    required this.channelId,
+    this.currentPubkey,
+    this.allMessages,
+    this.isMember = false,
+    this.isArchived = false,
+  });
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -381,47 +569,110 @@ class _SystemMessageRow extends ConsumerWidget {
       final profile =
           userCache[pubkey.toLowerCase()] ??
           ref.read(userCacheProvider.notifier).get(pubkey.toLowerCase());
-      return profile?.label ?? _shortPubkey(pubkey);
+      return profile?.label ?? shortPubkey(pubkey);
     }
 
     final description = systemEvent.describe(resolveLabel);
 
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: Grid.half),
-      child: Row(
-        children: [
-          Container(
-            width: 20,
-            height: 20,
-            decoration: BoxDecoration(
-              color: context.colors.surfaceContainerHighest,
-              shape: BoxShape.circle,
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onLongPress: () => showMessageActions(
+        context: context,
+        ref: ref,
+        message: message,
+        channelId: channelId,
+        isOwnMessage: false,
+        allMessages: null,
+        currentPubkey: currentPubkey,
+        isMember: isMember,
+        isArchived: isArchived,
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: Grid.xxs),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                _systemEventAvatar(context, systemEvent, userCache),
+                const SizedBox(width: Grid.xxs),
+                Expanded(
+                  child: Text(
+                    description,
+                    style: context.textTheme.bodySmall?.copyWith(
+                      color: context.colors.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+                Text(
+                  formatMessageTime(message.createdAt),
+                  style: context.textTheme.labelSmall?.copyWith(
+                    color: context.colors.onSurfaceVariant,
+                  ),
+                ),
+              ],
             ),
-            child: Icon(
-              LucideIcons.arrowLeftRight,
-              size: 12,
-              color: context.colors.outline,
-            ),
-          ),
-          const SizedBox(width: Grid.xxs),
-          Expanded(
-            child: Text(
-              description,
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.outline,
+            if (message.reactions.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(left: 28),
+                child: ReactionRow(
+                  reactions: message.reactions,
+                  onToggle: (emoji) => toggleReaction(ref, message, emoji),
+                ),
               ),
-            ),
-          ),
-          Text(
-            _formatTime(message.createdAt),
-            style: context.textTheme.labelSmall?.copyWith(
-              color: context.colors.outline.withValues(alpha: 0.6),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+Widget _systemEventAvatar(
+  BuildContext context,
+  SystemEvent event,
+  Map<String, UserProfile> userCache,
+) {
+  final hasTarget =
+      event.targetPubkey != null && event.targetPubkey != event.actorPubkey;
+
+  if (event.actorPubkey != null && hasTarget) {
+    // Two-avatar stack: actor + target (e.g. "Alice added Bob").
+    return SizedBox(
+      width: 32,
+      height: 20,
+      child: Stack(
+        children: [
+          SmallAvatar(pubkey: event.actorPubkey!, userCache: userCache),
+          Positioned(
+            left: 12,
+            child: SmallAvatar(
+              pubkey: event.targetPubkey!,
+              userCache: userCache,
             ),
           ),
         ],
       ),
     );
   }
+
+  if (event.actorPubkey != null) {
+    return SmallAvatar(pubkey: event.actorPubkey!, userCache: userCache);
+  }
+
+  // Fallback: generic icon when no actor is available.
+  return Container(
+    width: 20,
+    height: 20,
+    decoration: BoxDecoration(
+      color: context.colors.surfaceContainerHighest,
+      shape: BoxShape.circle,
+    ),
+    child: Icon(
+      LucideIcons.arrowLeftRight,
+      size: 12,
+      color: context.colors.onSurfaceVariant,
+    ),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +735,7 @@ class _ThreadSummaryRow extends ConsumerWidget {
                   for (var i = 0; i < summary.participantPubkeys.length; i++)
                     Positioned(
                       left: i * 12.0,
-                      child: _SmallAvatar(
+                      child: SmallAvatar(
                         pubkey: summary.participantPubkeys[i],
                         userCache: userCache,
                       ),
@@ -508,45 +759,6 @@ class _ThreadSummaryRow extends ConsumerWidget {
             ),
           ],
         ),
-      ),
-    );
-  }
-}
-
-class _SmallAvatar extends StatelessWidget {
-  final String pubkey;
-  final Map<String, UserProfile> userCache;
-
-  const _SmallAvatar({required this.pubkey, required this.userCache});
-
-  @override
-  Widget build(BuildContext context) {
-    final profile = userCache[pubkey.toLowerCase()];
-    final avatarUrl = profile?.avatarUrl;
-    final initial =
-        profile?.initial ?? (pubkey.isNotEmpty ? pubkey[0].toUpperCase() : '?');
-
-    return Container(
-      width: 20,
-      height: 20,
-      decoration: BoxDecoration(
-        shape: BoxShape.circle,
-        border: Border.all(color: context.colors.surface, width: 1.5),
-      ),
-      child: CircleAvatar(
-        radius: 9,
-        backgroundColor: context.colors.primaryContainer,
-        backgroundImage: avatarUrl != null ? NetworkImage(avatarUrl) : null,
-        child: avatarUrl == null
-            ? Text(
-                initial,
-                style: TextStyle(
-                  fontSize: 8,
-                  fontWeight: FontWeight.w600,
-                  color: context.colors.onPrimaryContainer,
-                ),
-              )
-            : null,
       ),
     );
   }
@@ -584,7 +796,7 @@ class _MessageBubble extends ConsumerWidget {
     final profile =
         ref.watch(userCacheProvider.select((cache) => cache[pk])) ??
         ref.read(userCacheProvider.notifier).get(pk);
-    final displayName = profile?.label ?? _shortPubkey(message.pubkey);
+    final displayName = profile?.label ?? shortPubkey(message.pubkey);
 
     // Build mention names map from event p-tags.
     final userCache = ref.watch(userCacheProvider);
@@ -598,7 +810,7 @@ class _MessageBubble extends ConsumerWidget {
 
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onLongPress: () => _showMessageActions(
+      onLongPress: () => showMessageActions(
         context: context,
         ref: ref,
         message: message,
@@ -611,12 +823,15 @@ class _MessageBubble extends ConsumerWidget {
         isArchived: isArchived,
       ),
       child: Padding(
-        padding: EdgeInsets.only(top: showAuthor ? Grid.xs : Grid.quarter),
+        padding: EdgeInsets.only(top: showAuthor ? Grid.xs : Grid.half),
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             if (showAuthor)
-              _UserAvatar(profile: profile, pubkey: message.pubkey)
+              GestureDetector(
+                onTap: () => showUserProfileSheet(context, message.pubkey),
+                child: _UserAvatar(profile: profile, pubkey: message.pubkey),
+              )
             else
               const SizedBox(width: 28),
             const SizedBox(width: Grid.xxs),
@@ -629,18 +844,22 @@ class _MessageBubble extends ConsumerWidget {
                       padding: const EdgeInsets.only(bottom: Grid.quarter),
                       child: Row(
                         children: [
-                          Text(
-                            displayName,
-                            style: context.textTheme.labelMedium?.copyWith(
-                              fontWeight: FontWeight.w600,
-                              color: context.colors.onSurface,
+                          GestureDetector(
+                            onTap: () =>
+                                showUserProfileSheet(context, message.pubkey),
+                            child: Text(
+                              displayName,
+                              style: context.textTheme.labelMedium?.copyWith(
+                                fontWeight: FontWeight.w600,
+                                color: context.colors.onSurface,
+                              ),
                             ),
                           ),
                           const SizedBox(width: Grid.xxs),
                           Text(
-                            _formatTime(message.createdAt),
+                            formatMessageTime(message.createdAt),
                             style: context.textTheme.labelSmall?.copyWith(
-                              color: context.colors.outline,
+                              color: context.colors.onSurfaceVariant,
                             ),
                           ),
                           if (message.edited) ...[
@@ -648,7 +867,7 @@ class _MessageBubble extends ConsumerWidget {
                             Text(
                               '(edited)',
                               style: context.textTheme.labelSmall?.copyWith(
-                                color: context.colors.outline,
+                                color: context.colors.onSurfaceVariant,
                                 fontStyle: FontStyle.italic,
                               ),
                             ),
@@ -684,23 +903,9 @@ class _MessageBubble extends ConsumerWidget {
                     },
                   ),
                   if (message.reactions.isNotEmpty)
-                    _ReactionRow(
+                    ReactionRow(
                       reactions: message.reactions,
-                      onToggle: (emoji) {
-                        final actions = ref.read(channelActionsProvider);
-                        final reaction = message.reactions.firstWhere(
-                          (r) => r.emoji == emoji,
-                        );
-                        if (reaction.reactedByCurrentUser &&
-                            reaction.currentUserReactionId != null) {
-                          actions.removeReaction(
-                            reaction.currentUserReactionId!,
-                            emoji,
-                          );
-                        } else {
-                          actions.addReaction(message.id, emoji);
-                        }
-                      },
+                      onToggle: (emoji) => toggleReaction(ref, message, emoji),
                     ),
                 ],
               ),
@@ -739,291 +944,6 @@ class _UserAvatar extends StatelessWidget {
           : null,
     );
   }
-}
-
-// ---------------------------------------------------------------------------
-// Reaction pills row
-// ---------------------------------------------------------------------------
-
-class _ReactionRow extends StatelessWidget {
-  final List<TimelineReaction> reactions;
-  final void Function(String emoji) onToggle;
-
-  const _ReactionRow({required this.reactions, required this.onToggle});
-
-  @override
-  Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.only(top: Grid.half),
-      child: Wrap(
-        spacing: Grid.half,
-        runSpacing: Grid.half,
-        children: [
-          for (final reaction in reactions)
-            GestureDetector(
-              onTap: () => onToggle(reaction.emoji),
-              child: Container(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: Grid.xxs,
-                  vertical: Grid.quarter,
-                ),
-                decoration: BoxDecoration(
-                  color: reaction.reactedByCurrentUser
-                      ? context.colors.primary.withValues(alpha: 0.12)
-                      : context.colors.surfaceContainerHighest,
-                  borderRadius: BorderRadius.circular(Radii.lg),
-                  border: Border.all(
-                    color: reaction.reactedByCurrentUser
-                        ? context.colors.primary.withValues(alpha: 0.4)
-                        : context.colors.outlineVariant,
-                  ),
-                ),
-                child: Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    Text(reaction.emoji, style: const TextStyle(fontSize: 14)),
-                    if (reaction.count > 1) ...[
-                      const SizedBox(width: Grid.quarter),
-                      Text(
-                        '${reaction.count}',
-                        style: context.textTheme.labelSmall?.copyWith(
-                          color: reaction.reactedByCurrentUser
-                              ? context.colors.primary
-                              : context.colors.onSurfaceVariant,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ],
-                  ],
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Message actions (long-press sheet)
-// ---------------------------------------------------------------------------
-
-const _quickEmojis = ['👍', '❤️', '😂', '🎉', '👀', '🙏'];
-
-void _showMessageActions({
-  required BuildContext context,
-  required WidgetRef ref,
-  required TimelineMessage message,
-  required String channelId,
-  required bool isOwnMessage,
-  List<TimelineMessage>? allMessages,
-  String? currentPubkey,
-  bool isMember = false,
-  bool isArchived = false,
-}) {
-  showModalBottomSheet<void>(
-    context: context,
-    showDragHandle: true,
-    builder: (sheetContext) => SafeArea(
-      child: Padding(
-        padding: const EdgeInsets.fromLTRB(Grid.xs, 0, Grid.xs, Grid.xs),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Quick emoji row
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-              children: [
-                for (final emoji in _quickEmojis)
-                  GestureDetector(
-                    onTap: () {
-                      Navigator.of(sheetContext).pop();
-                      ref
-                          .read(channelActionsProvider)
-                          .addReaction(message.id, emoji);
-                    },
-                    child: Container(
-                      width: 44,
-                      height: 44,
-                      alignment: Alignment.center,
-                      decoration: BoxDecoration(
-                        color: Theme.of(
-                          sheetContext,
-                        ).colorScheme.surfaceContainerHighest,
-                        shape: BoxShape.circle,
-                      ),
-                      child: Text(emoji, style: const TextStyle(fontSize: 20)),
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: Grid.xs),
-            if (allMessages != null)
-              ListTile(
-                leading: const Icon(LucideIcons.messageSquareReply),
-                title: const Text('Reply in thread'),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  Navigator.of(context).push(
-                    MaterialPageRoute<void>(
-                      builder: (_) => ThreadDetailPage(
-                        threadHead: message,
-                        allMessages: allMessages,
-                        channelId: channelId,
-                        currentPubkey: currentPubkey,
-                        isMember: isMember,
-                        isArchived: isArchived,
-                      ),
-                    ),
-                  );
-                },
-              ),
-            ListTile(
-              leading: const Icon(LucideIcons.copy),
-              title: const Text('Copy text'),
-              onTap: () {
-                Navigator.of(sheetContext).pop();
-                // Copy to clipboard
-                final data = ClipboardData(text: message.content);
-                Clipboard.setData(data);
-              },
-            ),
-            if (isOwnMessage) ...[
-              ListTile(
-                leading: const Icon(LucideIcons.pencil),
-                title: const Text('Edit message'),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _showEditSheet(
-                    context: context,
-                    ref: ref,
-                    message: message,
-                    channelId: channelId,
-                  );
-                },
-              ),
-              ListTile(
-                leading: Icon(
-                  LucideIcons.trash2,
-                  color: Theme.of(sheetContext).colorScheme.error,
-                ),
-                title: Text(
-                  'Delete message',
-                  style: TextStyle(
-                    color: Theme.of(sheetContext).colorScheme.error,
-                  ),
-                ),
-                onTap: () {
-                  Navigator.of(sheetContext).pop();
-                  _confirmDelete(
-                    context: context,
-                    ref: ref,
-                    messageId: message.id,
-                  );
-                },
-              ),
-            ],
-          ],
-        ),
-      ),
-    ),
-  );
-}
-
-void _showEditSheet({
-  required BuildContext context,
-  required WidgetRef ref,
-  required TimelineMessage message,
-  required String channelId,
-}) {
-  final controller = TextEditingController(text: message.content);
-  showModalBottomSheet<void>(
-    context: context,
-    isScrollControlled: true,
-    showDragHandle: true,
-    builder: (sheetContext) => Padding(
-      padding: EdgeInsets.fromLTRB(
-        Grid.xs,
-        0,
-        Grid.xs,
-        MediaQuery.viewInsetsOf(sheetContext).bottom + Grid.xs,
-      ),
-      child: SafeArea(
-        top: false,
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            TextField(
-              controller: controller,
-              autofocus: true,
-              minLines: 1,
-              maxLines: 5,
-              decoration: const InputDecoration(hintText: 'Edit message'),
-            ),
-            const SizedBox(height: Grid.xxs),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.end,
-              children: [
-                TextButton(
-                  onPressed: () => Navigator.of(sheetContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                const SizedBox(width: Grid.half),
-                FilledButton(
-                  onPressed: () {
-                    final text = controller.text.trim();
-                    if (text.isEmpty || text == message.content) {
-                      Navigator.of(sheetContext).pop();
-                      return;
-                    }
-                    ref
-                        .read(channelActionsProvider)
-                        .editMessage(
-                          channelId: channelId,
-                          eventId: message.id,
-                          content: text,
-                        );
-                    Navigator.of(sheetContext).pop();
-                  },
-                  child: const Text('Save'),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    ),
-  );
-}
-
-void _confirmDelete({
-  required BuildContext context,
-  required WidgetRef ref,
-  required String messageId,
-}) {
-  showDialog<void>(
-    context: context,
-    builder: (dialogContext) => AlertDialog(
-      title: const Text('Delete message'),
-      content: const Text('This cannot be undone.'),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(dialogContext).pop(),
-          child: const Text('Cancel'),
-        ),
-        FilledButton(
-          onPressed: () {
-            Navigator.of(dialogContext).pop();
-            ref.read(channelActionsProvider).deleteMessage(messageId);
-          },
-          style: FilledButton.styleFrom(
-            backgroundColor: Theme.of(dialogContext).colorScheme.error,
-          ),
-          child: const Text('Delete'),
-        ),
-      ],
-    ),
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1069,574 +989,44 @@ class _ReadOnlyNotice extends StatelessWidget {
   }
 }
 
-class _MembersSheet extends HookConsumerWidget {
-  final Channel channel;
-  final String? currentPubkey;
+// ---------------------------------------------------------------------------
+// Connection banner (shown inside channel detail during reconnect)
+// ---------------------------------------------------------------------------
 
-  const _MembersSheet({required this.channel, required this.currentPubkey});
+class _DetailConnectionBanner extends StatelessWidget {
+  final SessionStatus status;
 
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final membersAsync = ref.watch(channelMembersProvider(channel.id));
-    final allMembers = membersAsync.asData?.value ?? const <ChannelMember>[];
-    final people = allMembers.where((member) => !member.isBot).toList();
-    final userCache = ref.watch(userCacheProvider);
-
-    // Determine if the current user can manage members.
-    final currentMember = allMembers.cast<ChannelMember?>().firstWhere(
-      (m) => m!.pubkey.toLowerCase() == currentPubkey?.toLowerCase(),
-      orElse: () => null,
-    );
-    final canManage =
-        currentMember != null &&
-        currentMember.isElevated &&
-        !channel.isArchived;
-
-    // Preload profiles for all members so avatars appear.
-    useEffect(() {
-      if (people.isNotEmpty) {
-        ref
-            .read(userCacheProvider.notifier)
-            .preload(people.map((m) => m.pubkey).toList());
-      }
-      return null;
-    }, [people.length]);
-
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-        Grid.xs,
-        0,
-        Grid.xs,
-        MediaQuery.viewInsetsOf(context).bottom + Grid.xs,
-      ),
-      child: SafeArea(
-        top: false,
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('Members', style: context.textTheme.titleMedium),
-              const SizedBox(height: Grid.xxs),
-              Text(
-                'People in ${channel.displayLabel(currentPubkey: currentPubkey)}.',
-                style: context.textTheme.bodySmall?.copyWith(
-                  color: context.colors.onSurfaceVariant,
-                ),
-              ),
-              if (!channel.isDm) ...[const Divider(height: Grid.sm)],
-              SizedBox(
-                height: 280,
-                child: membersAsync.when(
-                  data: (_) => people.isEmpty
-                      ? Center(
-                          child: Text(
-                            'No people found.',
-                            style: context.textTheme.bodySmall?.copyWith(
-                              color: context.colors.outline,
-                            ),
-                          ),
-                        )
-                      : ListView(
-                          shrinkWrap: true,
-                          children: [
-                            for (final member in people)
-                              _MemberTile(
-                                member: member,
-                                currentPubkey: currentPubkey,
-                                profile: userCache[member.pubkey.toLowerCase()],
-                                canManage: canManage,
-                                isSelf:
-                                    member.pubkey.toLowerCase() ==
-                                    currentPubkey?.toLowerCase(),
-                                channelId: channel.id,
-                              ),
-                          ],
-                        ),
-                  loading: () =>
-                      const Center(child: CircularProgressIndicator()),
-                  error: (error, _) => Center(
-                    child: Text(
-                      error.toString(),
-                      style: context.textTheme.bodySmall?.copyWith(
-                        color: context.colors.error,
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-}
-
-const _changeableRoles = ['admin', 'member', 'guest'];
-
-class _MemberTile extends ConsumerWidget {
-  final ChannelMember member;
-  final String? currentPubkey;
-  final UserProfile? profile;
-  final bool canManage;
-  final bool isSelf;
-  final String channelId;
-
-  const _MemberTile({
-    required this.member,
-    required this.currentPubkey,
-    required this.profile,
-    required this.canManage,
-    required this.isSelf,
-    required this.channelId,
-  });
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final label = member.labelFor(currentPubkey);
-    final initial = label.substring(0, 1).toUpperCase();
-    final showMenu = canManage && !isSelf && !member.isOwner;
-
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: _MemberAvatar(avatarUrl: profile?.avatarUrl, initial: initial),
-      title: Text(label),
-      subtitle: Text(
-        _roleLabel(member.role),
-        style: context.textTheme.bodySmall?.copyWith(
-          color: context.colors.outline,
-        ),
-      ),
-      trailing: showMenu
-          ? IconButton(
-              icon: const Icon(LucideIcons.ellipsis, size: 18),
-              onPressed: () => _showMemberActions(context, ref),
-              visualDensity: VisualDensity.compact,
-            )
-          : null,
-    );
-  }
-
-  String _roleLabel(String role) {
-    if (role.isEmpty) return 'Member';
-    return '${role[0].toUpperCase()}${role.substring(1)}';
-  }
-
-  void _showMemberActions(BuildContext context, WidgetRef ref) {
-    final label = member.labelFor(currentPubkey);
-    showModalBottomSheet<void>(
-      context: context,
-      showDragHandle: true,
-      builder: (_) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: Grid.xs),
-              child: Text(label, style: context.textTheme.titleSmall),
-            ),
-            const SizedBox(height: Grid.xxs),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: Grid.xs),
-              child: Text(
-                'Change role',
-                style: context.textTheme.labelMedium?.copyWith(
-                  color: context.colors.outline,
-                ),
-              ),
-            ),
-            const SizedBox(height: Grid.half),
-            for (final role in _changeableRoles)
-              ListTile(
-                title: Text(_roleLabel(role)),
-                trailing: role == member.role
-                    ? Icon(
-                        LucideIcons.check,
-                        size: 16,
-                        color: context.colors.primary,
-                      )
-                    : null,
-                enabled: role != member.role,
-                onTap: role == member.role
-                    ? null
-                    : () async {
-                        Navigator.of(context).pop();
-                        await ref
-                            .read(channelActionsProvider)
-                            .changeMemberRole(
-                              channelId: channelId,
-                              pubkey: member.pubkey,
-                              role: role,
-                            );
-                      },
-              ),
-            const Divider(),
-            ListTile(
-              leading: Icon(
-                LucideIcons.userMinus,
-                size: 18,
-                color: context.colors.error,
-              ),
-              title: Text(
-                'Remove from channel',
-                style: TextStyle(color: context.colors.error),
-              ),
-              onTap: () async {
-                Navigator.of(context).pop();
-                final confirmed = await showDialog<bool>(
-                  context: context,
-                  builder: (context) => AlertDialog(
-                    title: const Text('Remove member'),
-                    content: Text('Remove $label from this channel?'),
-                    actions: [
-                      TextButton(
-                        onPressed: () => Navigator.of(context).pop(false),
-                        child: const Text('Cancel'),
-                      ),
-                      TextButton(
-                        onPressed: () => Navigator.of(context).pop(true),
-                        child: Text(
-                          'Remove',
-                          style: TextStyle(color: context.colors.error),
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-                if (confirmed == true) {
-                  await ref
-                      .read(channelActionsProvider)
-                      .removeMember(
-                        channelId: channelId,
-                        pubkey: member.pubkey,
-                      );
-                }
-              },
-            ),
-            const SizedBox(height: Grid.xxs),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _MemberAvatar extends HookWidget {
-  final String? avatarUrl;
-  final String initial;
-
-  const _MemberAvatar({required this.avatarUrl, required this.initial});
+  const _DetailConnectionBanner({required this.status});
 
   @override
   Widget build(BuildContext context) {
-    final failed = useState(false);
-
-    useEffect(() {
-      failed.value = false;
-      return null;
-    }, [avatarUrl]);
-
-    final url = avatarUrl;
-    if (url == null || failed.value) {
-      return CircleAvatar(child: Text(initial));
-    }
-    return CircleAvatar(
-      backgroundImage: NetworkImage(url),
-      onBackgroundImageError: (_, _) => failed.value = true,
-      child: null,
-    );
-  }
-}
-
-class _ManageChannelSheet extends HookConsumerWidget {
-  final Channel channel;
-
-  const _ManageChannelSheet({required this.channel});
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final canvasAsync = ref.watch(channelCanvasProvider(channel.id));
-    final isEditingCanvas = useState(false);
-    final isSavingCanvas = useState(false);
-    final isBusy = useState(false);
-    final actionError = useState<String?>(null);
-    final canvasController = useTextEditingController();
-
-    useEffect(() {
-      final canvas = canvasAsync.asData?.value;
-      if (!isEditingCanvas.value) {
-        canvasController.text = canvas?.content ?? '';
-      }
-      return null;
-    }, [canvasAsync.asData?.value.content, isEditingCanvas.value]);
-
-    final canJoin =
-        channel.visibility == 'open' &&
-        !channel.isArchived &&
-        !channel.isMember &&
-        !channel.isDm;
-    final canLeave = channel.isMember && !channel.isArchived && !channel.isDm;
-    final canEditCanvas = channel.isMember && !channel.isArchived;
-
-    Future<void> joinChannel() async {
-      if (isBusy.value) return;
-      isBusy.value = true;
-      actionError.value = null;
-      try {
-        await ref.read(channelActionsProvider).joinChannel(channel.id);
-        if (context.mounted) {
-          Navigator.of(context).pop(false);
-        }
-      } catch (error) {
-        actionError.value = error.toString();
-      } finally {
-        isBusy.value = false;
-      }
+    if (status == SessionStatus.connected ||
+        status == SessionStatus.disconnected) {
+      return const SizedBox.shrink();
     }
 
-    Future<void> leaveChannel() async {
-      if (isBusy.value) return;
-      isBusy.value = true;
-      actionError.value = null;
-      try {
-        await ref.read(channelActionsProvider).leaveChannel(channel.id);
-        if (context.mounted) {
-          Navigator.of(context).pop(true);
-        }
-      } catch (error) {
-        actionError.value = error.toString();
-      } finally {
-        isBusy.value = false;
-      }
-    }
-
-    Future<void> saveCanvas() async {
-      if (isSavingCanvas.value) {
-        return;
-      }
-      isSavingCanvas.value = true;
-      actionError.value = null;
-      try {
-        await ref
-            .read(channelActionsProvider)
-            .setCanvas(
-              channelId: channel.id,
-              content: canvasController.text.trim(),
-            );
-        if (context.mounted) {
-          isEditingCanvas.value = false;
-        }
-      } catch (error) {
-        actionError.value = error.toString();
-      } finally {
-        isSavingCanvas.value = false;
-      }
-    }
-
-    return Padding(
-      padding: EdgeInsets.fromLTRB(
-        Grid.xs,
-        0,
-        Grid.xs,
-        MediaQuery.viewInsetsOf(context).bottom + Grid.xs,
-      ),
-      child: SafeArea(
-        top: false,
-        child: ListView(
-          shrinkWrap: true,
-          children: [
-            Text('Manage channel', style: context.textTheme.titleMedium),
-            const SizedBox(height: Grid.xxs),
-            Text(
-              'Basic management for ${channel.name}.',
-              style: context.textTheme.bodySmall?.copyWith(
-                color: context.colors.onSurfaceVariant,
-              ),
-            ),
-            if (actionError.value case final error?) ...[
-              const SizedBox(height: Grid.xs),
-              Text(
-                error,
-                style: context.textTheme.bodySmall?.copyWith(
-                  color: context.colors.error,
-                ),
-              ),
-            ],
-            if (canJoin || canLeave) ...[
-              const SizedBox(height: Grid.xs),
-              Wrap(
-                spacing: Grid.xxs,
-                children: [
-                  if (canJoin)
-                    FilledButton.tonal(
-                      onPressed: isBusy.value ? null : joinChannel,
-                      child: Text(isBusy.value ? 'Joining…' : 'Join channel'),
-                    ),
-                  if (canLeave)
-                    OutlinedButton(
-                      onPressed: isBusy.value ? null : leaveChannel,
-                      child: Text(isBusy.value ? 'Leaving…' : 'Leave channel'),
-                    ),
-                ],
-              ),
-            ],
-            const SizedBox(height: Grid.sm),
-            Text('Context', style: context.textTheme.labelLarge),
-            const SizedBox(height: Grid.xxs),
-            _ContextCard(
-              label: 'Description',
-              value: channel.description,
-              emptyLabel: 'No description set',
-            ),
-            const SizedBox(height: Grid.xxs),
-            _ContextCard(
-              label: 'Topic',
-              value: channel.topic,
-              emptyLabel: 'No topic set',
-            ),
-            const SizedBox(height: Grid.xxs),
-            _ContextCard(
-              label: 'Purpose',
-              value: channel.purpose,
-              emptyLabel: 'No purpose set',
-            ),
-            if (!channel.isDm) ...[
-              const SizedBox(height: Grid.sm),
-              Text('Canvas', style: context.textTheme.labelLarge),
-              const SizedBox(height: Grid.xxs),
-              canvasAsync.when(
-                data: (canvas) {
-                  if (isEditingCanvas.value) {
-                    return Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        TextField(
-                          controller: canvasController,
-                          maxLines: 8,
-                          minLines: 6,
-                          decoration: const InputDecoration(
-                            hintText: 'Write your canvas content in Markdown…',
-                          ),
-                        ),
-                        const SizedBox(height: Grid.xxs),
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.end,
-                          children: [
-                            TextButton(
-                              onPressed: isSavingCanvas.value
-                                  ? null
-                                  : () {
-                                      isEditingCanvas.value = false;
-                                      canvasController.text =
-                                          canvas.content ?? '';
-                                    },
-                              child: const Text('Cancel'),
-                            ),
-                            const SizedBox(width: Grid.half),
-                            FilledButton(
-                              onPressed: isSavingCanvas.value
-                                  ? null
-                                  : saveCanvas,
-                              child: Text(
-                                isSavingCanvas.value
-                                    ? 'Saving…'
-                                    : 'Save canvas',
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    );
-                  }
-
-                  return Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Container(
-                        width: double.infinity,
-                        padding: const EdgeInsets.all(Grid.xs),
-                        decoration: BoxDecoration(
-                          color: context.colors.surfaceContainerHighest,
-                          borderRadius: BorderRadius.circular(Radii.md),
-                        ),
-                        child: Text(
-                          canvas.content?.trim().isNotEmpty == true
-                              ? canvas.content!
-                              : 'No canvas set for this channel.',
-                          style: context.textTheme.bodyMedium?.copyWith(
-                            color: context.colors.onSurfaceVariant,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: Grid.xxs),
-                      Align(
-                        alignment: Alignment.centerRight,
-                        child: FilledButton.tonal(
-                          onPressed: canEditCanvas
-                              ? () => isEditingCanvas.value = true
-                              : null,
-                          child: Text(
-                            canvas.content?.trim().isNotEmpty == true
-                                ? 'Edit canvas'
-                                : 'Create canvas',
-                          ),
-                        ),
-                      ),
-                    ],
-                  );
-                },
-                loading: () => const Center(child: CircularProgressIndicator()),
-                error: (error, _) => Text(
-                  error.toString(),
-                  style: context.textTheme.bodySmall?.copyWith(
-                    color: context.colors.error,
-                  ),
-                ),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-class _ContextCard extends StatelessWidget {
-  final String label;
-  final String? value;
-  final String emptyLabel;
-
-  const _ContextCard({
-    required this.label,
-    required this.value,
-    required this.emptyLabel,
-  });
-
-  @override
-  Widget build(BuildContext context) {
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.all(Grid.xs),
-      decoration: BoxDecoration(
-        color: context.colors.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(Radii.md),
+      padding: const EdgeInsets.symmetric(
+        horizontal: Grid.xs,
+        vertical: Grid.quarter + 2,
       ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
+      color: context.colors.surfaceContainerHighest,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Text(
-            label,
-            style: context.textTheme.labelSmall?.copyWith(
-              color: context.colors.outline,
-              fontWeight: FontWeight.w600,
+          SizedBox(
+            width: 12,
+            height: 12,
+            child: CircularProgressIndicator(
+              strokeWidth: 2,
+              color: context.colors.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: Grid.half),
+          const SizedBox(width: Grid.xxs),
           Text(
-            value?.trim().isNotEmpty == true ? value!.trim() : emptyLabel,
-            style: context.textTheme.bodyMedium?.copyWith(
+            'Reconnecting…',
+            style: context.textTheme.labelSmall?.copyWith(
               color: context.colors.onSurfaceVariant,
             ),
           ),
@@ -1662,7 +1052,7 @@ class _TypingIndicator extends ConsumerWidget {
       final profile =
           userCache[e.pubkey.toLowerCase()] ??
           ref.read(userCacheProvider.notifier).get(e.pubkey.toLowerCase());
-      return profile?.label ?? _shortPubkey(e.pubkey);
+      return profile?.label ?? shortPubkey(e.pubkey);
     }).toList();
     final text = switch (names.length) {
       1 => '${names[0]} is typing…',
@@ -1670,49 +1060,105 @@ class _TypingIndicator extends ConsumerWidget {
       _ => '${names[0]} and ${names.length - 1} others are typing…',
     };
 
+    final visibleEntries = entries.take(3).toList();
+    final avatarCount = visibleEntries.length;
+
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(
         horizontal: Grid.xs,
         vertical: Grid.quarter + 2,
       ),
-      child: Text(
-        text,
-        style: context.textTheme.labelSmall?.copyWith(
-          color: context.colors.outline,
-          fontStyle: FontStyle.italic,
-        ),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 20.0 + (avatarCount - 1) * 12.0,
+            height: 20,
+            child: Stack(
+              children: [
+                for (var i = 0; i < avatarCount; i++)
+                  Positioned(
+                    left: i * 12.0,
+                    child: SmallAvatar(
+                      pubkey: visibleEntries[i].pubkey,
+                      userCache: userCache,
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(width: Grid.xxs),
+          Flexible(
+            child: Text(
+              text,
+              style: context.textTheme.labelSmall?.copyWith(
+                color: context.colors.outline,
+                fontStyle: FontStyle.italic,
+              ),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
       ),
     );
   }
 }
 
 // ---------------------------------------------------------------------------
-// Compose bar
-// ---------------------------------------------------------------------------
-// Shared helpers
+// Members button with activity dot badge
 // ---------------------------------------------------------------------------
 
-String _shortPubkey(String pubkey) {
-  if (pubkey.length > 12) return '${pubkey.substring(0, 8)}…';
-  return pubkey;
-}
+class _MembersButton extends ConsumerWidget {
+  final String channelId;
+  final Channel channel;
+  final String? currentPubkey;
 
-String _formatTime(int createdAt) {
-  final dt = DateTime.fromMillisecondsSinceEpoch(
-    createdAt * 1000,
-    isUtc: true,
-  ).toLocal();
-  final now = DateTime.now();
-  final diff = now.difference(dt);
+  const _MembersButton({
+    required this.channelId,
+    required this.channel,
+    required this.currentPubkey,
+  });
 
-  if (diff.inDays > 0) {
-    return '${dt.month}/${dt.day} ${_pad(dt.hour)}:${_pad(dt.minute)}';
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final hasWorkingBot = ref
+        .watch(workingBotPubkeysProvider(channelId))
+        .isNotEmpty;
+
+    return IconButton(
+      onPressed: () {
+        showModalBottomSheet<void>(
+          context: context,
+          isScrollControlled: true,
+          showDragHandle: true,
+          builder: (_) =>
+              MembersSheet(channel: channel, currentPubkey: currentPubkey),
+        );
+      },
+      tooltip: 'View members',
+      icon: Stack(
+        clipBehavior: Clip.none,
+        children: [
+          const Icon(LucideIcons.users),
+          if (hasWorkingBot)
+            Positioned(
+              top: -2,
+              right: -2,
+              child: Container(
+                width: 8,
+                height: 8,
+                decoration: BoxDecoration(
+                  color: context.appColors.success,
+                  shape: BoxShape.circle,
+                  border: Border.all(color: context.colors.surface, width: 1.5),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
   }
-  return '${_pad(dt.hour)}:${_pad(dt.minute)}';
 }
-
-String _pad(int n) => n.toString().padLeft(2, '0');
 
 class _DmAppBarTitle extends ConsumerWidget {
   final Channel channel;
@@ -1796,9 +1242,7 @@ class _DmAppBarTitle extends ConsumerWidget {
                     },
                     shape: BoxShape.circle,
                     border: Border.all(
-                      color:
-                          context.theme.appBarTheme.backgroundColor ??
-                          context.theme.scaffoldBackgroundColor,
+                      color: context.colors.surface,
                       width: 1.5,
                     ),
                   ),
@@ -1811,6 +1255,7 @@ class _DmAppBarTitle extends ConsumerWidget {
         Expanded(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
             children: [
               Text(
                 channel.displayLabel(currentPubkey: currentPubkey),
@@ -1820,8 +1265,8 @@ class _DmAppBarTitle extends ConsumerWidget {
               ),
               Text(
                 presenceLabel,
-                style: context.textTheme.labelSmall?.copyWith(
-                  color: context.colors.outline,
+                style: context.textTheme.bodySmall?.copyWith(
+                  color: context.colors.onSurfaceVariant,
                 ),
               ),
             ],

@@ -12,17 +12,24 @@ use uuid::Uuid;
 use nostr::Event;
 use sprout_auth::Scope;
 use sprout_core::kind::{
-    event_kind_u32, is_parameterized_replaceable, KIND_AUTH, KIND_CANVAS, KIND_CONTACT_LIST,
-    KIND_DELETION, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_GIFT_WRAP,
-    KIND_HUDDLE_ENDED, KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED,
-    KIND_HUDDLE_PARTICIPANT_LEFT, KIND_HUDDLE_RECORDING_AVAILABLE, KIND_HUDDLE_STARTED,
-    KIND_HUDDLE_TRACK_PUBLISHED, KIND_LONG_FORM, KIND_MEMBER_ADDED_NOTIFICATION,
-    KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT,
-    KIND_NIP29_DELETE_GROUP, KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST,
-    KIND_NIP29_LEAVE_REQUEST, KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_PRESENCE_UPDATE,
-    KIND_PROFILE, KIND_REACTION, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_BOOKMARKED,
-    KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT, KIND_STREAM_MESSAGE_PINNED,
-    KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2, KIND_STREAM_REMINDER, KIND_TEXT_NOTE,
+    event_kind_u32, is_parameterized_replaceable, is_relay_admin_kind, KIND_APPROVAL_DENY,
+    KIND_APPROVAL_GRANT, KIND_AUTH, KIND_CANVAS, KIND_CONTACT_LIST, KIND_DELETION,
+    KIND_DM_ADD_MEMBER, KIND_DM_HIDE, KIND_DM_OPEN, KIND_FORUM_COMMENT, KIND_FORUM_POST,
+    KIND_FORUM_VOTE, KIND_GIFT_WRAP, KIND_GIT_ISSUE, KIND_GIT_PATCH, KIND_GIT_PR_UPDATE,
+    KIND_GIT_PULL_REQUEST, KIND_GIT_REPO_ANNOUNCEMENT, KIND_GIT_REPO_STATE, KIND_GIT_STATUS_CLOSED,
+    KIND_GIT_STATUS_DRAFT, KIND_GIT_STATUS_MERGED, KIND_GIT_STATUS_OPEN, KIND_HUDDLE_ENDED,
+    KIND_HUDDLE_GUIDELINES, KIND_HUDDLE_PARTICIPANT_JOINED, KIND_HUDDLE_PARTICIPANT_LEFT,
+    KIND_HUDDLE_RECORDING_AVAILABLE, KIND_HUDDLE_STARTED, KIND_HUDDLE_TRACK_PUBLISHED,
+    KIND_LONG_FORM, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_NIP29_CREATE_GROUP, KIND_NIP29_DELETE_EVENT, KIND_NIP29_DELETE_GROUP,
+    KIND_NIP29_EDIT_METADATA, KIND_NIP29_JOIN_REQUEST, KIND_NIP29_LEAVE_REQUEST,
+    KIND_NIP29_PUT_USER, KIND_NIP29_REMOVE_USER, KIND_NIP43_LEAVE_REQUEST, KIND_PRESENCE_UPDATE,
+    KIND_PROFILE, KIND_REACTION, KIND_READ_STATE, KIND_STREAM_MESSAGE,
+    KIND_STREAM_MESSAGE_BOOKMARKED, KIND_STREAM_MESSAGE_DIFF, KIND_STREAM_MESSAGE_EDIT,
+    KIND_STREAM_MESSAGE_PINNED, KIND_STREAM_MESSAGE_SCHEDULED, KIND_STREAM_MESSAGE_V2,
+    KIND_STREAM_REMINDER, KIND_TEXT_NOTE, KIND_USER_STATUS, KIND_WORKFLOW_DEF,
+    KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
+    RELAY_ADMIN_REMOVE_MEMBER,
 };
 use sprout_core::verification::verify_event;
 
@@ -35,11 +42,9 @@ use super::event::dispatch_persistent_event;
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
 #[derive(Debug, Clone)]
 pub enum HttpAuthMethod {
-    /// `Authorization: Bearer sprout_*` API token.
-    ApiToken,
-    /// `Authorization: Bearer eyJ*` Okta JWT.
-    OktaJwt,
-    /// `X-Pubkey: <hex>` dev-mode header.
+    /// `Authorization: Nostr <base64>` — NIP-98 HTTP Auth.
+    Nip98,
+    /// `X-Pubkey: <hex>` dev-mode header (backward compat during transition).
     DevPubkey,
 }
 
@@ -57,7 +62,7 @@ pub enum IngestAuth {
         /// WebSocket connection identifier.
         conn_id: Uuid,
     },
-    /// HTTP REST authenticated request.
+    /// HTTP bridge authenticated request (NIP-98 or dev X-Pubkey).
     Http {
         /// The authenticated Nostr public key.
         pubkey: nostr::PublicKey,
@@ -65,10 +70,6 @@ pub enum IngestAuth {
         scopes: Vec<Scope>,
         /// How the HTTP request was authenticated.
         auth_method: HttpAuthMethod,
-        /// API token UUID, if auth_method is `ApiToken`.
-        token_id: Option<Uuid>,
-        /// Token-level channel restriction, if any.
-        channel_ids: Option<Vec<Uuid>>,
     },
 }
 
@@ -100,14 +101,12 @@ impl IngestAuth {
         }
     }
 
-    /// Token-level channel restriction (Http/ApiToken only).
+    /// Token-level channel restriction (WS connections with scoped tokens — legacy).
+    /// In pure Nostr mode this always returns None; channel access is enforced
+    /// via NIP-29 membership checks instead.
     pub fn channel_ids(&self) -> Option<&[Uuid]> {
         match self {
             Self::Nip42 {
-                channel_ids: Some(ids),
-                ..
-            }
-            | Self::Http {
                 channel_ids: Some(ids),
                 ..
             } => Some(ids),
@@ -151,7 +150,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
     match kind {
         KIND_PROFILE => Ok(Scope::UsersWrite),
         KIND_TEXT_NOTE | KIND_LONG_FORM => Ok(Scope::MessagesWrite),
-        KIND_CONTACT_LIST => Ok(Scope::UsersWrite),
+        KIND_CONTACT_LIST | KIND_READ_STATE | KIND_USER_STATUS => Ok(Scope::UsersWrite),
         KIND_DELETION
         | KIND_REACTION
         | KIND_GIFT_WRAP
@@ -170,6 +169,13 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         KIND_NIP29_PUT_USER | KIND_NIP29_REMOVE_USER | KIND_NIP29_DELETE_GROUP => {
             Ok(Scope::AdminChannels)
         }
+        // NIP-43: relay membership admin commands (9030–9032)
+        k if k == RELAY_ADMIN_ADD_MEMBER
+            || k == RELAY_ADMIN_REMOVE_MEMBER
+            || k == RELAY_ADMIN_CHANGE_ROLE =>
+        {
+            Ok(Scope::AdminUsers)
+        }
         KIND_NIP29_EDIT_METADATA => {
             // kind:9002 scope split: archived tag → AdminChannels, else ChannelsWrite
             let has_archived = event
@@ -183,7 +189,9 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
             }
         }
         KIND_NIP29_CREATE_GROUP | KIND_CANVAS => Ok(Scope::ChannelsWrite),
-        KIND_NIP29_JOIN_REQUEST | KIND_NIP29_LEAVE_REQUEST => Ok(Scope::ChannelsRead),
+        KIND_NIP29_JOIN_REQUEST | KIND_NIP29_LEAVE_REQUEST | KIND_NIP43_LEAVE_REQUEST => {
+            Ok(Scope::ChannelsRead)
+        }
         // Huddle lifecycle events + guidelines
         KIND_HUDDLE_STARTED
         | KIND_HUDDLE_PARTICIPANT_JOINED
@@ -192,6 +200,20 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_HUDDLE_TRACK_PUBLISHED
         | KIND_HUDDLE_RECORDING_AVAILABLE
         | KIND_HUDDLE_GUIDELINES => Ok(Scope::ChannelsWrite),
+        // NIP-34: Git repository events
+        KIND_GIT_REPO_ANNOUNCEMENT | KIND_GIT_REPO_STATE => Ok(Scope::ReposWrite),
+        KIND_GIT_PATCH
+        | KIND_GIT_PULL_REQUEST
+        | KIND_GIT_PR_UPDATE
+        | KIND_GIT_ISSUE
+        | KIND_GIT_STATUS_OPEN
+        | KIND_GIT_STATUS_MERGED
+        | KIND_GIT_STATUS_CLOSED
+        | KIND_GIT_STATUS_DRAFT => Ok(Scope::MessagesWrite),
+        // Command kinds — DM management, workflows, approvals
+        KIND_DM_OPEN | KIND_DM_ADD_MEMBER | KIND_DM_HIDE => Ok(Scope::MessagesWrite),
+        KIND_WORKFLOW_DEF | KIND_WORKFLOW_TRIGGER => Ok(Scope::MessagesWrite),
+        KIND_APPROVAL_GRANT | KIND_APPROVAL_DENY => Ok(Scope::MessagesWrite),
         _ => Err("restricted: unknown event kind"),
     }
 }
@@ -272,7 +294,30 @@ pub(crate) async fn derive_reaction_channel(
 pub(crate) fn is_global_only_kind(kind: u32) -> bool {
     matches!(
         kind,
-        KIND_PROFILE | KIND_TEXT_NOTE | KIND_CONTACT_LIST | KIND_LONG_FORM
+        KIND_PROFILE
+            | KIND_TEXT_NOTE
+            | KIND_CONTACT_LIST
+            | KIND_LONG_FORM
+            | KIND_USER_STATUS
+            | KIND_READ_STATE
+            // NIP-34: git events use `a` tags (repo reference), not `h` tags (channel scope).
+            // Parameterized replaceable kinds are keyed by (pubkey, kind, d_tag).
+            | KIND_GIT_REPO_ANNOUNCEMENT
+            | KIND_GIT_REPO_STATE
+            | KIND_GIT_PATCH
+            | KIND_GIT_PULL_REQUEST
+            | KIND_GIT_PR_UPDATE
+            | KIND_GIT_ISSUE
+            | KIND_GIT_STATUS_OPEN
+            | KIND_GIT_STATUS_MERGED
+            | KIND_GIT_STATUS_CLOSED
+            | KIND_GIT_STATUS_DRAFT
+            // NIP-43: relay admin commands and leave requests are global — they
+            // must never be channel-scoped, even if the event carries a stray `h` tag.
+            | RELAY_ADMIN_ADD_MEMBER
+            | RELAY_ADMIN_REMOVE_MEMBER
+            | RELAY_ADMIN_CHANGE_ROLE
+            | KIND_NIP43_LEAVE_REQUEST
     )
 }
 
@@ -757,6 +802,11 @@ pub async fn ingest_event(
         )));
     }
 
+    // ── 1c. Reject relay-only kinds from external submission ─────────────
+    if sprout_core::kind::is_relay_only_kind(kind_u32) {
+        return Err(IngestError::Rejected("restricted: relay-only kind".into()));
+    }
+
     // ── 2. Signature verification ────────────────────────────────────────
     let event_clone = event.clone();
     let verify_result = tokio::task::spawn_blocking(move || verify_event(&event_clone)).await;
@@ -810,11 +860,41 @@ pub async fn ingest_event(
         Ok(scope) => scope,
         Err(msg) => return Err(IngestError::Rejected(msg.into())),
     };
+    // NIP-43: relay admin commands must NOT be submitted via proxy — they require
+    // the actual admin's signed event for authorization.
+    if auth.has_proxy_scope() && is_relay_admin_kind(event.kind.as_u16() as u32) {
+        return Err(IngestError::Rejected(
+            "invalid: relay admin commands cannot be submitted via proxy".into(),
+        ));
+    }
+    // NIP-43: relay admin commands are global — channel-scoped tokens cannot
+    // issue them even if the event has no `h` tag (is_global_only_kind strips
+    // channel_id, but we still need to reject the token itself).
+    if is_relay_admin_kind(kind_u32) && auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: relay admin commands require a global token, not a channel-scoped token"
+                .into(),
+        ));
+    }
+    // NIP-43: leave requests are also global — channel-scoped tokens cannot
+    // issue them.
+    if kind_u32 == KIND_NIP43_LEAVE_REQUEST && auth.channel_ids().is_some() {
+        return Err(IngestError::AuthFailed(
+            "restricted: leave requests require a global token".into(),
+        ));
+    }
     if !auth.has_proxy_scope() && !auth.scopes().contains(&required) {
         return Err(IngestError::AuthFailed(format!(
             "restricted: insufficient scope (need {})",
             required
         )));
+    }
+
+    // ── 4b. Route command kinds to command executor ──────────────────────
+    // Command kinds are routed AFTER signature verification, timestamp check,
+    // pubkey/auth match, and scope validation — never before.
+    if sprout_core::kind::is_command_kind(kind_u32) {
+        return super::command_executor::handle_command(state, event, auth).await;
     }
 
     // ── 5. Channel resolution ────────────────────────────────────────────
@@ -919,6 +999,103 @@ pub async fn ingest_event(
         }
     }
 
+    // ── 9a. Relay admin commands (kinds 9030–9032) ───────────────────────
+    // Handled directly — these mutate relay_members and do NOT get stored.
+    if is_relay_admin_kind(event.kind.as_u16() as u32) {
+        crate::handlers::relay_admin::handle_relay_admin_event(state, &event)
+            .await
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: String::new(),
+        });
+    }
+
+    // ── 9b. NIP-43 leave request (kind 28936) ────────────────────────────
+    // Handled directly — removes the sender from relay_members. NOT stored.
+    if kind_u32 == KIND_NIP43_LEAVE_REQUEST {
+        if !state.config.require_relay_membership {
+            return Err(IngestError::Rejected(
+                "invalid: relay membership is not enabled".into(),
+            ));
+        }
+
+        // Freshness check: reject events outside ±120s of now (same as admin commands).
+        {
+            let event_ts = event.created_at.as_u64() as i64;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            if (event_ts - now).abs() > 120 {
+                return Err(IngestError::Rejected(format!(
+                    "invalid: leave request timestamp out of range (delta={}s, max ±120s)",
+                    event_ts - now
+                )));
+            }
+        }
+
+        // NIP-43 spec: "This event MUST include a NIP-70 `-` tag."
+        let has_protected_tag = event
+            .tags
+            .iter()
+            .any(|t| t.as_slice().first().map(|s| s.as_str()) == Some("-"));
+        if !has_protected_tag {
+            return Err(IngestError::Rejected(
+                "invalid: leave request must include NIP-70 protected event tag [\"-\"]".into(),
+            ));
+        }
+
+        let sender_hex = event.pubkey.to_hex();
+
+        // remove_relay_member handles both the NotFound and IsOwner cases atomically.
+        let remove_result = state
+            .db
+            .remove_relay_member(&sender_hex)
+            .await
+            .map_err(|e| IngestError::Internal(format!("database error: {e}")))?;
+
+        match remove_result {
+            sprout_db::relay_members::RemoveResult::Removed => {}
+            sprout_db::relay_members::RemoveResult::NotFound => {
+                return Err(IngestError::Rejected(
+                    "invalid: you are not a relay member".into(),
+                ));
+            }
+            sprout_db::relay_members::RemoveResult::IsOwner => {
+                return Err(IngestError::Rejected(
+                    "invalid: relay owner cannot leave".into(),
+                ));
+            }
+            sprout_db::relay_members::RemoveResult::RoleMismatch => {
+                // remove_relay_member (no role filter) never returns RoleMismatch —
+                // this arm is unreachable but exhaustiveness requires it.
+                return Err(IngestError::Internal(
+                    "unexpected RoleMismatch from remove_relay_member".into(),
+                ));
+            }
+        }
+
+        // Publish NIP-43 announcements — fire-and-forget.
+        if let Err(e) =
+            crate::handlers::side_effects::publish_nip43_member_removed(state, &sender_hex).await
+        {
+            warn!(error = %e, "failed to publish NIP-43 member removed event");
+        }
+        if let Err(e) = crate::handlers::side_effects::publish_nip43_membership_list(state).await {
+            warn!(error = %e, "failed to publish NIP-43 membership list");
+        }
+
+        info!(pubkey = %sender_hex, "relay member left via NIP-43 leave request");
+
+        return Ok(IngestResult {
+            event_id: event_id_hex,
+            accepted: true,
+            message: "info: you have left this relay".into(),
+        });
+    }
+
     // ── 9. Admin validation (kinds 9000–9022) ────────────────────────────
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
         crate::handlers::side_effects::validate_admin_event(kind_u32, &event, state)
@@ -952,11 +1129,18 @@ pub async fn ingest_event(
     }
 
     // ── 12. Single-target enforcement (kind:9005, kind:5) ────────────────
+    // NIP-09: kind:5 may reference targets via `e` tag (regular events) OR
+    // `a` tag (addressable/parameterized-replaceable events like kind:30620).
     if kind_u32 == KIND_NIP29_DELETE_EVENT || kind_u32 == KIND_DELETION {
         let e_count = count_e_tags(&event);
-        if e_count != 1 {
+        let a_count = event
+            .tags
+            .iter()
+            .filter(|t| t.kind().to_string() == "a")
+            .count();
+        if (e_count + a_count) != 1 {
             return Err(IngestError::Rejected(format!(
-                "invalid: deletion events must reference exactly one target (got {e_count})"
+                "invalid: deletion events must reference exactly one target via e or a tag (got e={e_count}, a={a_count})"
             )));
         }
     }
@@ -1364,7 +1548,7 @@ mod tests {
     use super::*;
     use sprout_core::kind::{
         KIND_CANVAS, KIND_FORUM_COMMENT, KIND_FORUM_POST, KIND_FORUM_VOTE, KIND_LONG_FORM,
-        KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF,
+        KIND_PRESENCE_UPDATE, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_DIFF, KIND_USER_STATUS,
     };
 
     #[test]
@@ -1451,6 +1635,25 @@ mod tests {
     }
 
     #[test]
+    fn user_status_requires_users_write_scope() {
+        let dummy = make_dummy_event();
+        assert_eq!(
+            required_scope_for_kind(KIND_USER_STATUS, &dummy).unwrap(),
+            Scope::UsersWrite,
+        );
+    }
+
+    #[test]
+    fn user_status_is_global_only() {
+        assert!(is_global_only_kind(KIND_USER_STATUS));
+    }
+
+    #[test]
+    fn user_status_does_not_require_h_tag() {
+        assert!(!requires_h_channel_scope(KIND_USER_STATUS));
+    }
+
+    #[test]
     fn global_only_and_channel_scoped_are_disjoint() {
         // A kind cannot be both global-only and channel-scoped
         for kind in 0..=65535u32 {
@@ -1489,6 +1692,7 @@ mod tests {
             KIND_FORUM_VOTE,
             KIND_FORUM_COMMENT,
             KIND_LONG_FORM,
+            KIND_USER_STATUS,
         ];
         for kind in migrated {
             assert!(
@@ -1522,9 +1726,7 @@ mod tests {
         let http_auth = IngestAuth::Http {
             pubkey: keys.public_key(),
             scopes: vec![],
-            auth_method: HttpAuthMethod::ApiToken,
-            token_id: None,
-            channel_ids: None,
+            auth_method: HttpAuthMethod::Nip98,
         };
         assert!(
             http_auth.is_http(),

@@ -1,0 +1,166 @@
+import * as React from "react";
+import { Loader2 } from "lucide-react";
+
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import type { ManagedAgent } from "@/shared/api/types";
+import { cn } from "@/shared/lib/cn";
+import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
+import { UserAvatar } from "@/shared/ui/UserAvatar";
+
+export type BotActivityAgent = Pick<ManagedAgent, "pubkey" | "name">;
+
+type BotActivityBarProps = {
+  agents: BotActivityAgent[];
+  onOpenAgentSession: (pubkey: string) => void;
+  openAgentSessionPubkey: string | null;
+  profiles?: UserProfileLookup;
+  typingBotPubkeys: string[];
+};
+
+const HOVER_OPEN_DELAY_MS = 150;
+const HOVER_CLOSE_DELAY_MS = 180;
+
+export function BotActivityComposerAction({
+  agents,
+  onOpenAgentSession,
+  openAgentSessionPubkey,
+  profiles,
+  typingBotPubkeys,
+}: BotActivityBarProps) {
+  const [open, setOpen] = React.useState(false);
+  const hoverTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
+    null,
+  );
+
+  const typingAgents = React.useMemo(() => {
+    const typingSet = new Set(
+      typingBotPubkeys.map((pubkey) => pubkey.toLowerCase()),
+    );
+
+    return agents.filter((agent) => typingSet.has(agent.pubkey.toLowerCase()));
+  }, [agents, typingBotPubkeys]);
+
+  const clearHoverTimer = React.useCallback(() => {
+    if (hoverTimerRef.current !== null) {
+      clearTimeout(hoverTimerRef.current);
+      hoverTimerRef.current = null;
+    }
+  }, []);
+
+  const openWithDelay = React.useCallback(() => {
+    clearHoverTimer();
+    hoverTimerRef.current = setTimeout(() => {
+      setOpen(true);
+    }, HOVER_OPEN_DELAY_MS);
+  }, [clearHoverTimer]);
+
+  const closeWithDelay = React.useCallback(() => {
+    clearHoverTimer();
+    hoverTimerRef.current = setTimeout(() => {
+      setOpen(false);
+    }, HOVER_CLOSE_DELAY_MS);
+  }, [clearHoverTimer]);
+
+  const keepOpen = React.useCallback(() => {
+    clearHoverTimer();
+  }, [clearHoverTimer]);
+
+  React.useEffect(() => {
+    return () => clearHoverTimer();
+  }, [clearHoverTimer]);
+
+  if (typingAgents.length === 0) {
+    return null;
+  }
+
+  const agentAvatarUrl = (agent: BotActivityAgent) =>
+    profiles?.[agent.pubkey.toLowerCase()]?.avatarUrl ?? null;
+  const selectedPubkey = openAgentSessionPubkey?.toLowerCase() ?? null;
+  const triggerLabel =
+    typingAgents.length === 1
+      ? `${typingAgents[0]?.name ?? "Agent"} is working`
+      : `${typingAgents.length} agents working`;
+
+  return (
+    <Popover onOpenChange={setOpen} open={open}>
+      <PopoverTrigger asChild>
+        <button
+          aria-label={`${triggerLabel}. View activity.`}
+          className="inline-flex h-9 min-w-9 items-center justify-center gap-1.5 rounded-full border border-border/60 bg-background px-2 text-xs font-medium text-muted-foreground transition-colors hover:border-primary/30 hover:bg-primary/5 hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring data-[state=open]:border-primary/40 data-[state=open]:bg-primary/10 data-[state=open]:text-primary"
+          data-testid="bot-activity-composer-trigger"
+          onBlur={closeWithDelay}
+          onClick={() => {
+            clearHoverTimer();
+            setOpen((current) => !current);
+          }}
+          onFocus={() => setOpen(true)}
+          onMouseEnter={openWithDelay}
+          onMouseLeave={closeWithDelay}
+          type="button"
+        >
+          <span className="flex -space-x-1">
+            {typingAgents.slice(0, 2).map((agent) => (
+              <UserAvatar
+                avatarUrl={agentAvatarUrl(agent)}
+                className="!h-5 !w-5 rounded-full border border-background text-[8px]"
+                displayName={agent.name}
+                key={agent.pubkey}
+              />
+            ))}
+          </span>
+          {typingAgents.length > 2 ? (
+            <span className="text-[11px] leading-none">
+              +{typingAgents.length - 2}
+            </span>
+          ) : null}
+          <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin opacity-70" />
+        </button>
+      </PopoverTrigger>
+      <PopoverContent
+        align="end"
+        className="w-64 p-2"
+        onMouseEnter={keepOpen}
+        onMouseLeave={closeWithDelay}
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        side="top"
+        sideOffset={8}
+      >
+        <div className="px-2 py-1 text-xs font-medium text-muted-foreground">
+          Agents working
+        </div>
+        <div className="mt-1 flex flex-col gap-1">
+          {typingAgents.map((agent) => {
+            const isSelected = selectedPubkey === agent.pubkey.toLowerCase();
+
+            return (
+              <button
+                className={cn(
+                  "flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm transition-colors",
+                  isSelected
+                    ? "bg-primary/10 text-primary"
+                    : "text-foreground hover:bg-accent hover:text-accent-foreground",
+                )}
+                data-testid={`bot-activity-composer-item-${agent.pubkey}`}
+                key={agent.pubkey}
+                onClick={() => {
+                  clearHoverTimer();
+                  setOpen(false);
+                  onOpenAgentSession(agent.pubkey);
+                }}
+                type="button"
+              >
+                <UserAvatar
+                  avatarUrl={agentAvatarUrl(agent)}
+                  className="!h-6 !w-6 shrink-0 rounded-full text-[9px]"
+                  displayName={agent.name}
+                />
+                <span className="min-w-0 flex-1 truncate">{agent.name}</span>
+                <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin text-muted-foreground/70" />
+              </button>
+            );
+          })}
+        </div>
+      </PopoverContent>
+    </Popover>
+  );
+}

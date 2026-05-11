@@ -1,0 +1,143 @@
+import { useEffect, useRef, useState } from "react";
+
+import { relayClient } from "@/shared/api/relayClient";
+import { applyWorkspace, getDefaultRelayUrl } from "@/shared/api/tauri";
+import { resetMediaCaches } from "@/shared/lib/mediaUrl";
+import { clearSearchHitEventCache } from "@/app/navigation/searchHitEventCache";
+import { clearAllDrafts } from "@/features/messages/lib/useDrafts";
+import { resetAgentObserverStore } from "@/features/agents/observerRelayStore";
+
+import type { Workspace } from "./types";
+
+/**
+ * Tear down all workspace-scoped module singletons so the new
+ * workspace starts with a clean slate. If you add a new module-level
+ * cache or singleton that holds workspace data, add its reset here.
+ * See AGENTS.md "Workspace Switching" for the full contract.
+ */
+function resetWorkspaceState(): void {
+  relayClient.disconnect();
+  resetAgentObserverStore();
+  resetMediaCaches();
+  clearSearchHitEventCache();
+  clearAllDrafts();
+}
+
+type WorkspaceInitResult =
+  | { isReady: true; needsSetup: false; appliedKey: string }
+  | {
+      isReady: false;
+      needsSetup: true;
+      defaultRelayUrl: string;
+    }
+  | { isReady: false; needsSetup: false; appliedKey: string | null };
+
+/**
+ * Applies the active workspace config to the Tauri backend and resets
+ * all workspace-scoped module singletons when the workspace changes.
+ *
+ * Returns a discriminated union — only render the app after the
+ * workspace is applied. When `needsSetup` is true, the caller
+ * should show a first-run welcome screen.
+ */
+export function useWorkspaceInit(
+  activeWorkspace: Workspace | null,
+  workspaceKey: string,
+): WorkspaceInitResult {
+  const [result, setResult] = useState<WorkspaceInitResult>({
+    isReady: false,
+    needsSetup: false,
+    appliedKey: null,
+  });
+
+  // Track whether this is the initial mount or a workspace switch.
+  // On the initial mount we skip resetting singletons (they're fresh).
+  const hasInitializedRef = useRef(false);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: we intentionally depend on specific properties (id/relayUrl/token) — depending on the whole object would trigger resets on name-only changes
+  useEffect(() => {
+    let cancelled = false;
+
+    async function init() {
+      if (!activeWorkspace) {
+        // No workspace — need setup
+        try {
+          const defaultRelayUrl = await getDefaultRelayUrl();
+          if (!cancelled) {
+            setResult({
+              isReady: false,
+              needsSetup: true,
+              defaultRelayUrl,
+            });
+          }
+        } catch {
+          if (!cancelled) {
+            setResult({
+              isReady: false,
+              needsSetup: true,
+              defaultRelayUrl: "ws://localhost:3000",
+            });
+          }
+        }
+        return;
+      }
+
+      // Mark this workspace config as pending while it is applied to the
+      // backend. App.tsx also checks appliedKey against the active workspaceKey,
+      // which prevents rendering workspace-scoped UI for a new workspace until
+      // that exact config has finished applying.
+      setResult({
+        isReady: false,
+        needsSetup: false,
+        appliedKey: workspaceKey,
+      });
+
+      // On workspace switch (not initial mount), reset module singletons
+      // so the new tree starts with a clean slate.
+      if (hasInitializedRef.current) {
+        resetWorkspaceState();
+      }
+      hasInitializedRef.current = true;
+
+      // Apply workspace config to the Tauri backend.
+      //
+      // Note: we deliberately do NOT pass an nsec here. The persisted
+      // `identity.key` file (resolved at startup by `resolve_persisted_identity`,
+      // and updated atomically by `import_identity`) is the single source of
+      // truth for the active key. Older builds stored the nsec in localStorage
+      // and re-applied it on every reload, which silently overwrote any
+      // imported key. `loadWorkspaces()` strips lingering `nsec` fields from
+      // legacy entries; this site refuses to apply one even if present.
+      try {
+        await applyWorkspace(
+          activeWorkspace.relayUrl,
+          undefined,
+          activeWorkspace.token,
+        );
+      } catch (error) {
+        console.error("Failed to apply workspace to backend:", error);
+      }
+
+      if (!cancelled) {
+        setResult({
+          isReady: true,
+          needsSetup: false,
+          appliedKey: workspaceKey,
+        });
+      }
+    }
+
+    void init();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    activeWorkspace?.id,
+    activeWorkspace?.relayUrl,
+    activeWorkspace?.token,
+    workspaceKey,
+  ]);
+
+  return result;
+}

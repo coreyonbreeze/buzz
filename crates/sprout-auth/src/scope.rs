@@ -1,6 +1,8 @@
-//! API token scopes.
+//! Authorization scopes.
 //!
-//! Stored as `TEXT[]` in the database so new scopes don't require migrations.
+//! Scopes control what operations an authenticated connection may perform.
+//! In pure Nostr mode, all NIP-42 authenticated connections receive the full
+//! scope set; per-channel access is enforced by NIP-29 membership checks.
 
 use std::fmt;
 use std::str::FromStr;
@@ -40,6 +42,18 @@ pub enum Scope {
     FilesRead,
     /// Upload files and attachments.
     FilesWrite,
+    /// Clone git repositories.
+    ///
+    /// Reserved for future use. Not currently enforced by git HTTP routes —
+    /// those use NIP-98 auth directly. Will be enforced when collaborator
+    /// access (read-only, maintainer) is added in v2.
+    ReposRead,
+    /// Push to git repositories and create repos (kind:30617).
+    ///
+    /// Enforced for kind:30617/30618 events via WebSocket ingest, but NOT
+    /// enforced by git HTTP push routes (which use NIP-98 + owner check).
+    /// Full enforcement deferred to v2 collaborator model.
+    ReposWrite,
     /// Submit events on behalf of other pubkeys (proxy service accounts only).
     ProxySubmit,
     /// A scope string not recognised by this version of the relay.
@@ -69,6 +83,8 @@ impl Scope {
             Self::SubscriptionsWrite,
             Self::FilesRead,
             Self::FilesWrite,
+            Self::ReposRead,
+            Self::ReposWrite,
         ]
     }
 
@@ -91,6 +107,8 @@ impl Scope {
             Self::SubscriptionsWrite,
             Self::FilesRead,
             Self::FilesWrite,
+            Self::ReposRead,
+            Self::ReposWrite,
         ]
     }
 
@@ -111,6 +129,8 @@ impl Scope {
             Self::SubscriptionsWrite => "subscriptions:write",
             Self::FilesRead => "files:read",
             Self::FilesWrite => "files:write",
+            Self::ReposRead => "repos:read",
+            Self::ReposWrite => "repos:write",
             Self::ProxySubmit => "proxy:submit",
             Self::Unknown(s) => s.as_str(),
         }
@@ -142,49 +162,12 @@ impl FromStr for Scope {
             "subscriptions:write" => Self::SubscriptionsWrite,
             "files:read" => Self::FilesRead,
             "files:write" => Self::FilesWrite,
+            "repos:read" => Self::ReposRead,
+            "repos:write" => Self::ReposWrite,
             "proxy:submit" => Self::ProxySubmit,
             other => Self::Unknown(other.to_string()),
         })
     }
-}
-
-/// Scopes that can be self-minted via `POST /api/tokens`.
-///
-/// Admin-only scopes (`AdminChannels`, `AdminUsers`, `JobsRead`, `JobsWrite`,
-/// `SubscriptionsRead`, `SubscriptionsWrite`) are intentionally excluded — they require
-/// `sprout-admin mint-token`.
-///
-/// `UsersWrite` is included because it guards self-profile endpoints
-/// (`PUT /api/users/me/profile`, `PUT /api/users/me/channel-add-policy`)
-/// and contact list (kind:3) publishing.
-pub const SELF_MINTABLE_SCOPES: &[Scope] = &[
-    Scope::MessagesRead,
-    Scope::MessagesWrite,
-    Scope::ChannelsRead,
-    Scope::ChannelsWrite,
-    Scope::UsersRead,
-    Scope::UsersWrite,
-    Scope::FilesRead,
-    Scope::FilesWrite,
-];
-
-/// Returns `true` if the given scope may be requested via `POST /api/tokens`.
-///
-/// Admin-only scopes and `Scope::Unknown` always return `false`.
-/// Unknown scope strings are rejected at mint time rather than silently accepted —
-/// a client sending an unrecognised scope string likely has a bug.
-pub fn is_self_mintable(scope: &Scope) -> bool {
-    matches!(
-        scope,
-        Scope::MessagesRead
-            | Scope::MessagesWrite
-            | Scope::ChannelsRead
-            | Scope::ChannelsWrite
-            | Scope::UsersRead
-            | Scope::UsersWrite
-            | Scope::FilesRead
-            | Scope::FilesWrite
-    )
 }
 
 /// Parse a slice of scope strings into `Vec<Scope>`.
@@ -226,12 +209,12 @@ mod tests {
     #[test]
     fn all_non_admin_excludes_admin_scopes() {
         let scopes = Scope::all_non_admin();
-        assert_eq!(scopes.len(), 12, "expected 12 non-admin scope variants");
+        assert_eq!(scopes.len(), 14, "expected 14 non-admin scope variants");
         // Verify no duplicates
         let unique: std::collections::HashSet<_> = scopes.iter().map(|s| s.as_str()).collect();
         assert_eq!(
             unique.len(),
-            12,
+            14,
             "all_non_admin() must not contain duplicates"
         );
         // Verify no Unknown variants
@@ -255,10 +238,10 @@ mod tests {
     #[test]
     fn all_known_returns_all_14_variants() {
         let all = Scope::all_known();
-        assert_eq!(all.len(), 14, "expected 14 known scope variants");
+        assert_eq!(all.len(), 16, "expected 16 known scope variants");
         // Verify no duplicates
         let unique: std::collections::HashSet<_> = all.iter().map(|s| s.as_str()).collect();
-        assert_eq!(unique.len(), 14, "all_known() must not contain duplicates");
+        assert_eq!(unique.len(), 16, "all_known() must not contain duplicates");
         // Verify no Unknown variants
         for scope in &all {
             assert!(

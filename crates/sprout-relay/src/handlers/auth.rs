@@ -1,25 +1,45 @@
 //! NIP-42 AUTH handler — verify challenge response, transition auth state.
+//!
+//! Relay membership enforcement uses the shared
+//! [`crate::api::relay_members::enforce_relay_membership`] helper, which supports
+//! NIP-OA owner-delegation fallback on closed relays. On open relays, the auth
+//! handler calls [`crate::api::relay_members::extract_nip_oa_owner`] directly to
+//! extract the owner pubkey for agent→owner backfill (observer frame auth).
+//!
+//! For WebSocket auth, the NIP-OA `auth` tag is extracted from the signed AUTH
+//! event itself (the tag is integrity-protected by the event signature).
 
 use std::sync::Arc;
 
-use sha2::{Digest, Sha256};
 use tracing::{debug, info, warn};
 
 use crate::connection::{AuthState, ConnectionState};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
-fn verify_api_token_nip42_binding(
-    event: &nostr::Event,
-    challenge: &str,
-    relay_url: &str,
-) -> Result<(), sprout_auth::AuthError> {
-    sprout_auth::verify_nip42_event(event, challenge, relay_url)
+/// Extract a NIP-OA `auth` tag from a verified AUTH event and serialize it as
+/// the JSON-array string that [`sprout_sdk::nip_oa::verify_auth_tag`] expects.
+///
+/// Returns `None` if no `auth` tag is present (direct-member auth path) or if
+/// more than one `auth` tag exists (per NIP-OA spec: >1 auth tag ⇒ no valid tag).
+pub fn extract_auth_tag_json(event: &nostr::Event) -> Option<String> {
+    let mut iter = event
+        .tags
+        .iter()
+        .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"));
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        return None; // NIP-OA spec: treat >1 auth tag as no valid auth tag
+    }
+    serde_json::to_string(first.as_slice()).ok()
 }
 
-/// Handle a NIP-42 AUTH message: verify the challenge response and transition the connection to authenticated state.
+/// Handle a NIP-42 AUTH message: verify the challenge response and transition
+/// the connection to authenticated state.
+///
+/// Pure crypto verification — no API tokens, no JWT, no DB token lookups.
 pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state: Arc<AppState>) {
-    let event_id_hex_early = event.id.to_hex();
+    let event_id_hex = event.id.to_hex();
     let (challenge, conn_id) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
@@ -27,7 +47,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             AuthState::Authenticated(_) => {
                 debug!(conn_id = %conn.conn_id, "AUTH received but already authenticated");
                 conn.send(RelayMessage::ok(
-                    &event_id_hex_early,
+                    &event_id_hex,
                     false,
                     "auth-required: already authenticated",
                 ));
@@ -36,7 +56,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             AuthState::Failed => {
                 debug!(conn_id = %conn.conn_id, "AUTH received after failed auth");
                 conn.send(RelayMessage::ok(
-                    &event_id_hex_early,
+                    &event_id_hex,
                     false,
                     "auth-required: authentication already failed",
                 ));
@@ -45,164 +65,27 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
         }
     };
 
+    // Extract the NIP-OA auth tag before verification consumes the event.
+    // The tag is integrity-protected by the event's Schnorr signature — if
+    // tampered, NIP-42 verification will fail before we ever inspect it.
+    let auth_tag_json = extract_auth_tag_json(&event);
+
     let relay_url = state.config.relay_url.clone();
     let auth_svc = Arc::clone(&state.auth);
-    let event_id_hex = event.id.to_hex();
 
-    // Extract the auth_token tag before dispatching — API tokens (sprout_*) must be
-    // intercepted here because verify_auth_event() has no DB access and rejects them.
-    let auth_token = event.tags.iter().find_map(|tag| {
-        let vec = tag.as_slice();
-        if vec.len() >= 2 && vec[0] == "auth_token" {
-            Some(vec[1].to_string())
-        } else {
-            None
-        }
-    });
+    metrics::counter!("sprout_auth_attempts_total", "method" => "nip42").increment(1);
 
-    metrics::counter!("sprout_auth_attempts_total", "method" => if auth_token.as_ref().is_some_and(|t| t.starts_with("sprout_")) { "api_token" } else { "nip42" }).increment(1);
-
-    if let Some(ref token) = auth_token {
-        if token.starts_with("sprout_") {
-            // ── API token path ──────────────────────────────────────────────
-            let event_clone = event.clone();
-            let challenge_owned = challenge.clone();
-            let relay_owned = relay_url.clone();
-            match tokio::task::spawn_blocking(move || {
-                verify_api_token_nip42_binding(&event_clone, &challenge_owned, &relay_owned)
-            })
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(conn_id = %conn_id, error = %e, "API token auth failed NIP-42 verification");
-                    metrics::counter!("sprout_auth_failures_total", "reason" => "nip42_invalid")
-                        .increment(1);
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: verification failed",
-                    ));
-                    return;
-                }
-                Err(e) => {
-                    warn!(conn_id = %conn_id, error = %e, "API token NIP-42 verification task failed");
-                    metrics::counter!("sprout_auth_failures_total", "reason" => "nip42_internal")
-                        .increment(1);
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: verification failed",
-                    ));
-                    return;
-                }
-            }
-
-            // Hash the raw token and look it up in the DB. The relay owns this
-            // path; sprout-auth has no DB access.
-            let hash: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-
-            let record = match state.db.get_api_token_by_hash(&hash).await {
-                Ok(Some(r)) => r,
-                Ok(None) => {
-                    warn!(conn_id = %conn_id, "API token not found");
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: invalid token",
-                    ));
-                    return;
-                }
-                Err(e) => {
-                    warn!(conn_id = %conn_id, error = %e, "API token lookup failed");
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: verification failed",
-                    ));
-                    return;
-                }
-            };
-
-            // Reconstruct the owner pubkey from the stored raw bytes.
-            let owner_pubkey = match nostr::PublicKey::from_slice(&record.owner_pubkey) {
-                Ok(pk) => pk,
-                Err(e) => {
-                    warn!(conn_id = %conn_id, error = %e, "API token owner pubkey invalid");
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: verification failed",
-                    ));
-                    return;
-                }
-            };
-
-            // Verify hash, expiry, and pubkey match via the auth service.
-            match auth_svc.verify_api_token_against_hash(
-                token,
-                &record.token_hash,
-                &owner_pubkey,
-                &event.pubkey,
-                record.expires_at,
-                &record.scopes,
-            ) {
-                Ok((pubkey, scopes)) => {
-                    info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "API token auth successful");
-                    // Update last_used_at asynchronously — non-fatal if it fails.
-                    let db = state.db.clone();
-                    let hash_owned = hash;
-                    tokio::spawn(async move {
-                        if let Err(e) = db.update_token_last_used(&hash_owned).await {
-                            warn!("update_token_last_used failed: {e}");
-                        }
-                    });
-                    let auth_ctx = sprout_auth::AuthContext {
-                        pubkey,
-                        scopes,
-                        channel_ids: record.channel_ids,
-                        auth_method: sprout_auth::AuthMethod::Nip42ApiToken,
-                    };
-                    // API token users have already proven authorization via their token —
-                    // the pubkey allowlist does not apply here.
-                    *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
-                    state
-                        .conn_manager
-                        .set_authenticated_pubkey(conn_id, pubkey.serialize().to_vec());
-                    conn.send(RelayMessage::ok(&event_id_hex, true, ""));
-                }
-                Err(e) => {
-                    warn!(conn_id = %conn_id, error = %e, "API token verification failed");
-                    metrics::counter!("sprout_auth_failures_total", "reason" => "api_token_invalid").increment(1);
-                    *conn.auth_state.write().await = AuthState::Failed;
-                    conn.send(RelayMessage::ok(
-                        &event_id_hex,
-                        false,
-                        "auth-required: verification failed",
-                    ));
-                }
-            }
-            return;
-        }
-    }
-
-    // ── Okta JWT / pubkey-only path ─────────────────────────────────────────
-    // Non-sprout_ tokens (eyJ* JWTs) and no-token (open-relay) fall through here.
+    // Pure NIP-42 verification — crypto only, no DB lookups.
     match auth_svc
         .verify_auth_event(event, &challenge, &relay_url)
         .await
     {
-        Ok(auth_ctx) => {
+        Ok(mut auth_ctx) => {
             let pubkey = auth_ctx.pubkey;
-            // Pubkey allowlist gate — only for pubkey-only auth (no JWT/token).
-            // Users with valid API tokens or Okta JWTs bypass the allowlist.
+
+            // Pubkey allowlist gate — only for pubkey-only auth.
             if state.config.pubkey_allowlist_enabled
-                && auth_ctx.auth_method == sprout_auth::AuthMethod::Nip42PubkeyOnly
+                && auth_ctx.auth_method == sprout_auth::AuthMethod::Nip42
             {
                 let allowed = match state.db.is_pubkey_allowed(&pubkey.serialize()).await {
                     Ok(v) => v,
@@ -225,6 +108,112 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                     return;
                 }
             }
+
+            // Relay membership gate — uses the shared helper with NIP-OA fallback.
+            let nip_oa_owner = match crate::api::relay_members::enforce_relay_membership(
+                &state,
+                &pubkey.serialize(),
+                auth_tag_json.as_deref(),
+            )
+            .await
+            {
+                Ok(owner) => owner,
+                Err(_) => {
+                    warn!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "not a relay member");
+                    metrics::counter!("sprout_auth_failures_total", "reason" => "not_relay_member")
+                        .increment(1);
+                    *conn.auth_state.write().await = AuthState::Failed;
+                    conn.send(RelayMessage::ok(
+                        &event_id_hex,
+                        false,
+                        "restricted: not a relay member",
+                    ));
+                    return;
+                }
+            };
+
+            // Open relay NIP-OA backfill: extract owner for agent→owner DB mapping
+            // (needed for observer frame auth). Only runs on open relays — on closed
+            // relays, enforce_relay_membership already handles NIP-OA delegation.
+            // No feature flag needed: NIP-OA is cryptographically self-proving.
+            let nip_oa_owner = nip_oa_owner.or_else(|| {
+                if !state.config.require_relay_membership && auth_tag_json.is_some() {
+                    crate::api::relay_members::extract_nip_oa_owner(
+                        &pubkey.serialize(),
+                        auth_tag_json.as_deref(),
+                    )
+                } else {
+                    None
+                }
+            });
+
+            // Stash NIP-OA owner on the auth context (session-scoped) only if
+            // the DB confirms this owner relationship (first-write-wins).
+            if let Some(owner) = nip_oa_owner {
+                // Ensure both agent and owner have users rows (BYO agents may not,
+                // and agent_owner_pubkey has a FK constraint to users.pubkey).
+                if let Err(e) = state.db.ensure_user(&pubkey.serialize()).await {
+                    warn!(conn_id = %conn_id, error = %e, "ensure_user(agent) failed during NIP-OA backfill");
+                }
+                if let Err(e) = state.db.ensure_user(&owner.serialize()).await {
+                    warn!(conn_id = %conn_id, error = %e, "ensure_user(owner) failed during NIP-OA backfill");
+                }
+
+                // Idempotent backfill: record agent→owner in DB so cross-connection
+                // features (observer frames, channel policy) work for BYO agents.
+                // Returns Ok(true) if written, Ok(false) if already owned by someone else.
+                match state
+                    .db
+                    .set_agent_owner(&pubkey.serialize(), &owner.serialize())
+                    .await
+                {
+                    Ok(true) => {
+                        // Successfully materialized — this owner is authoritative.
+                        auth_ctx.agent_owner_pubkey = Some(owner);
+                        // Pre-warm the observer cache to avoid stale negatives.
+                        let cache_key = (pubkey.serialize().to_vec(), owner.serialize().to_vec());
+                        state.observer_owner_cache.insert(cache_key, true);
+                    }
+                    Ok(false) => {
+                        // Agent already owned by someone else. Verify if this
+                        // owner matches the existing DB record before trusting it.
+                        match state
+                            .db
+                            .is_agent_owner(&pubkey.serialize(), &owner.serialize())
+                            .await
+                        {
+                            Ok(true) => {
+                                auth_ctx.agent_owner_pubkey = Some(owner);
+                            }
+                            Ok(false) => {
+                                warn!(
+                                    conn_id = %conn_id,
+                                    agent = %pubkey.to_hex(),
+                                    nip_oa_owner = %owner.to_hex(),
+                                    "NIP-OA owner differs from DB owner — session will not get owner fast-path"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    conn_id = %conn_id,
+                                    error = %e,
+                                    "is_agent_owner check failed after set_agent_owner conflict"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            conn_id = %conn_id,
+                            agent = %pubkey.to_hex(),
+                            owner = %owner.to_hex(),
+                            error = %e,
+                            "failed to backfill agent_owner_pubkey"
+                        );
+                    }
+                }
+            }
+
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");
             *conn.auth_state.write().await = AuthState::Authenticated(auth_ctx);
             state
@@ -243,52 +232,5 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 "auth-required: verification failed",
             ));
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use nostr::{Event, EventBuilder, Keys, Tag, Url};
-    use sprout_auth::AuthError;
-
-    use super::*;
-
-    const TEST_RELAY: &str = "wss://relay.example.com";
-
-    fn make_api_token_auth_event(
-        keys: &Keys,
-        challenge: &str,
-        relay_url: &str,
-        token: &str,
-    ) -> Event {
-        let url: Url = relay_url.parse().expect("valid relay url");
-        let auth_token = Tag::parse(&["auth_token", token]).expect("valid auth_token tag");
-        EventBuilder::auth(challenge, url)
-            .add_tags(vec![auth_token])
-            .sign_with_keys(keys)
-            .expect("signing failed")
-    }
-
-    #[test]
-    fn api_token_auth_still_requires_a_valid_nip42_challenge() {
-        let keys = Keys::generate();
-        let challenge = sprout_auth::generate_challenge();
-        let event =
-            make_api_token_auth_event(&keys, &challenge, TEST_RELAY, "sprout_test_api_token");
-
-        assert!(matches!(
-            verify_api_token_nip42_binding(&event, "wrong-challenge", TEST_RELAY),
-            Err(AuthError::ChallengeMismatch)
-        ));
-    }
-
-    #[test]
-    fn api_token_auth_accepts_a_valid_nip42_proof() {
-        let keys = Keys::generate();
-        let challenge = sprout_auth::generate_challenge();
-        let event =
-            make_api_token_auth_event(&keys, &challenge, TEST_RELAY, "sprout_test_api_token");
-
-        assert!(verify_api_token_nip42_binding(&event, &challenge, TEST_RELAY).is_ok());
     }
 }

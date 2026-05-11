@@ -4,6 +4,7 @@ set dotenv-load := true
 
 desktop_dir := "desktop"
 desktop_tauri_manifest := "desktop/src-tauri/Cargo.toml"
+web_dir := "web"
 
 # List all available tasks
 default:
@@ -43,7 +44,7 @@ build-release:
     cargo build --workspace --release
 
 # Run repo lint and formatting checks
-check: fmt-check clippy desktop-check desktop-tauri-fmt-check mobile-check
+check: fmt-check clippy desktop-check desktop-tauri-fmt-check web-check mobile-check
 
 # Format all Rust code
 fmt:
@@ -57,13 +58,13 @@ fmt-check:
 clippy:
     cargo clippy --workspace --all-targets -- -D warnings
 
-# Install desktop JS dependencies
+# Install JS dependencies (pnpm workspace — installs all packages from root)
 desktop-install:
-    cd {{desktop_dir}} && pnpm install
+    pnpm install
 
-# Install desktop JS dependencies reproducibly for CI
+# Install JS dependencies reproducibly for CI (pnpm workspace)
 desktop-install-ci:
-    cd {{desktop_dir}} && pnpm install --frozen-lockfile
+    pnpm install --frozen-lockfile
 
 # Run desktop lint and format checks
 desktop-check:
@@ -91,7 +92,7 @@ _ensure-sidecar-stubs:
     set -euo pipefail
     TARGET=$(rustc -vV | sed -n 's|host: ||p')
     mkdir -p desktop/src-tauri/binaries
-    for bin in sprout-acp sprout-mcp-server; do
+    for bin in sprout-acp sprout-mcp-server git-credential-nostr; do
         touch "desktop/src-tauri/binaries/${bin}-${TARGET}"
     done
 
@@ -107,7 +108,9 @@ desktop-release-build target="aarch64-apple-darwin":
     mkdir -p desktop/src-tauri/binaries
     touch "desktop/src-tauri/binaries/sprout-acp-$TARGET"
     touch "desktop/src-tauri/binaries/sprout-mcp-server-$TARGET"
-    cd {{desktop_dir}} && pnpm install && pnpm tauri build --target {{target}}
+    touch "desktop/src-tauri/binaries/git-credential-nostr-$TARGET"
+    pnpm install
+    cd {{desktop_dir}} && pnpm tauri build --target {{target}}
 
 # Run desktop checks suitable for CI / pre-push
 desktop-ci: desktop-check desktop-tauri-fmt-check desktop-build desktop-tauri-check
@@ -125,7 +128,7 @@ desktop-e2e-integration:
     cd {{desktop_dir}} && pnpm test:e2e:integration
 
 # Run all checks suitable for CI / pre-push (no infra needed)
-ci: check test-unit desktop-build desktop-tauri-check mobile-test
+ci: check test-unit desktop-build desktop-tauri-check web-build mobile-test
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
 
@@ -146,6 +149,14 @@ test-integration:
 # Start the relay server
 relay:
     cargo run -p sprout-relay
+
+# Start the relay with the built web UI served from it
+relay-web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ -d node_modules ]] || pnpm install
+    pnpm -C web build
+    SPROUT_WEB_DIR=./web/dist cargo run -p sprout-relay
 
 # Start the relay server in release mode
 relay-release:
@@ -173,9 +184,7 @@ dev *ARGS: _ensure-sidecar-stubs
 staging *ARGS: _ensure-sidecar-stubs
     #!/usr/bin/env bash
     set -euo pipefail
-    cd {{desktop_dir}}
     pnpm install
-    cd ..
     cargo build --release -p sprout-acp -p sprout-mcp
     cd {{desktop_dir}}
     source ../scripts/instance-env.sh
@@ -196,6 +205,44 @@ desktop-dev:
 # Run the desktop Tauri app (alias for dev)
 desktop-app *ARGS:
     just dev {{ARGS}}
+
+# ─── Web ─────────────────────────────────────────────────────────────────────
+
+# Run the web frontend dev server (port derived from worktree to avoid collisions)
+web:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ -d node_modules ]] || pnpm install
+    source scripts/instance-env.sh
+    export VITE_PORT=$((SPROUT_VITE_PORT + 100))
+    export VITE_RELAY_URL="${SPROUT_RELAY_URL}"
+    echo "Starting web dev server on port ${VITE_PORT}, relay ${SPROUT_RELAY_URL}"
+    cd {{web_dir}}
+    pnpm exec vite --port "${VITE_PORT}" --strictPort
+
+# Install web JS dependencies (pnpm workspace — installs all packages from root)
+web-install:
+    pnpm install
+
+# Install web JS dependencies reproducibly for CI (pnpm workspace)
+web-install-ci:
+    pnpm install --frozen-lockfile
+
+# Run web lint and format checks
+web-check:
+    cd {{web_dir}} && pnpm check
+
+# Run web TypeScript checks
+web-typecheck:
+    cd {{web_dir}} && pnpm typecheck
+
+# Build web frontend assets
+web-build:
+    cd {{web_dir}} && pnpm build
+
+# Run web browser smoke tests
+web-e2e-smoke:
+    cd {{web_dir}} && pnpm test:e2e:smoke
 
 # ─── Mobile ──────────────────────────────────────────────────────────────────
 
@@ -233,7 +280,7 @@ check-compile:
 # ─── Agent Harness ────────────────────────────────────────────────────────────
 
 # Run a goose agent connected to a Sprout relay (foreground)
-goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROUT_PRIVATE_KEY" token="$SPROUT_ACP_API_TOKEN":
+goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROUT_PRIVATE_KEY":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p sprout-acp -p sprout-mcp
@@ -246,7 +293,6 @@ goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROU
         SPROUT_ACP_AGENTS="{{agents}}"
         GOOSE_MODE=auto
     )
-    [[ -n "{{token}}"  ]] && env_args+=(SPROUT_ACP_API_TOKEN="{{token}}")
     [[ -n "{{prompt}}" ]] && env_args+=(SPROUT_ACP_SYSTEM_PROMPT="{{prompt}}")
     if [[ "{{heartbeat}}" != "0" ]]; then
         env_args+=(SPROUT_ACP_HEARTBEAT_INTERVAL={{heartbeat}})
@@ -254,7 +300,7 @@ goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROU
     exec env "${env_args[@]}" ./target/release/sprout-acp
 
 # Run a goose agent in the background (screen session named 'goose-agent-N')
-goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROUT_PRIVATE_KEY" token="$SPROUT_ACP_API_TOKEN":
+goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROUT_PRIVATE_KEY":
     #!/usr/bin/env bash
     set -euo pipefail
     cargo build --release -p sprout-acp -p sprout-mcp
@@ -267,7 +313,6 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SP
         SPROUT_ACP_AGENTS="{{agents}}"
         GOOSE_MODE=auto
     )
-    [[ -n "{{token}}"  ]] && env_args+=(SPROUT_ACP_API_TOKEN="{{token}}")
     [[ -n "{{prompt}}" ]] && env_args+=(SPROUT_ACP_SYSTEM_PROMPT="{{prompt}}")
     if [[ "{{heartbeat}}" != "0" ]]; then
         env_args+=(SPROUT_ACP_HEARTBEAT_INTERVAL={{heartbeat}})

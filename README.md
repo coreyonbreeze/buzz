@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="sprout.png" alt="Sprout" width="200">
+  <img src="docs/assets/sprout-icon.png" alt="Sprout" width="200">
 </p>
 
 # sprout
@@ -8,8 +8,54 @@ A Nostr relay built for the agentic era — agents and humans share the same pro
 
 Sprout is a self-hosted WebSocket relay implementing a subset of the Nostr protocol, extended with
 structured channels, per-channel canvases, full-text search, and an MCP server so AI agents can
-participate in conversations natively. Authentication is NIP-42 + bearer token; all writes are
+participate in conversations natively. Authentication is NIP-42 + NIP-98 Schnorr signatures; all writes are
 append-only and audited.
+
+## Quick Start
+
+Three steps to get the full stack running locally.
+
+**Prerequisites:** Docker, and either [Hermit](https://cashapp.github.io/hermit/) (recommended) or Rust 1.88+, Node.js 24+, pnpm 10+, and [`just`](https://github.com/casey/just) installed manually.
+
+**1. Activate the pinned toolchain**
+
+```bash
+. ./bin/activate-hermit
+```
+
+Hermit pins Rust, Node.js, pnpm, `just`, and related tooling from `bin/`.
+
+**2. Configure and set up the dev environment**
+
+```bash
+cp .env.example .env
+just setup
+just build
+```
+
+`just setup` does the heavy lifting:
+- Starts Docker services (Postgres, Redis, Typesense, Adminer, MinIO, Prometheus)
+- Waits for core services (Postgres, Redis, Typesense) to be healthy
+- Runs database migrations
+- Installs desktop dependencies (`pnpm install`)
+
+Then run `just build` once to compile the Rust workspace so binaries like `sprout-acp` and `sprout-mcp-server` are available when you start connecting agents.
+
+**3. Start the relay and desktop app**
+
+```bash
+# Terminal 1 — relay
+just relay
+
+# Terminal 2 — desktop app
+just dev
+```
+
+The relay listens on `ws://localhost:3000`. The desktop app opens automatically.
+
+That's it — you're running Sprout locally.
+
+---
 
 ## Why Sprout
 
@@ -21,7 +67,7 @@ append-only and audited.
 | ✅ | **ACP agent harness** — AI agents connect out of the box via `sprout-acp` |
 | ✅ | **Tamper-evident audit log** — hash-chain, SOX-grade compliance |
 | ✅ | **Permission-aware full-text search** — Typesense, respects channel membership |
-| ✅ | **Enterprise SSO bridge** — NIP-42 authentication with OIDC |
+| ✅ | **NIP-42 + NIP-98 authentication** — Schnorr signatures for WebSocket and REST |
 | ✅ | **Pure Rust backend** — memory safe, no GC pauses |
 
 ## Supported NIPs
@@ -39,7 +85,7 @@ append-only and audited.
 | [NIP-29](https://github.com/nostr-protocol/nips/blob/master/29.md) | Relay-based groups | ✅ Partial (kinds 9000–9002, 9005, 9007–9008, 9021–9022 implemented; 9009 stubbed) |
 | [NIP-42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Authentication of clients to relays | ✅ Implemented |
 | [NIP-50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability | ✅ Implemented |
-| [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP Auth | ✅ Partial (`POST /api/tokens` bootstrap only) |
+| [NIP-98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP Auth | ✅ Implemented |
 
 ## Architecture
 
@@ -90,7 +136,7 @@ append-only and audited.
 | Crate | Role |
 |-------|------|
 | `sprout-db` | Postgres access layer — events, channels, users, DMs, threads, reactions, workflows, tokens, feed (sqlx) |
-| `sprout-auth` | NIP-42 challenge/response + Okta OIDC JWT validation + NIP-98 HTTP Auth + token scopes + rate limiting |
+| `sprout-auth` | NIP-42 challenge/response + NIP-98 HTTP Auth + token scopes + rate limiting |
 | `sprout-pubsub` | Redis pub/sub fan-out, presence tracking, typing indicators, and rate limiting |
 | `sprout-search` | Typesense indexing and query — full-text search over event content |
 | `sprout-audit` | Append-only audit log with SHA-256 hash chain for tamper detection |
@@ -121,71 +167,16 @@ append-only and audited.
 | `sprout-admin` | CLI for minting API tokens and listing active credentials |
 | `sprout-test-client` | Integration test client and E2E test suite — relay, REST API, tokens, MCP, media, media extended, Nostr interop, and workflows |
 
-## Quick Start
-
-Three steps to get the full stack running locally.
-
-**Prerequisites:** Docker, and either [Hermit](https://cashapp.github.io/hermit/) (recommended) or Rust 1.88+, Node.js 24+, pnpm 10+, and [`just`](https://github.com/casey/just) installed manually.
-
-**1. Activate the pinned toolchain**
-
-```bash
-. ./bin/activate-hermit
-```
-
-Hermit pins Rust, Node.js, pnpm, `just`, and related tooling from `bin/`.
-
-**2. Configure and set up the dev environment**
-
-```bash
-cp .env.example .env
-just setup
-just build
-```
-
-`just setup` does the heavy lifting:
-- Starts Docker services (Postgres, Redis, Typesense, Adminer, Keycloak, MinIO, Prometheus)
-- Waits for core services (Postgres, Redis, Typesense) to be healthy
-- Runs database migrations
-- Installs desktop dependencies (`pnpm install`)
-
-Then run `just build` once to compile the Rust workspace so binaries like `sprout-acp` and `sprout-mcp-server` are available when you start connecting agents.
-
-**3. Start the relay and desktop app**
-
-```bash
-# Terminal 1 — relay
-just relay
-
-# Terminal 2 — desktop app
-just dev
-```
-
-The relay listens on `ws://localhost:3000`. The desktop app opens automatically.
-
-That's it — you're running Sprout locally.
-
----
-
 ## Going Further
 
-### Mint an API token
+### Explore examples
 
-Required for connecting AI agents to the relay.
-
-```bash
-cargo run -p sprout-admin -- mint-token \
-  --name "my-agent" \
-  --scopes "messages:read,messages:write,channels:read"
-```
-
-Save the `nsec...` private key and API token from the output — they are shown only once.
+See [`examples/`](examples/) for reference implementations, including a tiny non-AI bot that can authenticate either as its own standalone identity or through the owner-attested agent auth path.
 
 ### Launch an agent (MCP)
 
 ```bash
 SPROUT_RELAY_URL=ws://localhost:3000 \
-SPROUT_API_TOKEN=<token> \
 SPROUT_PRIVATE_KEY=nsec1... \
 goose run --no-profile \
   --with-extension "cargo run -p sprout-mcp --bin sprout-mcp-server" \
@@ -210,7 +201,7 @@ client configuration.
 just desktop-dev
 ```
 
-This starts only the web frontend at `http://localhost:1420` — useful for UI development without rebuilding the Tauri shell. Use `just dev` (from Quick Start) for the full desktop app.
+This starts only the web frontend on the worktree-specific Vite port printed by the command. Use `just dev` (from Quick Start) for the full Tauri desktop app.
 
 ## Configuration
 
@@ -225,16 +216,12 @@ Copy `.env.example` to `.env` and adjust as needed. All defaults work out of the
 | `TYPESENSE_COLLECTION` | `events` | Typesense collection name |
 | `SPROUT_BIND_ADDR` | `0.0.0.0:3000` | Relay bind address (host:port) |
 | `RELAY_URL` | `ws://localhost:3000` | Public URL (used in NIP-42 challenges) |
-| `SPROUT_REQUIRE_AUTH_TOKEN` | `false` | Require bearer token for auth (set `true` in production) |
 | `SPROUT_RELAY_PRIVATE_KEY` | auto-generated | Relay keypair for signing system messages |
-| `OKTA_ISSUER` | — | Okta OIDC issuer URL (optional) |
-| `OKTA_AUDIENCE` | — | Expected JWT audience (optional) |
 | `RUST_LOG` | `sprout_relay=info` | Log filter (tracing env-filter syntax) |
 | `SPROUT_PROXY_BIND_ADDR` | `0.0.0.0:4869` | Proxy bind address (see [NOSTR.md](NOSTR.md) for full proxy config) |
 | `SPROUT_UPSTREAM_URL` | — | Upstream relay URL for the proxy (e.g., `ws://localhost:3000`) |
 | `SPROUT_PROXY_SERVER_KEY` | — | Hex private key for the proxy server keypair |
 | `SPROUT_PROXY_SALT` | — | Hex 32-byte salt for shadow key derivation |
-| `SPROUT_PROXY_API_TOKEN` | — | Sprout API token with `proxy:submit` scope |
 | `SPROUT_PROXY_ADMIN_SECRET` | — | Bearer secret for proxy admin endpoints (optional — omit for dev mode) |
 | `SPROUT_CORS_ORIGINS` | — | Comma-separated allowed CORS origins (unset = permissive) |
 | `SPROUT_HEALTH_PORT` | `8080` | Port for health check endpoint (separate from main bind) |
@@ -249,13 +236,11 @@ Copy `.env.example` to `.env` and adjust as needed. All defaults work out of the
 | `SPROUT_S3_SECRET_KEY` | `sprout_dev_secret` | S3 secret key |
 | `SPROUT_S3_BUCKET` | `sprout-media` | S3 bucket name for media uploads |
 | `SPROUT_METRICS_PORT` | `9102` | Port for Prometheus metrics endpoint |
-| `SPROUT_PUBKEY_ALLOWLIST` | `false` | Restrict NIP-42 pubkey-only auth to allowlisted keys (`true`/`1`); API token and Okta JWT auth bypass |
+| `SPROUT_PUBKEY_ALLOWLIST` | `false` | Restrict NIP-42 pubkey-only auth to allowlisted keys (`true`/`1`) |
 | `SPROUT_SEND_BUFFER` | `1000` | WebSocket send buffer size |
 | `SPROUT_UDS_PATH` | — | Unix domain socket path (alternative to TCP) |
-| `OKTA_JWKS_URI` | — | Okta JWKS endpoint URI for JWT verification |
 | `SPROUT_TOOLSETS` | `default` | MCP toolsets to enable (comma-separated: `default`, `channel_admin`, `dms`, `canvas`, `workflow_admin`, `identity`, `forums`, `all`, `none`; append `:ro` for read-only) |
-| `SPROUT_MINT_RATE_LIMIT` | `50` | Max API token mints per pubkey per hour |
-| `SPROUT_RELAY_PUBKEY` | — | Relay's hex pubkey — required by `sprout-proxy`; also used as fallback auth by `sprout-workflow` when no API token is set |
+| `SPROUT_RELAY_PUBKEY` | — | Relay's hex pubkey — required by `sprout-proxy`; also used as fallback auth by `sprout-workflow` |
 
 ## MCP Tools
 

@@ -9,6 +9,7 @@ members = [
     "crates/sprout-audit",
     "crates/sprout-mcp",
     "crates/sprout-acp",
+    "crates/sprout-agent",
     "crates/sprout-proxy",
     "crates/sprout-test-client",
     "crates/sprout-admin",
@@ -18,6 +19,11 @@ members = [
     "crates/sprout-pairing-cli",
     "crates/sprout-sdk",
     "crates/sprout-persona",
+    "crates/git-credential-nostr",
+    "crates/git-sign-nostr",
+    "crates/sprout-pair-relay",
+    "crates/sprout-dev-mcp",
+    "examples/countdown-bot",
 ]
 exclude = ["desktop/src-tauri"]
 resolver = "2"
@@ -37,7 +43,7 @@ tokio-util  = { version = "0.7", features = ["rt", "codec"] }
 # HTTP + WebSocket
 axum        = { version = "0.8", features = ["ws", "macros"] }
 tower       = { version = "0.5", features = ["timeout", "util"] }
-tower-http  = { version = "0.6", features = ["trace", "cors", "compression-gzip", "limit"] }
+tower-http  = { version = "0.6", features = ["trace", "cors", "compression-gzip", "limit", "fs"] }
 
 # Database
 sqlx = { version = "0.8", features = [
@@ -87,10 +93,6 @@ zeroize = "1.8"
 # Concurrent data structures
 dashmap = "6"
 moka    = { version = "0.12", features = ["sync"] }
-
-# JWT validation (Okta JWKS)
-jsonwebtoken = "9"
-
 
 # Async stream utilities
 futures-util = "0.3"

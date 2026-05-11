@@ -4,9 +4,12 @@ import 'package:hooks_riverpod/hooks_riverpod.dart';
 import 'package:lucide_icons_flutter/lucide_icons.dart';
 
 import '../../shared/theme/theme.dart';
+import '../../shared/widgets/frosted_app_bar.dart';
+import '../../shared/widgets/frosted_scaffold.dart';
 import '../channels/channel.dart';
 import '../channels/channel_detail_page.dart';
 import '../channels/channels_provider.dart';
+import '../channels/small_avatar.dart';
 import '../profile/user_cache_provider.dart';
 import 'activity_provider.dart';
 import 'feed_item.dart';
@@ -83,7 +86,16 @@ class ActivityPage extends HookConsumerWidget {
       body = const _LoadingSkeleton();
     }
 
-    return Scaffold(body: SafeArea(child: body));
+    return FrostedScaffold(
+      appBar: const FrostedAppBar(title: Text('Activity')),
+      body: SafeArea(
+        top: false,
+        child: Padding(
+          padding: EdgeInsets.only(top: frostedAppBarHeight(context)),
+          child: body,
+        ),
+      ),
+    );
   }
 
   List<FeedItem> _filteredItems(HomeFeedResponse feed, _Filter filter) {
@@ -229,9 +241,8 @@ class _FeedItemTile extends ConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
-    final profile = ref.watch(
-      userCacheProvider.select((cache) => cache[item.pubkey.toLowerCase()]),
-    );
+    final userCache = ref.watch(userCacheProvider);
+    final profile = userCache[item.pubkey.toLowerCase()];
     final authorLabel = profile?.label ?? _shortPubkey(item.pubkey);
 
     return InkWell(
@@ -263,6 +274,8 @@ class _FeedItemTile extends ConsumerWidget {
                         ),
                       ),
                       const SizedBox(width: Grid.xxs),
+                      SmallAvatar(pubkey: item.pubkey, userCache: userCache),
+                      const SizedBox(width: Grid.quarter),
                       Flexible(
                         child: Text(
                           authorLabel,
@@ -293,7 +306,7 @@ class _FeedItemTile extends ConsumerWidget {
                 Text(
                   _relativeTime(item.createdAt),
                   style: context.textTheme.labelSmall?.copyWith(
-                    color: context.colors.outline,
+                    color: context.colors.onSurfaceVariant,
                   ),
                 ),
               ],
@@ -396,7 +409,11 @@ class _EmptyState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(LucideIcons.bell, size: Grid.xl, color: context.colors.outline),
+          Icon(
+            LucideIcons.bell,
+            size: Grid.xl,
+            color: context.colors.onSurfaceVariant,
+          ),
           const SizedBox(height: Grid.xs),
           Text(
             'No activity yet',
@@ -408,7 +425,7 @@ class _EmptyState extends StatelessWidget {
           Text(
             'Mentions, replies, and reactions will show up here.',
             style: context.textTheme.bodySmall?.copyWith(
-              color: context.colors.outline,
+              color: context.colors.onSurfaceVariant,
             ),
             textAlign: TextAlign.center,
           ),
@@ -440,7 +457,7 @@ class _EmptyFilterState extends StatelessWidget {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(icon, size: Grid.lg, color: context.colors.outline),
+          Icon(icon, size: Grid.lg, color: context.colors.onSurfaceVariant),
           const SizedBox(height: Grid.xxs),
           Text(
             message,

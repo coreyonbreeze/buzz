@@ -1,10 +1,11 @@
 import { useState, useMemo, useRef } from "react";
 import {
   BellRing,
+  Bot,
   Check,
   Download,
   Keyboard,
-  KeyRound,
+  LockKeyhole,
   MonitorCog,
   Moon,
   Search,
@@ -18,7 +19,7 @@ import type {
   DesktopNotificationPermissionState,
   NotificationSettings,
 } from "@/features/notifications/hooks";
-import { TokenSettingsCard } from "@/features/tokens/ui/TokenSettingsCard";
+import { RelayMembersSettingsCard } from "@/features/relay-members/ui/RelayMembersSettingsCard";
 import { cn } from "@/shared/lib/cn";
 import { ACCENT_COLORS, useTheme } from "@/shared/theme/ThemeProvider";
 import { SYNTAX_THEMES, isLightTheme } from "@/shared/theme/theme-loader";
@@ -26,15 +27,17 @@ import { DoctorSettingsPanel } from "./DoctorSettingsPanel";
 import { KeyboardShortcutsCard } from "./KeyboardShortcutsCard";
 import { MobilePairingCard } from "./MobilePairingCard";
 import { NotificationSettingsCard } from "./NotificationSettingsCard";
+import { PreventSleepSettingsCard } from "./PreventSleepSettingsCard";
 import { ProfileSettingsCard } from "./ProfileSettingsCard";
 import { UpdateChecker } from "../UpdateChecker";
 
 export type SettingsSection =
   | "profile"
   | "notifications"
+  | "agents"
   | "appearance"
   | "shortcuts"
-  | "tokens"
+  | "relay-members"
   | "mobile"
   | "updates"
   | "doctor";
@@ -58,6 +61,7 @@ export type SettingsPanelProps = {
   onSetHomeBadgeEnabled: (enabled: boolean) => void;
   onSetMentionNotificationsEnabled: (enabled: boolean) => void;
   onSetNeedsActionNotificationsEnabled: (enabled: boolean) => void;
+  onSetSoundEnabled: (enabled: boolean) => void;
 };
 
 export const settingsSections: SettingsSectionDescriptor[] = [
@@ -72,6 +76,11 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: BellRing,
   },
   {
+    value: "agents",
+    label: "Agents",
+    icon: Bot,
+  },
+  {
     value: "appearance",
     label: "Appearance",
     icon: MonitorCog,
@@ -82,9 +91,9 @@ export const settingsSections: SettingsSectionDescriptor[] = [
     icon: Keyboard,
   },
   {
-    value: "tokens",
-    label: "Tokens",
-    icon: KeyRound,
+    value: "relay-members",
+    label: "Relay Access",
+    icon: LockKeyhole,
   },
   {
     value: "mobile",
@@ -246,14 +255,17 @@ export function renderSettingsSection(
           onSetNeedsActionNotificationsEnabled={
             props.onSetNeedsActionNotificationsEnabled
           }
+          onSetSoundEnabled={props.onSetSoundEnabled}
         />
       );
+    case "agents":
+      return <PreventSleepSettingsCard />;
     case "appearance":
       return <ThemeSettingsCard />;
     case "shortcuts":
       return <KeyboardShortcutsCard />;
-    case "tokens":
-      return <TokenSettingsCard currentPubkey={props.currentPubkey} />;
+    case "relay-members":
+      return <RelayMembersSettingsCard currentPubkey={props.currentPubkey} />;
     case "mobile":
       return <MobilePairingCard currentPubkey={props.currentPubkey} />;
     case "updates":

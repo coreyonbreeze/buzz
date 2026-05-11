@@ -68,9 +68,10 @@ export function InboxDetailPane({
 
   const focusComposer = React.useCallback(() => {
     window.requestAnimationFrame(() => {
-      const textarea = detailPaneRef.current?.querySelector<HTMLTextAreaElement>(
-        '[data-testid="message-input"]',
-      );
+      const textarea =
+        detailPaneRef.current?.querySelector<HTMLTextAreaElement>(
+          '[data-testid="message-input"]',
+        );
       textarea?.focus();
     });
   }, []);
@@ -113,7 +114,9 @@ export function InboxDetailPane({
             />
             <div className="min-w-0">
               <div className="flex min-w-0 flex-wrap items-center gap-2">
-                <p className="truncate text-base font-semibold">{item.senderLabel}</p>
+                <p className="truncate text-base font-semibold">
+                  {item.senderLabel}
+                </p>
                 <span
                   className={cn(
                     "inline-flex items-center text-[10px] font-semibold uppercase tracking-[0.14em]",
@@ -248,7 +251,8 @@ export function InboxDetailPane({
         placeholder={
           canReply
             ? `Send reply to ${item.channelLabel ? `#${item.channelLabel} thread` : "channel thread"}`
-            : (disabledReplyReason ?? "Replies are not available for this item.")
+            : (disabledReplyReason ??
+              "Replies are not available for this item.")
         }
       />
     </section>

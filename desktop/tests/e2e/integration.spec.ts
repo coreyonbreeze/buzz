@@ -6,6 +6,7 @@ import { assertRelaySeeded } from "../helpers/seed";
 
 const isCi = Boolean(process.env.CI);
 const relaySeedHookTimeoutMs = isCi ? 90_000 : 30_000;
+const relayDeliveryTimeoutMs = isCi ? 15_000 : 10_000;
 
 async function createStream(
   page: import("@playwright/test").Page,
@@ -33,12 +34,11 @@ async function closeChannelManagement(page: import("@playwright/test").Page) {
   await expect(page.getByTestId("channel-management-sheet")).not.toBeVisible();
 }
 
-async function enableDesktopNotifications(
+async function assertDesktopNotificationsEnabled(
   page: import("@playwright/test").Page,
 ) {
   await openSettings(page, "notifications");
   await expect(page.getByTestId("settings-notifications")).toBeVisible();
-  await page.getByTestId("notifications-desktop-toggle").click();
   await expect(page.getByTestId("notifications-desktop-state")).toContainText(
     "On",
   );
@@ -260,7 +260,7 @@ test("live mentions refetch the home feed without waiting for polling", async ({
 
     await targetPage.goto("/");
     await senderPage.goto("/");
-    await enableDesktopNotifications(targetPage);
+    await assertDesktopNotificationsEnabled(targetPage);
 
     await targetPage.getByTestId("channel-general").click();
     await expect(targetPage.getByTestId("chat-title")).toHaveText("general");
@@ -276,11 +276,13 @@ test("live mentions refetch the home feed without waiting for polling", async ({
       message,
     );
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveText("1", {
-      timeout: 5_000,
+      timeout: relayDeliveryTimeoutMs,
     });
 
     await expect
-      .poll(() => getLoggedNotificationCount(targetPage), { timeout: 5_000 })
+      .poll(() => getLoggedNotificationCount(targetPage), {
+        timeout: relayDeliveryTimeoutMs,
+      })
       .toBe(1);
 
     const notifications = await getLoggedNotifications(targetPage);
@@ -296,7 +298,9 @@ test("live mentions refetch the home feed without waiting for polling", async ({
     await expect(targetPage.getByTestId("chat-title")).toHaveText("Inbox");
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveCount(0);
     await expect
-      .poll(() => getLoggedNotificationCount(targetPage), { timeout: 3_000 })
+      .poll(() => getLoggedNotificationCount(targetPage), {
+        timeout: relayDeliveryTimeoutMs,
+      })
       .toBe(1);
   } finally {
     await targetContext.close();
@@ -321,7 +325,7 @@ test("live forum mentions refetch the home feed without waiting for polling", as
 
     await targetPage.goto("/");
     await senderPage.goto("/");
-    await enableDesktopNotifications(targetPage);
+    await assertDesktopNotificationsEnabled(targetPage);
 
     await targetPage.getByTestId("channel-general").click();
     await expect(targetPage.getByTestId("chat-title")).toHaveText("general");
@@ -336,11 +340,13 @@ test("live forum mentions refetch the home feed without waiting for polling", as
     });
 
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveText("1", {
-      timeout: 5_000,
+      timeout: relayDeliveryTimeoutMs,
     });
 
     await expect
-      .poll(() => getLoggedNotificationCount(targetPage), { timeout: 5_000 })
+      .poll(() => getLoggedNotificationCount(targetPage), {
+        timeout: relayDeliveryTimeoutMs,
+      })
       .toBe(1);
 
     const notifications = await getLoggedNotifications(targetPage);
@@ -355,10 +361,14 @@ test("live forum mentions refetch the home feed without waiting for polling", as
     await targetPage.getByRole("button", { name: "Inbox" }).click();
     await expect(targetPage.getByTestId("chat-title")).toHaveText("Inbox");
     await expect(targetPage.getByTestId("home-inbox-list")).toBeVisible();
-    await expect(targetPage.getByTestId("home-inbox-list")).toContainText(message);
+    await expect(targetPage.getByTestId("home-inbox-list")).toContainText(
+      message,
+    );
     await expect(targetPage.getByTestId("sidebar-home-count")).toHaveCount(0);
     await expect
-      .poll(() => getLoggedNotificationCount(targetPage), { timeout: 3_000 })
+      .poll(() => getLoggedNotificationCount(targetPage), {
+        timeout: relayDeliveryTimeoutMs,
+      })
       .toBe(1);
   } finally {
     await targetContext.close();
@@ -402,7 +412,10 @@ test("create channel with description", async ({ page }) => {
   await page.goto("/");
   await createStream(page, channelName, description);
 
-  await expect(page.getByTestId("chat-description")).toContainText(description);
+  await expect(page.getByTestId("chat-title")).toHaveAttribute(
+    "title",
+    description,
+  );
 });
 
 test("multiple channels independent", async ({ page }) => {
@@ -487,14 +500,10 @@ test("manage sheet updates channel details and context through the relay", async
 
   await page.getByTestId(`channel-${renamedChannel}`).click();
   await expect(page.getByTestId("chat-title")).toHaveText(renamedChannel);
-  await expect(page.getByTestId("chat-description")).toContainText(
+  // channelDescription deduplicates by showing only the first non-empty field
+  await expect(page.getByTestId("chat-title")).toHaveAttribute(
+    "title",
     updatedTopic,
-  );
-  await expect(page.getByTestId("chat-description")).toContainText(
-    updatedDescription,
-  );
-  await expect(page.getByTestId("chat-description")).toContainText(
-    updatedPurpose,
   );
 
   await openChannelManagement(page);

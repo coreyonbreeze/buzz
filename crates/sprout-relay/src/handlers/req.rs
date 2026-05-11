@@ -9,7 +9,8 @@ use hex;
 use nostr::Filter;
 use sprout_core::filter::filters_match;
 use sprout_core::kind::{
-    KIND_GIFT_WRAP, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_AGENT_OBSERVER_FRAME, KIND_GIFT_WRAP, KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION,
 };
 use sprout_db::EventQuery;
 
@@ -19,8 +20,14 @@ use crate::connection::{AuthState, ConnectionState};
 use crate::protocol::RelayMessage;
 use crate::state::AppState;
 
-const MAX_HISTORICAL_LIMIT: i64 = 500;
+const MAX_HISTORICAL_LIMIT: i64 = 10_000;
 const MAX_SUBSCRIPTIONS: usize = 1024;
+const P_GATED_KINDS: [u32; 4] = [
+    KIND_AGENT_OBSERVER_FRAME,
+    KIND_MEMBER_ADDED_NOTIFICATION,
+    KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_GIFT_WRAP,
+];
 
 /// Handle a REQ message: register the subscription, deliver historical events, then send EOSE.
 pub async fn handle_req(
@@ -113,33 +120,14 @@ pub async fn handle_req(
     // Only applies to GLOBAL subscriptions (channel_id = None). Channel-scoped
     // subscriptions can never receive globally-stored events — the fan_out()
     // invariant in subscription.rs prevents it.
-    const P_GATED_KINDS: [u32; 3] = [
-        KIND_MEMBER_ADDED_NOTIFICATION,
-        KIND_MEMBER_REMOVED_NOTIFICATION,
-        KIND_GIFT_WRAP,
-    ];
-
     if channel_id.is_none() {
         let authed_pubkey_hex = hex::encode(&pubkey_bytes);
-        let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
-
-        for filter in &filters {
-            let can_match_p_gated = filter.kinds.as_ref().is_none_or(|ks| {
-                ks.iter()
-                    .any(|k| P_GATED_KINDS.contains(&(k.as_u16() as u32)))
-            });
-            if can_match_p_gated {
-                let has_matching_p = filter.generic_tags.get(&p_tag).is_some_and(|values| {
-                    !values.is_empty() && values.iter().all(|v| *v == authed_pubkey_hex)
-                });
-                if !has_matching_p {
-                    conn.send(RelayMessage::closed(
-                        &sub_id,
-                        "restricted: p-gated events require #p matching your pubkey",
-                    ));
-                    return;
-                }
-            }
+        if !p_gated_filters_authorized(&filters, &authed_pubkey_hex) {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: p-gated events require #p matching your pubkey",
+            ));
+            return;
         }
     }
 
@@ -247,7 +235,7 @@ pub async fn handle_req(
 /// Maximum Typesense pages to fetch per filter (prevents unbounded loops).
 const MAX_SEARCH_PAGES: u32 = 10;
 
-fn build_search_channel_scope_filter(
+pub(crate) fn build_search_channel_scope_filter(
     accessible_channels: &[uuid::Uuid],
     include_global: bool,
 ) -> Option<String> {
@@ -453,6 +441,93 @@ async fn handle_search_req(
 
 /// Convert a single NIP-01 filter into an [`EventQuery`] for the database.
 ///
+/// Public wrapper for use by the HTTP bridge and COUNT handler.
+/// Resolves accessible channels for the given pubkey and builds the query.
+pub async fn build_event_query_from_filter(
+    filter: &Filter,
+    _pubkey_bytes: &[u8],
+    _state: &AppState,
+) -> EventQuery {
+    let channel_id = extract_channel_id_from_filter(filter);
+    filter_to_query_params(filter, channel_id)
+}
+
+/// Returns `true` if all constraints in this filter can be fully represented
+/// in SQL by `filter_to_query_params` — meaning `count_events()` will produce
+/// an exact count without post-filtering.
+///
+/// Pushed constraints: kinds, authors (single or multi), ids, since, until,
+/// channel_id (#h single), #p (single), #d (single, NIP-33-only kinds), #e (any),
+/// channel_ids (injected by caller).
+///
+/// Anything else (multi-#p, #t, #a, search, multi-#h, #d on non-NIP-33)
+/// requires post-filtering and cannot use the fast COUNT path.
+pub fn filter_fully_pushable(filter: &Filter) -> bool {
+    // Check if filter exclusively targets NIP-33 kinds (needed for #d pushability).
+    let is_nip33_only = filter.kinds.as_ref().is_some_and(|ks| {
+        !ks.is_empty()
+            && ks
+                .iter()
+                .all(|k| sprout_core::kind::is_parameterized_replaceable(k.as_u16() as u32))
+    });
+
+    for (tag_key, tag_values) in filter.generic_tags.iter() {
+        let key = tag_key.to_string();
+        match key.as_str() {
+            "h" => {
+                // Single #h is pushed as channel_id; multi-#h is not.
+                if tag_values.len() > 1 {
+                    return false;
+                }
+            }
+            "p" => {
+                // Single #p is pushed via event_mentions join; multi is not.
+                if tag_values.len() > 1 {
+                    return false;
+                }
+            }
+            "d" => {
+                // #d is pushed (single or multi) ONLY for NIP-33-only kind filters.
+                // Otherwise it's silently ignored by SQL → overcount.
+                if !tag_values.is_empty() && !is_nip33_only {
+                    return false;
+                }
+            }
+            "e" => {
+                // #e is fully pushed (any count) via JSONB containment.
+            }
+            _ => {
+                // Any other generic tag (#t, #a, etc.) is not pushed.
+                if !tag_values.is_empty() {
+                    return false;
+                }
+            }
+        }
+    }
+    // search field is not pushed by filter_to_query_params
+    if filter.search.is_some() {
+        return false;
+    }
+    true
+}
+
+/// Extract a channel UUID from a single filter's `#h` tag.
+fn extract_channel_id_from_filter(filter: &Filter) -> Option<uuid::Uuid> {
+    for (tag_key, tag_values) in filter.generic_tags.iter() {
+        let key = tag_key.to_string();
+        if key == "h" {
+            for val in tag_values {
+                if let Ok(id) = val.parse::<uuid::Uuid>() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Convert a single NIP-01 filter into an [`EventQuery`] for the database.
+///
 /// Each filter is queried independently so that per-filter `limit` and time
 /// windows are respected. Results are deduplicated by event ID in the caller.
 fn filter_to_query_params(filter: &Filter, channel_id: Option<uuid::Uuid>) -> EventQuery {
@@ -479,13 +554,42 @@ fn filter_to_query_params(filter: &Filter, channel_id: Option<uuid::Uuid>) -> Ev
         .map(|l| (l as i64).min(MAX_HISTORICAL_LIMIT))
         .unwrap_or(MAX_HISTORICAL_LIMIT);
 
-    // Push single-author filter into SQL (EventQuery.pubkey is Option<Vec<u8>>).
-    // Multi-author filters fall through to in-memory filters_match post-filtering.
-    let pubkey = filter.authors.as_ref().and_then(|authors| {
-        if authors.len() == 1 {
-            authors.iter().next().map(|pk| pk.serialize().to_vec())
-        } else {
+    // Push author filter into SQL. Single-author uses the indexed `pubkey` column;
+    // multi-author uses the `authors` IN-list pushdown added in the pure-nostr PR.
+    let (pubkey, authors) = match filter.authors.as_ref() {
+        Some(a) if a.len() == 1 => (a.iter().next().map(|pk| pk.serialize().to_vec()), None),
+        Some(a) if !a.is_empty() => (
+            None,
+            Some(
+                a.iter()
+                    .map(|pk| pk.serialize().to_vec())
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        _ => (None, None),
+    };
+
+    // Push event IDs into SQL via the `ids` IN-list pushdown.
+    let ids = filter.ids.as_ref().and_then(|id_set| {
+        if id_set.is_empty() {
             None
+        } else {
+            Some(
+                id_set
+                    .iter()
+                    .map(|id| id.to_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+        }
+    });
+
+    // Push #e tag filter into SQL via JSONB containment.
+    let e_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::E);
+    let e_tags = filter.generic_tags.get(&e_tag_key).and_then(|values| {
+        if values.is_empty() {
+            None
+        } else {
+            Some(values.iter().map(|v| v.to_string()).collect::<Vec<_>>())
         }
     });
 
@@ -517,16 +621,21 @@ fn filter_to_query_params(filter: &Filter, channel_id: Option<uuid::Uuid>) -> Ev
                 .all(|&k| sprout_core::kind::is_parameterized_replaceable(k as u32))
     });
     let d_tag_key = nostr::SingleLetterTag::lowercase(nostr::Alphabet::D);
-    let d_tag = if filter_is_nip33_only {
-        filter.generic_tags.get(&d_tag_key).and_then(|values| {
-            if values.len() == 1 {
-                values.iter().next().map(|v| v.to_string())
-            } else {
-                None
-            }
-        })
+    let (d_tag, d_tags) = if filter_is_nip33_only {
+        let values = filter.generic_tags.get(&d_tag_key);
+        match values.map(|v| v.len()) {
+            Some(1) => (
+                values.and_then(|vs| vs.iter().next().map(|v| v.to_string())),
+                None,
+            ),
+            Some(n) if n > 1 => (
+                None,
+                values.map(|vs| vs.iter().map(|v| v.to_string()).collect::<Vec<_>>()),
+            ),
+            _ => (None, None),
+        }
     } else {
-        None
+        (None, None)
     };
 
     EventQuery {
@@ -538,6 +647,10 @@ fn filter_to_query_params(filter: &Filter, channel_id: Option<uuid::Uuid>) -> Ev
         limit: Some(limit),
         p_tag_hex,
         d_tag,
+        d_tags,
+        authors,
+        ids,
+        e_tags,
         ..Default::default()
     }
 }
@@ -579,6 +692,30 @@ fn extract_channel_id_from_filters(filters: &[Filter]) -> Option<uuid::Uuid> {
         }
     }
     found_id
+}
+
+pub(crate) fn p_gated_filters_authorized(filters: &[Filter], authed_pubkey_hex: &str) -> bool {
+    let p_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::P);
+    filters.iter().all(|filter| {
+        // Filters with explicit `ids` are targeting specific known events — they
+        // can't be used to fish for p-gated events you don't own because the
+        // caller already knows the event ID. Skip the p-gate check.
+        if filter.ids.as_ref().is_some_and(|ids| !ids.is_empty()) {
+            return true;
+        }
+
+        let can_match_p_gated = filter.kinds.as_ref().is_none_or(|ks| {
+            ks.iter()
+                .any(|kind| P_GATED_KINDS.contains(&(kind.as_u16() as u32)))
+        });
+        if !can_match_p_gated {
+            return true;
+        }
+
+        filter.generic_tags.get(&p_tag).is_some_and(|values| {
+            !values.is_empty() && values.iter().all(|value| value == authed_pubkey_hex)
+        })
+    })
 }
 
 #[cfg(test)]
@@ -661,6 +798,32 @@ mod tests {
         let has_non_search = filters.iter().any(|f| f.search.is_none());
         assert!(has_search);
         assert!(!has_non_search, "all-search filters should not be mixed");
+    }
+
+    #[test]
+    fn agent_observer_subscription_requires_matching_p_tag() {
+        let p_tag = SingleLetterTag::lowercase(Alphabet::P);
+        let authed = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let other = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let missing_p = Filter::new().kind(nostr::Kind::Custom(
+            sprout_core::kind::KIND_AGENT_OBSERVER_FRAME as u16,
+        ));
+        assert!(!p_gated_filters_authorized(&[missing_p], authed));
+
+        let wrong_p = Filter::new()
+            .kind(nostr::Kind::Custom(
+                sprout_core::kind::KIND_AGENT_OBSERVER_FRAME as u16,
+            ))
+            .custom_tag(p_tag, [other]);
+        assert!(!p_gated_filters_authorized(&[wrong_p], authed));
+
+        let matching_p = Filter::new()
+            .kind(nostr::Kind::Custom(
+                sprout_core::kind::KIND_AGENT_OBSERVER_FRAME as u16,
+            ))
+            .custom_tag(p_tag, [authed]);
+        assert!(p_gated_filters_authorized(&[matching_p], authed));
     }
 
     #[test]

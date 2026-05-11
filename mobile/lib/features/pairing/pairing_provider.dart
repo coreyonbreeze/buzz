@@ -229,12 +229,37 @@ class PairingNotifier extends Notifier<PairingState> {
         errorMessage: 'Invalid pairing code: ${e.message}',
       );
     } catch (e) {
+      debugPrint('Pairing connection error: $e');
       _cleanup();
       state = PairingState(
         status: PairingStatus.error,
-        errorMessage: 'Connection failed: $e',
+        errorMessage: _friendlyErrorMessage(e),
       );
     }
+  }
+
+  static String _friendlyErrorMessage(Object error) {
+    final message = error.toString();
+    if (message.contains('SocketException') ||
+        message.contains('Connection refused') ||
+        message.contains('Network is unreachable') ||
+        message.contains('No route to host') ||
+        message.contains('Failed to connect') ||
+        message.contains('Null check operator used on a null value')) {
+      return 'Could not reach the pairing relay. Check your internet '
+          'connection and VPN, then try again.';
+    }
+    if (message.contains('HandshakeException') ||
+        message.contains('CERTIFICATE_VERIFY_FAILED')) {
+      return 'Secure connection failed. Check your network settings '
+          'and try again.';
+    }
+    if (message.contains('TimeoutException') || message.contains('timed out')) {
+      return 'Connection timed out. Check your internet connection and '
+          'try again.';
+    }
+    return 'Connection failed. Please check your internet connection '
+        'and try again.';
   }
 
   void _handleRelayMessage(List<dynamic> data) {
@@ -393,43 +418,32 @@ class PairingNotifier extends Notifier<PairingState> {
       // Parse the custom payload.
       final data = jsonDecode(payload) as Map<String, dynamic>;
       final relayUrl = data['relayUrl'] as String?;
-      final token = data['token'] as String?;
       final pubkey = data['pubkey'] as String?;
       final nsec = data['nsec'] as String?;
 
-      if (relayUrl == null || token == null) {
-        throw const FormatException('Missing relayUrl or token in payload');
+      if (relayUrl == null) {
+        throw const FormatException('Missing relayUrl in payload');
       }
 
       // Validate relay URL to prevent SSRF via private network addresses.
       _validateRelayUrl(relayUrl);
 
-      // Validate credentials against the relay.
-      final client = RelayClient(
-        baseUrl: relayUrl,
-        apiToken: token,
-        httpClient: ref.read(pairingHttpClientProvider),
-      );
-      try {
-        await client.get('/api/users/me/profile');
-      } finally {
-        client.dispose();
-      }
+      // Validate credentials against the relay via NIP-42 WS handshake.
+      await _validateCredentials(relayUrl: relayUrl, nsec: nsec);
 
       // Send complete only after credentials are validated.
       _sendComplete(true);
 
-      // Store credentials.
+      // Store as workspace and switch to it.
+      final workspace = Workspace.create(
+        name: Workspace.nameFromUrl(relayUrl),
+        relayUrl: relayUrl,
+        pubkey: pubkey,
+        nsec: nsec,
+      );
       await ref
           .read(authProvider.notifier)
-          .authenticate(
-            StoredCredentials(
-              relayUrl: relayUrl,
-              token: token,
-              pubkey: pubkey,
-              nsec: nsec,
-            ),
-          );
+          .authenticateWithWorkspace(workspace);
 
       _cleanup();
       state = const PairingState(status: PairingStatus.success);
@@ -518,20 +532,16 @@ class PairingNotifier extends Notifier<PairingState> {
     state = const PairingState(status: PairingStatus.connecting);
 
     try {
-      final creds = _parseLegacyInput(rawInput);
+      final workspace = _parseLegacyInput(rawInput);
 
-      final client = RelayClient(
-        baseUrl: creds.relayUrl,
-        apiToken: creds.token,
-        httpClient: ref.read(pairingHttpClientProvider),
+      await _validateCredentials(
+        relayUrl: workspace.relayUrl,
+        nsec: workspace.nsec,
       );
-      try {
-        await client.get('/api/users/me/profile');
-      } finally {
-        client.dispose();
-      }
 
-      await ref.read(authProvider.notifier).authenticate(creds);
+      await ref
+          .read(authProvider.notifier)
+          .authenticateWithWorkspace(workspace);
       state = const PairingState(status: PairingStatus.success);
     } on FormatException catch (e) {
       state = PairingState(
@@ -555,7 +565,32 @@ class PairingNotifier extends Notifier<PairingState> {
     }
   }
 
-  StoredCredentials _parseLegacyInput(String raw) {
+  Future<void> _validateCredentials({
+    required String relayUrl,
+    required String? nsec,
+  }) async {
+    if (nsec == null || nsec.isEmpty) {
+      throw const FormatException('Pairing payload missing nsec');
+    }
+    final uri = Uri.parse(relayUrl);
+    final scheme = uri.scheme == 'https' ? 'wss' : 'ws';
+    final wsUrl = uri.replace(scheme: scheme).toString();
+
+    final socket = RelaySocket(
+      wsUrl: wsUrl,
+      nsec: nsec,
+      onMessage: (_) {},
+      onConnected: () {},
+      onDisconnected: (_) {},
+    );
+    try {
+      await socket.connect().timeout(const Duration(seconds: 8));
+    } finally {
+      await socket.disconnect();
+    }
+  }
+
+  Workspace _parseLegacyInput(String raw) {
     var payload = raw.trim();
 
     if (payload.startsWith('sprout://')) {
@@ -570,16 +605,15 @@ class PairingNotifier extends Notifier<PairingState> {
     }
 
     final relayUrl = decoded['relayUrl'] as String?;
-    final token = decoded['token'] as String?;
-    if (relayUrl == null || token == null) {
-      throw const FormatException('Missing relayUrl or token');
+    if (relayUrl == null) {
+      throw const FormatException('Missing relayUrl in payload');
     }
 
     _validateRelayUrl(relayUrl);
 
-    return StoredCredentials(
+    return Workspace.create(
+      name: Workspace.nameFromUrl(relayUrl),
       relayUrl: relayUrl,
-      token: token,
       pubkey: decoded['pubkey'] as String?,
       nsec: decoded['nsec'] as String?,
     );

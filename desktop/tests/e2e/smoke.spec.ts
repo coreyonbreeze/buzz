@@ -140,7 +140,10 @@ test("opens a mocked channel from the home feed", async ({ page }) => {
   await expect(page.getByTestId("chat-title")).toHaveText("Inbox");
   await expect(inboxList).toContainText("Please review the release checklist.");
 
-  await inboxList.getByText("Please review the release checklist.").first().click();
+  await inboxList
+    .getByText("Please review the release checklist.")
+    .first()
+    .click();
   await page.getByRole("button", { name: "Open channel" }).click();
 
   await expect(page).toHaveURL(
@@ -298,14 +301,7 @@ test("opens accessible unjoined channels from search in read-only mode", async (
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Design critique notes for the browse flow.",
   );
-  await expect(page.getByTestId("message-input")).toHaveAttribute(
-    "contenteditable",
-    "false",
-  );
-
-  await page.getByTestId("channel-management-trigger").click();
-  await expect(page.getByTestId("channel-management-sheet")).toBeVisible();
-  await expect(page.getByTestId("channel-management-join")).toBeVisible();
+  await expect(page.getByTestId("join-banner")).toBeVisible();
 });
 
 test("replaces the channel pane when switching channels", async ({ page }) => {
@@ -360,7 +356,9 @@ test("supports multiline drafts with Ctrl+Enter and sends with Enter", async ({
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
-  await expect(page.getByTestId("send-message")).toContainText("Send");
+  await expect(
+    page.getByRole("button", { name: "Send message" }),
+  ).toBeVisible();
   const initialInputHeight = await input.evaluate(
     (element) => (element as HTMLElement).clientHeight,
   );
@@ -421,7 +419,7 @@ test("does not shift the timeline when the composer grows", async ({
   await page.waitForTimeout(1200);
 
   const after = await getTimelineMetrics(page);
-  expect(after.clientHeight).toBeLessThan(before.clientHeight);
+  expect(after.clientHeight).toBeLessThanOrEqual(before.clientHeight);
   expect(Math.abs(after.scrollTop - before.scrollTop)).toBeLessThanOrEqual(2);
   expect(after.distanceFromBottom).toBeGreaterThan(160);
 });

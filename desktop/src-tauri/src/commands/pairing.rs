@@ -15,9 +15,7 @@ use tokio_util::sync::CancellationToken;
 use zeroize::Zeroizing;
 
 use crate::app_state::AppState;
-use crate::relay::{relay_api_base_url, relay_ws_url};
-
-use super::tokens::{mint_token_internal_with_auth_mode, MintTokenAuthMode};
+use crate::relay::{relay_api_base_url_with_override, relay_ws_url_with_override};
 
 #[derive(Serialize, Clone)]
 struct PairingSasPayload {
@@ -62,29 +60,11 @@ impl PairingHandle {
     }
 }
 
-const MOBILE_SCOPES: &[&str] = &[
-    "messages:read",
-    "messages:write",
-    "channels:read",
-    "channels:write",
-    "users:read",
-    "files:read",
-    "files:write",
-];
-const EXPIRES_IN_DAYS: u32 = 90;
-
-fn mobile_pairing_mint_auth_mode(state: &AppState) -> MintTokenAuthMode {
-    if state.configured_api_token.is_some() {
-        MintTokenAuthMode::BootstrapNip98
-    } else {
-        MintTokenAuthMode::Auto
-    }
-}
-
 /// Start a NIP-AB pairing session as the source device.
 ///
-/// Mints a token, creates a `PairingSession`, connects to the relay,
-/// and returns the `nostrpair://` QR URI for the frontend to display.
+/// Creates a `PairingSession`, connects to the relay, and returns the
+/// `nostrpair://` QR URI for the frontend to display. The mobile peer will
+/// receive the desktop's nsec (NIP-OA auth — no token minting needed).
 #[tauri::command]
 pub async fn start_pairing(
     app: AppHandle,
@@ -96,18 +76,6 @@ pub async fn start_pairing(
     }
     pairing.clear();
 
-    let scopes: Vec<String> = MOBILE_SCOPES.iter().map(|s| s.to_string()).collect();
-    let token_name = format!("mobile-pairing-{}", chrono::Utc::now().timestamp());
-    let mint_result = mint_token_internal_with_auth_mode(
-        &state,
-        &token_name,
-        &scopes,
-        None,
-        Some(EXPIRES_IN_DAYS),
-        mobile_pairing_mint_auth_mode(&state),
-    )
-    .await?;
-
     let (nsec, pubkey_hex) = {
         let keys = state.keys.lock().map_err(|e| e.to_string())?;
         let nsec = keys
@@ -118,15 +86,25 @@ pub async fn start_pairing(
         (nsec, pubkey)
     };
 
-    let ws_url = relay_ws_url();
-    let http_url = relay_api_base_url();
+    let ws_url = relay_ws_url_with_override(&state);
+    let http_url = relay_api_base_url_with_override(&state);
 
-    let (session, qr_payload) = PairingSession::new_source(ws_url.clone());
+    // Detect NIP-43: if the relay requires auth, the target device should
+    // connect to the /pair sidecar instead of the main relay.
+    let qr_relay_url = if probe_relay_requires_auth(&ws_url).await {
+        let mut url = url::Url::parse(&ws_url).map_err(|e| format!("invalid relay URL: {e}"))?;
+        let path = url.path().trim_end_matches('/').to_string();
+        url.set_path(&format!("{path}/pair"));
+        url.to_string()
+    } else {
+        ws_url.clone()
+    };
+
+    let (session, qr_payload) = PairingSession::new_source(qr_relay_url);
     let qr_uri = encode_qr(&qr_payload);
 
     let payload_json = serde_json::json!({
         "relayUrl": http_url,
-        "token": mint_result.token,
         "pubkey": pubkey_hex,
         "nsec": nsec,
     });
@@ -444,6 +422,49 @@ fn parse_relay_event(text: &str, sub_id: &str) -> Option<nostr_compat::Event> {
     serde_json::from_value(arr[2].clone()).ok()
 }
 
+/// Check the relay's NIP-11 information document to determine if auth is
+/// required (indicating NIP-43 access control). Returns `true` if the relay
+/// advertises `limitation.auth_required: true`, `false` otherwise.
+///
+/// Converts the WebSocket URL to HTTP(S) and fetches `GET /` with
+/// `Accept: application/nostr+json` per NIP-11.
+async fn probe_relay_requires_auth(relay_url: &str) -> bool {
+    // Convert ws(s):// to http(s):// for the NIP-11 fetch.
+    let http_url = if let Some(rest) = relay_url.strip_prefix("wss://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = relay_url.strip_prefix("ws://") {
+        format!("http://{rest}")
+    } else {
+        return false;
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
+
+    let resp = match client
+        .get(&http_url)
+        .header("Accept", "application/nostr+json")
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(_) => return false, // can't reach relay — assume open
+    };
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+
+    // Check limitation.auth_required per NIP-11.
+    json.get("limitation")
+        .and_then(|l| l.get("auth_required"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
 fn parse_auth_challenge(text: &str) -> Option<String> {
     let arr: serde_json::Value = serde_json::from_str(text).ok()?;
     let arr = arr.as_array()?;
@@ -480,38 +501,4 @@ where
     })
     .await
     .map_err(|_| "timeout waiting for EOSE".to_string())?
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MOBILE_SCOPES;
-    use super::*;
-    use crate::app_state::build_app_state;
-
-    #[test]
-    fn mobile_pairing_token_includes_file_write_scope() {
-        assert!(MOBILE_SCOPES.contains(&"files:write"));
-    }
-
-    #[test]
-    fn mobile_pairing_uses_bootstrap_mint_when_configured_token_is_present() {
-        let mut state = build_app_state();
-        state.configured_api_token = Some("desktop-token".to_string());
-
-        assert_eq!(
-            mobile_pairing_mint_auth_mode(&state),
-            MintTokenAuthMode::BootstrapNip98
-        );
-    }
-
-    #[test]
-    fn mobile_pairing_keeps_auto_mint_without_configured_token() {
-        let mut state = build_app_state();
-        state.configured_api_token = None;
-
-        assert_eq!(
-            mobile_pairing_mint_auth_mode(&state),
-            MintTokenAuthMode::Auto
-        );
-    }
 }

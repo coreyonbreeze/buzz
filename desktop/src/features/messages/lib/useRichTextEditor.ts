@@ -5,8 +5,10 @@ import { useEditor, type Editor } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import Placeholder from "@tiptap/extension-placeholder";
 import Link from "@tiptap/extension-link";
-import { Extension } from "@tiptap/core";
-import { TextSelection } from "@tiptap/pm/state";
+import { Extension, type KeyboardShortcutCommand } from "@tiptap/core";
+import { Selection, TextSelection } from "@tiptap/pm/state";
+
+import { isMacPlatform } from "@/shared/lib/platform";
 
 import {
   MentionHighlightExtension,
@@ -69,6 +71,58 @@ export function useRichTextEditor({
           // after block nodes (lists, blockquotes, code blocks) which creates
           // a phantom empty line in the compact message composer.
           trailingNode: false,
+          // Disable StarterKit's built-in Link — we configure it separately
+          // below with custom options (autolink, openOnClick, etc.).
+          link: false,
+        }),
+        // macOS text fields traditionally support a small set of Emacs-style
+        // Control shortcuts. ProseMirror already handles Ctrl-A/E/H/D on macOS;
+        // these fill in the common movement and kill-line gaps for the composer.
+        Extension.create({
+          name: "macEmacsTextShortcuts",
+          addKeyboardShortcuts() {
+            const shortcuts: Record<string, KeyboardShortcutCommand> = {};
+            if (!isMacPlatform()) {
+              return shortcuts;
+            }
+
+            return {
+              "Ctrl-b": ({ editor: ed }) => {
+                const { empty, from } = ed.state.selection;
+                if (!empty || from <= 0) return false;
+                return ed.commands.setTextSelection(from - 1);
+              },
+              "Ctrl-f": ({ editor: ed }) => {
+                const { empty, from } = ed.state.selection;
+                if (!empty || from >= ed.state.doc.content.size) return false;
+                return ed.commands.setTextSelection(from + 1);
+              },
+              "Ctrl-k": ({ editor: ed }) => {
+                const { state, view } = ed;
+                const { $from, empty, from, to } = state.selection;
+
+                if (!empty) {
+                  return ed.commands.deleteSelection();
+                }
+
+                const blockEnd = $from.end();
+                if (from < blockEnd) {
+                  return ed.commands.deleteRange({ from, to: blockEnd });
+                }
+
+                const nextSelection = Selection.findFrom(
+                  state.doc.resolve(to),
+                  1,
+                  true,
+                );
+                if (!nextSelection) return false;
+
+                const transaction = state.tr.delete(to, nextSelection.from);
+                view.dispatch(transaction.scrollIntoView());
+                return true;
+              },
+            };
+          },
         }),
         // Shift+Enter inside lists/blockquotes: split the node instead of
         // inserting a hard break so continuation lines keep their formatting.
@@ -180,7 +234,11 @@ export function useRichTextEditor({
         Placeholder.configure({
           placeholder: () => placeholderRef.current ?? "Write a message…",
         }),
-        Link.configure({
+        Link.extend({
+          inclusive() {
+            return false;
+          },
+        }).configure({
           openOnClick: false,
           autolink: true,
           linkOnPaste: true,
@@ -363,7 +421,12 @@ function getMarkdownFromEditor(editor: Editor): string {
     | { getMarkdown?: () => string }
     | undefined;
   if (storage?.getMarkdown) {
-    return storage.getMarkdown();
+    let md = storage.getMarkdown();
+    // tiptap-markdown serializes hard breaks as "\" + newline (CommonMark hard
+    // line break syntax). Chat messages are plain text, not rendered markdown,
+    // so strip the backslashes to keep clean newlines.
+    md = md.replace(/\\\n/g, "\n");
+    return md;
   }
   // Fallback: plain text
   return editor.state.doc.textContent;

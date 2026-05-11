@@ -6,7 +6,6 @@ import {
   Clipboard,
   Ellipsis,
   FileText,
-  KeyRound,
   Pencil,
   Play,
   Power,
@@ -49,7 +48,6 @@ export function ManagedAgentRow({
   presenceLookup,
   onAddToChannel,
   onDelete,
-  onMintToken,
   onSelectLogAgent,
   onStart,
   onStop,
@@ -67,7 +65,6 @@ export function ManagedAgentRow({
   presenceLookup: PresenceLookup;
   onAddToChannel: (agent: ManagedAgent) => void;
   onDelete: (pubkey: string) => void;
-  onMintToken: (pubkey: string, name: string) => void;
   onSelectLogAgent: (pubkey: string | null) => void;
   onStart: (pubkey: string) => void;
   onStop: (pubkey: string) => void;
@@ -158,7 +155,6 @@ export function ManagedAgentRow({
             isActive={isActive}
             onAddToChannel={onAddToChannel}
             onDelete={onDelete}
-            onMintToken={onMintToken}
             onOpenLogs={(pubkey) => onSelectLogAgent(pubkey)}
             onStart={onStart}
             onStop={onStop}
@@ -307,7 +303,6 @@ function AgentActionsMenu({
   isActive,
   onAddToChannel,
   onDelete,
-  onMintToken,
   onOpenLogs,
   onStart,
   onStop,
@@ -318,7 +313,6 @@ function AgentActionsMenu({
   isActive: boolean;
   onAddToChannel: (agent: ManagedAgent) => void;
   onDelete: (pubkey: string) => void;
-  onMintToken: (pubkey: string, name: string) => void;
   onOpenLogs: (pubkey: string) => void;
   onStart: (pubkey: string) => void;
   onStop: (pubkey: string) => void;
@@ -392,14 +386,6 @@ function AgentActionsMenu({
           </DropdownMenuItem>
 
           <DropdownMenuItem
-            disabled={isActionPending}
-            onClick={() => onMintToken(agent.pubkey, agent.name)}
-          >
-            <KeyRound className="h-4 w-4" />
-            Mint token
-          </DropdownMenuItem>
-
-          <DropdownMenuItem
             onClick={async () => {
               await navigator.clipboard.writeText(agent.pubkey);
               toast.success("Copied pubkey to clipboard");
@@ -460,6 +446,9 @@ function AgentOriginBadge({ agent }: { agent: ManagedAgent }) {
   );
 }
 
+/** Grace period after mount before treating "running + no presence" as "Starting…" */
+const PRESENCE_GRACE_MS = 15_000;
+
 function AgentStatusBadge({
   presenceLoaded,
   presenceStatus,
@@ -469,8 +458,16 @@ function AgentStatusBadge({
   presenceStatus: PresenceStatus | undefined;
   status: ManagedAgent["status"];
 }) {
+  const [inGracePeriod, setInGracePeriod] = React.useState(true);
+
+  React.useEffect(() => {
+    const timer = setTimeout(() => setInGracePeriod(false), PRESENCE_GRACE_MS);
+    return () => clearTimeout(timer);
+  }, []);
+
   const isActive = status === "running" || status === "deployed";
   const isStarting =
+    !inGracePeriod &&
     presenceLoaded &&
     status === "running" &&
     (!presenceStatus || presenceStatus === "offline");

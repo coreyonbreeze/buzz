@@ -59,6 +59,73 @@ async fn main() -> anyhow::Result<()> {
         error!("Failed to ensure partitions: {e}");
     }
 
+    // NIP-43: if membership enforcement is on, a valid owner pubkey is required.
+    // config.rs already strips invalid values with a warning; catch the resulting
+    // None here so we fail fast with a clear message rather than starting a relay
+    // that no one can administer.
+    if config.require_relay_membership && config.relay_owner_pubkey.is_none() {
+        error!(
+            "SPROUT_REQUIRE_RELAY_MEMBERSHIP=true but RELAY_OWNER_PUBKEY is not set or invalid. \
+             Set RELAY_OWNER_PUBKEY to a valid 64-char hex pubkey."
+        );
+        return Err(anyhow::anyhow!(
+            "RELAY_OWNER_PUBKEY required when SPROUT_REQUIRE_RELAY_MEMBERSHIP=true"
+        ));
+    }
+
+    // NIP-43: relay membership requires a stable signing key.
+    // Check this before any DB mutations so we fail fast — no point backfilling
+    // or bootstrapping if we'll reject the config anyway.
+    if config.require_relay_membership && config.relay_private_key.is_none() {
+        return Err(anyhow::anyhow!(
+            "SPROUT_RELAY_PRIVATE_KEY is required when SPROUT_REQUIRE_RELAY_MEMBERSHIP=true. \
+             NIP-43 events signed with an ephemeral key become unverifiable after restart."
+        ));
+    }
+
+    // NIP-43: migrate any existing pubkey_allowlist entries to relay_members.
+    // Idempotent — safe to run every startup. Must run before bootstrap_owner
+    // so that existing allowlist users become relay members before the owner
+    // is promoted (otherwise enabling membership locks everyone out).
+    match db.backfill_from_allowlist().await {
+        Ok(0) => {}
+        Ok(n) => info!("Backfilled {n} pubkey_allowlist entries into relay_members"),
+        Err(e) => {
+            if config.require_relay_membership {
+                error!(
+                    "Fatal: failed to backfill allowlist with membership enforcement enabled: {e}"
+                );
+                return Err(anyhow::anyhow!(
+                    "Failed to backfill pubkey_allowlist (required when SPROUT_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
+                ));
+            } else {
+                error!("Failed to backfill pubkey_allowlist (non-fatal): {e}");
+            }
+        }
+    }
+
+    // NIP-43: ensure the configured relay owner always holds the owner role.
+    if let Some(ref owner_pubkey) = config.relay_owner_pubkey {
+        match db.bootstrap_owner(owner_pubkey).await {
+            Ok(()) => info!(pubkey = %owner_pubkey, "Relay owner bootstrapped"),
+            Err(e) => {
+                if config.require_relay_membership {
+                    // Membership enforcement is on — a missing owner means no one
+                    // can administer the relay. Fail fast rather than silently start
+                    // in a broken state.
+                    error!("Fatal: failed to bootstrap relay owner with membership enforcement enabled: {e}");
+                    return Err(anyhow::anyhow!(
+                        "Failed to bootstrap relay owner (required when SPROUT_REQUIRE_RELAY_MEMBERSHIP=true): {e}"
+                    ));
+                } else {
+                    error!(
+                        "Failed to bootstrap relay owner (non-fatal, membership not required): {e}"
+                    );
+                }
+            }
+        }
+    }
+
     // NIP-33: backfill d_tag for any existing parameterized replaceable events
     // that predate the column addition. Idempotent — no-ops when fully populated.
     match db.backfill_d_tags().await {
@@ -116,10 +183,24 @@ async fn main() -> anyhow::Result<()> {
     let relay_keypair = if let Some(hex) = &config.relay_private_key {
         nostr::Keys::parse(hex)
             .map_err(|e| anyhow::anyhow!("invalid SPROUT_RELAY_PRIVATE_KEY: {e}"))?
-    } else {
-        let keys = nostr::Keys::generate();
-        tracing::info!("Generated relay keypair: {}", keys.public_key().to_hex());
+    } else if !config.require_auth_token {
+        // Dev mode: use a deterministic keypair so addressable events (kind:39000/39001/39002)
+        // replace correctly across restarts. Without this, each restart generates a new pubkey
+        // and replace_addressable_event inserts duplicates instead of replacing.
+        const DEV_RELAY_PRIVKEY: &str =
+            "0000000000000000000000000000000000000000000000000000000000000001";
+        let keys = nostr::Keys::parse(DEV_RELAY_PRIVKEY).expect("hardcoded dev key is valid");
+        tracing::warn!(
+            pubkey = %keys.public_key().to_hex(),
+            "Using hardcoded dev relay keypair (SPROUT_REQUIRE_AUTH_TOKEN=false). \
+             Set SPROUT_RELAY_PRIVATE_KEY for production."
+        );
         keys
+    } else {
+        panic!(
+            "SPROUT_RELAY_PRIVATE_KEY must be set when SPROUT_REQUIRE_AUTH_TOKEN=true. \
+             A stable relay identity is required for production."
+        );
     };
 
     config
@@ -143,6 +224,49 @@ async fn main() -> anyhow::Result<()> {
         media_storage,
     );
     let state = Arc::new(app_state);
+
+    // NIP-43: publish the initial membership list on startup so clients can
+    // REQ kind:13534 immediately without waiting for the next membership change.
+    if config.require_relay_membership {
+        let startup_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(e) =
+                sprout_relay::handlers::side_effects::publish_nip43_membership_list(&startup_state)
+                    .await
+            {
+                tracing::warn!(error = %e, "failed to publish initial NIP-43 membership list on startup");
+            } else {
+                tracing::info!("NIP-43 membership list published on startup");
+            }
+        });
+    }
+
+    // Emit kind:39000/39002 discovery events for channels that exist in the DB
+    // but don't have corresponding events (e.g. seeded via direct SQL inserts).
+    // Only runs when SPROUT_RECONCILE_CHANNELS=true (dev/CI environments).
+    // Production relays create channels through the event pipeline and don't need this.
+    if std::env::var("SPROUT_RECONCILE_CHANNELS").is_ok() {
+        let reconcile_state = Arc::clone(&state);
+        tokio::spawn(async move {
+            // Try immediately, then retry every 5s for up to 2 minutes.
+            // Handles CI pattern: relay starts → seed script inserts data → reconciliation.
+            for attempt in 0..24u32 {
+                if attempt > 0 {
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                }
+                match sprout_relay::handlers::side_effects::reconcile_channel_events(
+                    &reconcile_state,
+                )
+                .await
+                {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tracing::debug!(error = %e, "channel reconciliation attempt failed");
+                    }
+                }
+            }
+        });
+    }
 
     // Wire the action sink — must happen after AppState (which creates
     // sub_registry, conn_manager) and before the cron loop starts.

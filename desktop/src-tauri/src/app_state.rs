@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io::Write,
-    sync::{atomic::AtomicU16, Mutex},
+    sync::{atomic::AtomicU16, Arc, Mutex},
 };
 
 use nostr::{Keys, ToBech32};
@@ -13,8 +13,9 @@ use crate::managed_agents::ManagedAgentProcess;
 pub struct AppState {
     pub keys: Mutex<Keys>,
     pub http_client: reqwest::Client,
-    pub configured_api_token: Option<String>,
-    pub session_token: Mutex<Option<String>>,
+    /// Workspace-provided relay URL override. Set by `apply_workspace` on app
+    /// init and takes priority over env vars and compile-time defaults.
+    pub relay_url_override: Mutex<Option<String>>,
     pub managed_agents_store_lock: Mutex<()>,
     pub managed_agent_processes: Mutex<HashMap<String, ManagedAgentProcess>>,
     pub huddle_state: Mutex<HuddleState>,
@@ -29,6 +30,8 @@ pub struct AppState {
     pub audio_output_device: Mutex<Option<String>>,
     /// Port of the localhost media streaming proxy (set during setup).
     pub media_proxy_port: AtomicU16,
+    /// IOKit power assertion state — prevents idle sleep while agents run.
+    pub prevent_sleep: Arc<Mutex<crate::prevent_sleep::PreventSleepState>>,
 }
 
 pub fn build_app_state() -> AppState {
@@ -56,26 +59,23 @@ pub fn build_app_state() -> AppState {
         );
     }
 
-    let api_token = match std::env::var("SPROUT_API_TOKEN") {
-        Ok(token) if !token.trim().is_empty() => Some(token),
-        Ok(_) | Err(std::env::VarError::NotPresent) => None,
-        Err(std::env::VarError::NotUnicode(_)) => {
-            eprintln!("sprout-desktop: SPROUT_API_TOKEN contains invalid UTF-8");
-            None
-        }
-    };
-
     AppState {
         keys: Mutex::new(keys),
-        http_client: reqwest::Client::new(),
-        configured_api_token: api_token,
-        session_token: Mutex::new(None),
+        http_client: reqwest::Client::builder()
+            .pool_idle_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(1)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new()),
+        relay_url_override: Mutex::new(None),
         managed_agents_store_lock: Mutex::new(()),
         managed_agent_processes: Mutex::new(HashMap::new()),
         huddle_state: Mutex::new(HuddleState::default()),
         app_handle: Mutex::new(None),
         audio_output_device: Mutex::new(None),
         media_proxy_port: AtomicU16::new(0),
+        prevent_sleep: Arc::new(Mutex::new(
+            crate::prevent_sleep::PreventSleepState::default(),
+        )),
     }
 }
 
@@ -192,7 +192,7 @@ fn load_key_file(path: &std::path::Path) -> Result<Keys, String> {
 /// On Unix, the file is created with mode 0600 (owner read/write only).
 /// On Windows, default ACLs apply — the app data directory is already
 /// per-user, so the key is not world-readable in practice.
-fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), String> {
+pub(crate) fn save_key_file(path: &std::path::Path, keys: &Keys) -> Result<(), String> {
     use atomic_write_file::AtomicWriteFile;
 
     let nsec = keys

@@ -5,12 +5,15 @@ import { X } from "lucide-react";
 import { useChannelLinks } from "@/features/messages/lib/useChannelLinks";
 import type { ChannelSuggestion } from "@/features/messages/lib/useChannelLinks";
 import { useDrafts } from "@/features/messages/lib/useDrafts";
+import { useEmojiAutocomplete } from "@/features/messages/lib/useEmojiAutocomplete";
+import type { EmojiSuggestion } from "@/features/messages/lib/useEmojiAutocomplete";
 
 import {
   ALLOWED_MEDIA_TYPES,
   useMediaUpload,
 } from "@/features/messages/lib/useMediaUpload";
 import { useMentions } from "@/features/messages/lib/useMentions";
+import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import {
   hasMentionClipboardHtml,
   normalizeMentionClipboardHtml,
@@ -21,6 +24,7 @@ import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import { ChannelAutocomplete } from "./ChannelAutocomplete";
 import { ComposerAttachments } from "./ComposerAttachments";
+import { EmojiAutocomplete } from "./EmojiAutocomplete";
 import {
   MentionAutocomplete,
   type MentionSuggestion,
@@ -48,11 +52,14 @@ type MessageComposerProps = {
     mediaTags?: string[][],
   ) => Promise<void>;
   placeholder?: string;
+  profiles?: UserProfileLookup;
   replyTarget?: {
     author: string;
     body: string;
     id: string;
   } | null;
+  showTopBorder?: boolean;
+  toolbarExtraActions?: React.ReactNode;
   typingParentEventId?: string | null;
   typingRootEventId?: string | null;
 };
@@ -70,7 +77,10 @@ export function MessageComposer({
   onEditSave,
   onSend,
   placeholder,
+  profiles,
   replyTarget = null,
+  showTopBorder = false,
+  toolbarExtraActions,
   typingParentEventId = null,
   typingRootEventId = null,
 }: MessageComposerProps) {
@@ -93,8 +103,9 @@ export function MessageComposer({
   const effectiveDraftKeyRef = React.useRef(effectiveDraftKey);
   effectiveDraftKeyRef.current = effectiveDraftKey;
 
-  const mentions = useMentions(channelId);
+  const mentions = useMentions(channelId, undefined, profiles);
   const channelLinks = useChannelLinks();
+  const emojiAutocomplete = useEmojiAutocomplete();
   const notifyTyping = useTypingBroadcast(
     channelId,
     typingParentEventId,
@@ -121,7 +132,9 @@ export function MessageComposer({
   // ── Refs consumed by Tiptap's submitOnEnter extension ──────────────
   const isAutocompleteOpenRef = React.useRef(false);
   isAutocompleteOpenRef.current =
-    mentions.isMentionOpen || channelLinks.isChannelOpen;
+    mentions.isMentionOpen ||
+    channelLinks.isChannelOpen ||
+    emojiAutocomplete.isEmojiAutocompleteOpen;
 
   const submitMessageRef = React.useRef<() => void>(() => {});
 
@@ -145,10 +158,11 @@ export function MessageComposer({
       setContent(markdown);
       contentRef.current = markdown;
 
-      // Bridge to existing mention/channel detection hooks.
+      // Bridge to existing mention/channel/emoji detection hooks.
       const { cursor } = richText.getTextAndCursor();
       mentions.updateMentionQuery(text, cursor);
       channelLinks.updateChannelQuery(text, cursor);
+      emojiAutocomplete.updateEmojiQuery(text, cursor);
 
       if (text.trim().length > 0) {
         notifyTyping();
@@ -183,6 +197,7 @@ export function MessageComposer({
     setIsEmojiPickerOpen(false);
     mentions.clearMentions();
     channelLinks.clearChannels();
+    emojiAutocomplete.clearEmojis();
 
     return () => {
       if (effectiveDraftKey) {
@@ -235,6 +250,21 @@ export function MessageComposer({
     },
     [
       channelLinks.insertChannel,
+      richText.getTextAndCursor,
+      richText.setContentWithTrailingSpace,
+    ],
+  );
+
+  const applyEmojiInsert = React.useCallback(
+    (suggestion: EmojiSuggestion) => {
+      const { text, cursor } = richText.getTextAndCursor();
+      const result = emojiAutocomplete.insertEmoji(suggestion, text, cursor);
+      richText.setContentWithTrailingSpace(result.nextContent);
+      setContent(result.nextContent);
+      contentRef.current = result.nextContent;
+    },
+    [
+      emojiAutocomplete.insertEmoji,
       richText.getTextAndCursor,
       richText.setContentWithTrailingSpace,
     ],
@@ -296,6 +326,7 @@ export function MessageComposer({
       richText.clearContent();
       mentions.clearMentions();
       channelLinks.clearChannels();
+      emojiAutocomplete.clearEmojis();
       setIsEmojiPickerOpen(false);
 
       try {
@@ -353,6 +384,7 @@ export function MessageComposer({
     media.setPendingImeta([]);
     mentions.clearMentions();
     channelLinks.clearChannels();
+    emojiAutocomplete.clearEmojis();
     setIsEmojiPickerOpen(false);
 
     const sentDraftKey = effectiveDraftKeyRef.current;
@@ -376,6 +408,7 @@ export function MessageComposer({
     channelLinks.clearChannels,
     richText.clearContent,
     richText.setContent,
+    emojiAutocomplete.clearEmojis,
   ]);
   submitMessageRef.current = submitMessage;
 
@@ -395,6 +428,14 @@ export function MessageComposer({
   const handleEditorKeyDown = React.useCallback(
     (event: React.KeyboardEvent<HTMLDivElement>) => {
       // Let autocomplete handle keys first
+      const emojiResult = emojiAutocomplete.handleEmojiKeyDown(event);
+      if (emojiResult.handled) {
+        if (emojiResult.suggestion) {
+          applyEmojiInsert(emojiResult.suggestion);
+        }
+        return;
+      }
+
       const channelResult = channelLinks.handleChannelKeyDown(event);
       if (channelResult.handled) {
         if (channelResult.suggestion) {
@@ -419,6 +460,8 @@ export function MessageComposer({
       }
     },
     [
+      emojiAutocomplete.handleEmojiKeyDown,
+      applyEmojiInsert,
       channelLinks.handleChannelKeyDown,
       applyChannelInsert,
       mentions.handleMentionKeyDown,
@@ -503,13 +546,18 @@ export function MessageComposer({
   return (
     <footer
       className={cn(
-        "relative z-10 -mt-4 px-8 pb-0 pt-0 sm:px-10",
+        "relative z-10 shrink-0 bg-transparent px-4 pb-2 pt-0",
+        showTopBorder ? "border-t border-border/40 pt-3" : "",
         containerClassName,
       )}
     >
-      <div className="flex w-full flex-col gap-3">
+      <div
+        aria-hidden="true"
+        className="absolute inset-x-0 bottom-0 h-5 bg-background"
+      />
+      <div className="relative mx-auto flex w-full max-w-4xl flex-col gap-3">
         <form
-          className="relative rounded-2xl border border-input bg-card px-4 pb-3 pt-4"
+          className="relative isolate rounded-2xl border border-border/50 bg-background/70 px-3 pb-2 pt-3 shadow-[0_4px_24px_rgba(0,0,0,0.08)] backdrop-blur-xl supports-[backdrop-filter]:bg-background/55 dark:shadow-[0_4px_24px_rgba(0,0,0,0.35)] sm:px-4"
           data-testid="message-composer"
           onDragOver={media.handleDragOver}
           onDrop={(e) => {
@@ -519,6 +567,15 @@ export function MessageComposer({
             handleSubmit(event);
           }}
         >
+          <EmojiAutocomplete
+            onSelect={applyEmojiInsert}
+            selectedIndex={emojiAutocomplete.emojiSelectedIndex}
+            suggestions={
+              emojiAutocomplete.isEmojiAutocompleteOpen
+                ? emojiAutocomplete.emojiSuggestions
+                : []
+            }
+          />
           <ChannelAutocomplete
             onSelect={applyChannelInsert}
             selectedIndex={channelLinks.channelSelectedIndex}
@@ -617,6 +674,7 @@ export function MessageComposer({
           <MessageComposerToolbar
             composerDisabled={disabled}
             editor={richText.editor}
+            extraActions={toolbarExtraActions}
             formattingDisabled={disabled}
             isEmojiPickerOpen={isEmojiPickerOpen}
             isFormattingOpen={isFormattingOpen}

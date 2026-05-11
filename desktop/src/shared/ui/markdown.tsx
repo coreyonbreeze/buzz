@@ -10,6 +10,7 @@ import { useChannelNavigation } from "@/shared/context/ChannelNavigationContext"
 import { cn } from "@/shared/lib/cn";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import rehypeImageGallery from "@/shared/lib/rehypeImageGallery";
+import rehypeSearchHighlight from "@/shared/lib/rehypeSearchHighlight";
 import remarkChannelLinks from "@/shared/lib/remarkChannelLinks";
 import remarkMentions from "@/shared/lib/remarkMentions";
 
@@ -30,6 +31,7 @@ type MarkdownProps = {
   content: string;
   imetaByUrl?: ImetaLookup;
   mentionNames?: string[];
+  searchQuery?: string;
   tight?: boolean;
 };
 
@@ -130,72 +132,20 @@ function createMarkdownComponents(
           ? rewriteRelayUrl(posterUrl)
           : undefined;
         return (
-          <DialogPrimitive.Root>
-            <DialogPrimitive.Trigger asChild>
-              <div className="cursor-pointer transition-opacity hover:opacity-90">
-                <VideoPlayer
-                  key={resolvedSrc}
-                  src={resolvedSrc}
-                  poster={resolvedPoster}
-                />
-              </div>
-            </DialogPrimitive.Trigger>
-            <DialogPrimitive.Portal>
-              <DialogPrimitive.Overlay className="fixed inset-0 z-50 bg-black/80 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0" />
-              <DialogPrimitive.Content
-                className="fixed inset-0 z-50 flex items-center justify-center p-8"
-                onPointerDownOutside={(e) => e.preventDefault()}
-                onInteractOutside={(e) => e.preventDefault()}
-              >
-                <DialogPrimitive.Title className="sr-only">
-                  Video preview
-                </DialogPrimitive.Title>
-                <DialogPrimitive.Description className="sr-only">
-                  Full-size video preview. Press Escape or click outside the
-                  video to close.
-                </DialogPrimitive.Description>
-                <DialogPrimitive.Close
-                  className="absolute inset-0 cursor-default"
-                  aria-label="Close lightbox"
-                />
-                {/* biome-ignore lint/a11y/useMediaCaption: user-uploaded video, no captions available */}
-                <video
-                  controls
-                  autoPlay
-                  src={resolvedSrc}
-                  poster={resolvedPoster}
-                  className="relative max-h-[90vh] max-w-[90vw] rounded-lg"
-                />
-                <DialogPrimitive.Close className="absolute right-4 top-4 rounded-full bg-black/50 p-2 text-white/80 transition-colors hover:bg-black/70 hover:text-white focus:outline-none focus:ring-2 focus:ring-white/30">
-                  <svg
-                    aria-hidden="true"
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="20"
-                    height="20"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                  >
-                    <line x1="18" y1="6" x2="6" y2="18" />
-                    <line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
-                  <span className="sr-only">Close</span>
-                </DialogPrimitive.Close>
-              </DialogPrimitive.Content>
-            </DialogPrimitive.Portal>
-          </DialogPrimitive.Root>
+          <VideoPlayer
+            key={resolvedSrc}
+            src={resolvedSrc}
+            poster={resolvedPoster}
+          />
         );
       }
       return (
         <DialogPrimitive.Root>
           <DialogPrimitive.Trigger asChild>
-            <div className="mt-3 flex max-w-sm cursor-pointer items-center justify-center overflow-hidden rounded-2xl border border-border/70 bg-muted/40 transition-opacity hover:opacity-90">
+            <div className="mt-1 max-w-sm cursor-pointer transition-opacity hover:opacity-90">
               <img
                 alt={alt}
-                className="max-h-64 max-w-full object-contain"
+                className="max-h-64 max-w-full rounded-xl object-contain"
                 src={resolvedSrc}
               />
             </div>
@@ -262,7 +212,7 @@ function createMarkdownComponents(
 
       if (isImageOnlyParagraph(childArray)) {
         return (
-          <div className="mt-3 grid max-w-lg grid-cols-2 gap-1.5 [&_br]:hidden [&_div]:mt-0 [&_div]:max-w-none">
+          <div className="mt-1 grid max-w-lg grid-cols-2 gap-1.5 [&_br]:hidden [&_div]:mt-0 [&_div]:max-w-none">
             {imageChildren}
           </div>
         );
@@ -275,7 +225,7 @@ function createMarkdownComponents(
       return <p className={paragraphClassName}>{children}</p>;
     },
     pre: ({ children }) => (
-      <pre className="overflow-x-auto rounded-2xl border border-border/70 bg-muted/60 px-4 py-3 shadow-sm">
+      <pre className="overflow-x-auto rounded-xl border border-border/70 bg-muted/60 px-3 py-1.5 shadow-sm">
         {children}
       </pre>
     ),
@@ -354,6 +304,7 @@ function MarkdownInner({
   content,
   imetaByUrl,
   mentionNames,
+  searchQuery,
   tight = false,
 }: MarkdownProps) {
   const variant: MarkdownVariant = tight
@@ -389,7 +340,14 @@ function MarkdownInner({
   );
 
   // biome-ignore lint/suspicious/noExplicitAny: PluggableList type not directly importable
-  const rehypePlugins = React.useMemo<any[]>(() => [rehypeImageGallery], []);
+  const rehypePlugins = React.useMemo<any[]>(() => {
+    // biome-ignore lint/suspicious/noExplicitAny: PluggableList type not directly importable
+    const plugins: any[] = [rehypeImageGallery];
+    if (searchQuery && searchQuery.trim().length >= 2) {
+      plugins.push([rehypeSearchHighlight, { query: searchQuery }]);
+    }
+    return plugins;
+  }, [searchQuery]);
 
   let processedContent = content;
 
@@ -401,24 +359,28 @@ function MarkdownInner({
     processedContent = `${processedContent}\u200B`;
   }
 
+  const markdownNode = (
+    <ReactMarkdown
+      components={components}
+      remarkPlugins={remarkPlugins}
+      rehypePlugins={rehypePlugins}
+    >
+      {processedContent}
+    </ReactMarkdown>
+  );
+
   return (
     <div
       className={cn(
         tight
-          ? "max-w-none break-words text-sm leading-5 text-foreground/90 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*]:my-1"
+          ? "max-w-none break-words text-sm leading-5 text-foreground/90 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*]:my-0.5"
           : compact
             ? "max-w-none break-words text-[15px] leading-6 text-foreground/90 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*]:my-1.5"
             : "max-w-none break-words text-sm leading-7 text-foreground/90 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0 [&>*]:my-3",
         className,
       )}
     >
-      <ReactMarkdown
-        components={components}
-        remarkPlugins={remarkPlugins}
-        rehypePlugins={rehypePlugins}
-      >
-        {processedContent}
-      </ReactMarkdown>
+      {markdownNode}
     </div>
   );
 }
@@ -432,7 +394,8 @@ export const Markdown = React.memo(
     prev.tight === next.tight &&
     shallowArrayEqual(prev.mentionNames, next.mentionNames) &&
     shallowArrayEqual(prev.channelNames, next.channelNames) &&
-    prev.imetaByUrl === next.imetaByUrl,
+    prev.imetaByUrl === next.imetaByUrl &&
+    prev.searchQuery === next.searchQuery,
 );
 
 Markdown.displayName = "Markdown";
