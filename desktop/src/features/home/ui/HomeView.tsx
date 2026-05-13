@@ -102,7 +102,6 @@ export function HomeView({
   onRefresh,
 }: HomeViewProps) {
   const [filter, setFilter] = React.useState<InboxFilter>("all");
-  const [searchValue, setSearchValue] = React.useState("");
   const [selectedItemId, setSelectedItemId] = React.useState<string | null>(
     null,
   );
@@ -171,17 +170,8 @@ export function HomeView({
     [currentPubkey, feed, feedProfiles],
   );
   const filteredItems = React.useMemo(() => {
-    const normalizedQuery = searchValue.trim().toLowerCase();
-
-    return inboxItems.filter((item) => {
-      const matchesFilter = matchesInboxFilter(item, filter);
-      const matchesQuery =
-        normalizedQuery.length === 0 ||
-        item.searchableText.includes(normalizedQuery);
-
-      return matchesFilter && matchesQuery;
-    });
-  }, [filter, inboxItems, searchValue]);
+    return inboxItems.filter((item) => matchesInboxFilter(item, filter));
+  }, [filter, inboxItems]);
   const selectedItem =
     filteredItems.find((item) => item.id === selectedItemId) ?? null;
   const contextMessages = React.useMemo<InboxContextMessage[]>(() => {
@@ -299,12 +289,10 @@ export function HomeView({
           filter={filter}
           items={filteredItems}
           onFilterChange={setFilter}
-          onSearchChange={setSearchValue}
           onSelect={(itemId) => {
             setSelectedItemId(itemId);
             markDone(itemId);
           }}
-          searchValue={searchValue}
           selectedId={selectedItemId}
         />
 

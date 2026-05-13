@@ -30,7 +30,6 @@ export type InboxItem = {
   latestActivityAt: number;
   mentionNames: string[];
   preview: string;
-  searchableText: string;
   senderLabel: string;
   subject: string;
   timestampLabel: string;
@@ -328,16 +327,6 @@ export function buildInboxItems({
         latestActivityAt: group.latestActivityAt,
         mentionNames,
         preview,
-        searchableText: [
-          senderLabel,
-          subject,
-          preview,
-          ...group.items.map(feedPreview),
-          channelLabel ?? "",
-          categoryLabel,
-        ]
-          .join(" ")
-          .toLowerCase(),
         senderLabel,
         subject,
         timestampLabel: formatInboxTimestamp(group.latestActivityAt),

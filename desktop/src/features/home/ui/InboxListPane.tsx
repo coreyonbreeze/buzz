@@ -1,9 +1,6 @@
-import { Search } from "lucide-react";
-
 import type { InboxFilter, InboxItem } from "@/features/home/lib/inbox";
 import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
-import { Input } from "@/shared/ui/input";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
 const FILTER_OPTIONS: Array<{ label: string; value: InboxFilter }> = [
@@ -19,9 +16,7 @@ type InboxListPaneProps = {
   filter: InboxFilter;
   items: InboxItem[];
   onFilterChange: (filter: InboxFilter) => void;
-  onSearchChange: (value: string) => void;
   onSelect: (itemId: string) => void;
-  searchValue: string;
   selectedId: string | null;
 };
 
@@ -30,26 +25,13 @@ export function InboxListPane({
   filter,
   items,
   onFilterChange,
-  onSearchChange,
   onSelect,
-  searchValue,
   selectedId,
 }: InboxListPaneProps) {
   return (
     <section className="flex min-h-0 min-w-0 flex-col overflow-hidden border-r border-border/70 bg-background">
-      <div className="border-b border-border/70 px-4 pb-4 pt-3">
-        <div className="relative">
-          <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
-          <Input
-            className="h-10 rounded-md border-border/70 bg-background pl-9 shadow-none"
-            data-testid="home-inbox-search"
-            onChange={(event) => onSearchChange(event.target.value)}
-            placeholder="Search mail"
-            value={searchValue}
-          />
-        </div>
-
-        <div className="mt-3 flex flex-wrap gap-1.5">
+      <div className="border-b border-border/70 px-4 pb-3 pt-3">
+        <div className="flex flex-wrap gap-1.5">
           {FILTER_OPTIONS.map((option) => (
             <Button
               className="h-7 rounded-none px-1 text-[11px] font-medium text-muted-foreground data-[active=true]:text-foreground"
@@ -77,7 +59,7 @@ export function InboxListPane({
                 No messages found
               </p>
               <p className="mt-1 text-sm text-muted-foreground">
-                Try a different search or switch back to all mail.
+                Switch back to all mail to see more messages.
               </p>
             </div>
           </div>
