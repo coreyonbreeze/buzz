@@ -50,6 +50,8 @@ type MembersSidebarMemberCardProps = {
   onViewActivity?: (pubkey: string) => void;
   presenceStatus?: PresenceStatus | null;
   profileAvatarUrl?: string | null;
+  /** Respond-to mode from the bot's profile (for bots not managed by current user). */
+  profileRespondTo?: string | null;
 };
 
 function formatRoleLabel(member: ChannelMember, memberIsBot: boolean) {
@@ -66,6 +68,17 @@ function formatRespondToLabel(agent: ManagedAgent) {
       return "Anyone";
     case "allowlist":
       return `Allowlist (${agent.respondToAllowlist.length})`;
+    default:
+      return "Owner only";
+  }
+}
+
+function formatProfileRespondToLabel(respondTo: string) {
+  switch (respondTo) {
+    case "anyone":
+      return "Anyone";
+    case "allowlist":
+      return "Allowlist";
     default:
       return "Owner only";
   }
@@ -101,6 +114,7 @@ export function MembersSidebarMemberCard({
   onViewActivity,
   presenceStatus,
   profileAvatarUrl,
+  profileRespondTo,
 }: MembersSidebarMemberCardProps) {
   const roleLabel = formatRoleLabel(member, memberIsBot);
   const disabled = isActionPending || isArchived;
@@ -159,6 +173,14 @@ export function MembersSidebarMemberCard({
                   {formatRespondToLabel(managedAgent)}
                 </Badge>
               </>
+            ) : memberIsBot && profileRespondTo ? (
+              <Badge
+                className="shrink-0"
+                data-testid={`sidebar-managed-agent-respond-to-${member.pubkey}`}
+                variant="outline"
+              >
+                {formatProfileRespondToLabel(profileRespondTo)}
+              </Badge>
             ) : null}
           </div>
           <p className="truncate font-mono text-[10px] text-muted-foreground/50">

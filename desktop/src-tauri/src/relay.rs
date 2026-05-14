@@ -209,8 +209,10 @@ fn build_profile_event(
     display_name: &str,
     avatar_url: Option<&str>,
     auth_tag_json: Option<&str>,
+    respond_to: Option<&str>,
 ) -> Result<nostr::Event, String> {
-    let builder = crate::events::build_profile(Some(display_name), None, avatar_url, None, None)?;
+    let builder =
+        crate::events::build_profile(Some(display_name), None, avatar_url, None, None, respond_to)?;
 
     let builder = if let Some(tag_json) = auth_tag_json {
         // Bridge nostr 0.37 PublicKey → nostr 0.36 PublicKey via hex encoding.
@@ -250,9 +252,10 @@ pub async fn sync_managed_agent_profile(
     display_name: &str,
     avatar_url: Option<&str>,
     auth_tag: Option<&str>, // NIP-OA auth tag JSON
+    respond_to: Option<&str>,
 ) -> Result<(), String> {
     // Build a signed kind:0 profile event (with optional NIP-OA auth tag).
-    let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag)?;
+    let event = build_profile_event(agent_keys, display_name, avatar_url, auth_tag, respond_to)?;
     let event_json = event.as_json();
     let body_bytes = event_json.into_bytes();
 
@@ -413,7 +416,7 @@ mod tests {
     fn profile_event_with_valid_auth_tag() {
         let agent_keys = nostr::Keys::generate();
         let tag_json = make_valid_auth_tag(&agent_keys);
-        let event = build_profile_event(&agent_keys, "TestBot", None, Some(&tag_json))
+        let event = build_profile_event(&agent_keys, "TestBot", None, Some(&tag_json), None)
             .expect("should succeed with a valid auth tag");
 
         // Exactly one "auth" tag must be present.
@@ -431,7 +434,7 @@ mod tests {
     #[test]
     fn profile_event_without_auth_tag() {
         let agent_keys = nostr::Keys::generate();
-        let event = build_profile_event(&agent_keys, "TestBot", None, None)
+        let event = build_profile_event(&agent_keys, "TestBot", None, None, None)
             .expect("should succeed without an auth tag");
 
         // No "auth" tags should be present.
@@ -450,7 +453,7 @@ mod tests {
         let agent_keys = nostr::Keys::generate();
         // Structurally valid JSON array but with a bogus signature — verification must fail.
         let bad_json = format!(r#"["auth","{}","","{}"]"#, "a".repeat(64), "b".repeat(128));
-        let result = build_profile_event(&agent_keys, "TestBot", None, Some(&bad_json));
+        let result = build_profile_event(&agent_keys, "TestBot", None, Some(&bad_json), None);
         assert!(result.is_err(), "should reject an invalid auth tag");
         assert!(
             result.unwrap_err().contains("verification failed"),

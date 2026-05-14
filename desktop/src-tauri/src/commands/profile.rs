@@ -76,7 +76,10 @@ pub async fn update_profile(
         .as_deref()
         .or_else(|| current.get("nip05").and_then(Value::as_str));
 
-    let builder = events::build_profile(dn, name, picture, ab, nip05)?;
+    // Preserve any existing respond_to from the current profile (user profiles
+    // don't set this — it's only relevant for agent kind:0 events).
+    let respond_to = current.get("respond_to").and_then(Value::as_str);
+    let builder = events::build_profile(dn, name, picture, ab, nip05, respond_to)?;
     submit_event(builder, &state).await?;
 
     // Re-fetch to return canonical profile.

@@ -208,6 +208,10 @@ export function MembersSidebar({
           memberProfilesQuery.data?.profiles[member.pubkey.toLowerCase()]
             ?.avatarUrl ?? null
         }
+        profileRespondTo={
+          memberProfilesQuery.data?.profiles[member.pubkey.toLowerCase()]
+            ?.respondTo ?? null
+        }
       />
     );
   }

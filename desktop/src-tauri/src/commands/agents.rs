@@ -423,6 +423,7 @@ pub async fn create_managed_agent(
         &name,
         avatar_url.as_deref(),
         auth_tag.as_deref(),
+        Some(input.respond_to.as_str()),
     )
     .await)
         .err();

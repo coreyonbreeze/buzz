@@ -24,6 +24,9 @@ pub struct UserProfileSummaryInfo {
     pub display_name: Option<String>,
     pub avatar_url: Option<String>,
     pub nip05_handle: Option<String>,
+    /// Respond-to mode from the agent's kind:0 profile (e.g. "anyone", "allowlist", "owner-only").
+    /// Only present for bot profiles that have published this field.
+    pub respond_to: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]

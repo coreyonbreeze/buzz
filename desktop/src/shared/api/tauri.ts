@@ -61,6 +61,7 @@ type RawUserProfileSummary = {
   display_name: string | null;
   avatar_url: string | null;
   nip05_handle: string | null;
+  respond_to: string | null;
 };
 
 type RawUsersBatchResponse = {
@@ -412,6 +413,7 @@ function fromRawUserProfileSummary(
     displayName: profile.display_name,
     avatarUrl: profile.avatar_url,
     nip05Handle: profile.nip05_handle,
+    respondTo: profile.respond_to,
   };
 }
 

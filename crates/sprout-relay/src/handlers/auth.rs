@@ -212,6 +212,32 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                         );
                     }
                 }
+
+                // If we confirmed this is an agent, fix any existing channel
+                // memberships that have "member" role instead of "bot". The query
+                // is a no-op (0 rows) once all roles are correct.
+                if auth_ctx.agent_owner_pubkey.is_some() {
+                    let agent_bytes = pubkey.serialize().to_vec();
+                    match state.db.upgrade_member_to_bot(&agent_bytes).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            info!(
+                                conn_id = %conn_id,
+                                agent = %pubkey.to_hex(),
+                                count = n,
+                                "upgraded agent member roles to bot"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                conn_id = %conn_id,
+                                agent = %pubkey.to_hex(),
+                                error = %e,
+                                "failed to upgrade agent member roles"
+                            );
+                        }
+                    }
+                }
             }
 
             info!(conn_id = %conn_id, pubkey = %pubkey.to_hex(), "NIP-42 auth successful");

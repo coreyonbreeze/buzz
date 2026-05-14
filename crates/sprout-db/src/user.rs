@@ -342,6 +342,18 @@ pub async fn is_agent_owner(
     Ok(row.unwrap_or(false))
 }
 
+/// Check whether `pubkey` is a known agent (has `agent_owner_pubkey` set).
+/// Returns `false` if the pubkey doesn't exist in the users table.
+pub async fn is_agent(pool: &PgPool, pubkey: &[u8]) -> Result<bool> {
+    let row = sqlx::query_scalar::<_, bool>(
+        "SELECT agent_owner_pubkey IS NOT NULL FROM users WHERE pubkey = $1",
+    )
+    .bind(pubkey)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.unwrap_or(false))
+}
+
 /// Set the channel_add_policy for a user.
 /// Returns an error if the pubkey is not found (rows_affected == 0).
 /// Returns an error if `policy` is not one of the valid ENUM values.

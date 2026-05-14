@@ -1223,15 +1223,19 @@ async fn handle_join_request(event: &Event, state: &Arc<AppState>) -> anyhow::Re
         return Ok(());
     }
 
+    // Detect agents: if the joining pubkey has an agent_owner_pubkey set in the
+    // users table, assign them the "bot" role instead of "member". This ensures
+    // that agents are correctly classified for all users, not just the bot owner.
+    let role = if state.db.is_agent(&actor_bytes).await.unwrap_or(false) {
+        sprout_db::channel::MemberRole::Bot
+    } else {
+        sprout_db::channel::MemberRole::Member
+    };
+
     // Add as member (idempotent — add_member handles duplicates).
     state
         .db
-        .add_member(
-            channel_id,
-            &actor_bytes,
-            sprout_db::channel::MemberRole::Member,
-            None,
-        )
+        .add_member(channel_id, &actor_bytes, role, None)
         .await?;
     state.invalidate_membership(channel_id, &actor_bytes);
 

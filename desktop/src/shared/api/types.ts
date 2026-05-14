@@ -115,6 +115,7 @@ export type UserProfileSummary = {
   displayName: string | null;
   avatarUrl: string | null;
   nip05Handle: string | null;
+  respondTo: string | null;
 };
 
 export type UsersBatchResponse = {

@@ -201,6 +201,22 @@ export function ChannelScreen({
     );
     const pLookup = new Map<string, string>();
     const rLookup = new Map<string, RespondToMode>();
+
+    // Populate from profile data (works for all bots, including other users' bots).
+    const profiles = messageProfilesQuery.data?.profiles;
+    if (profiles) {
+      for (const [pubkey, profile] of Object.entries(profiles)) {
+        if (
+          profile.respondTo === "anyone" ||
+          profile.respondTo === "allowlist" ||
+          profile.respondTo === "owner-only"
+        ) {
+          rLookup.set(pubkey.toLowerCase(), profile.respondTo);
+        }
+      }
+    }
+
+    // Override with local managed agent data (authoritative for own bots).
     for (const agent of agents) {
       const key = agent.pubkey.toLowerCase();
       rLookup.set(key, agent.respondTo);
@@ -208,7 +224,11 @@ export function ChannelScreen({
       if (pName) pLookup.set(key, pName);
     }
     return { personaLookup: pLookup, respondToLookup: rLookup };
-  }, [managedAgentsQuery.data, personasQuery.data]);
+  }, [
+    managedAgentsQuery.data,
+    messageProfilesQuery.data?.profiles,
+    personasQuery.data,
+  ]);
   const timelineMessages = React.useMemo(
     () =>
       formatTimelineMessages(

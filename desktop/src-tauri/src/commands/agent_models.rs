@@ -125,6 +125,7 @@ pub async fn update_managed_agent(
         let record = find_managed_agent_mut(&mut records, &input.pubkey)?;
 
         let mut name_changed = false;
+        let mut respond_to_changed = false;
         if let Some(name_update) = input.name {
             let trimmed = name_update.trim().to_string();
             if !trimmed.is_empty() && trimmed != record.name {
@@ -188,6 +189,9 @@ pub async fn update_managed_agent(
                     .to_string(),
             );
         }
+        if prospective_mode != record.respond_to {
+            respond_to_changed = true;
+        }
         record.respond_to = prospective_mode;
         // Preserve the persisted allowlist across mode toggles — only replace
         // when the caller explicitly supplied a new list.
@@ -204,14 +208,22 @@ pub async fn update_managed_agent(
             .find(|r| r.pubkey == input.pubkey)
             .ok_or_else(|| format!("agent {} not found", input.pubkey))?;
 
-        let sync_params = if name_changed {
+        let sync_params = if name_changed || respond_to_changed {
             let agent_keys = Keys::parse(&record.private_key_nsec)
                 .map_err(|e| format!("failed to parse agent keys: {e}"))?;
             let relay_url = record.relay_url.clone();
             let display_name = record.name.clone();
             let avatar_url = managed_agent_avatar_url(&record.agent_command);
             let auth_tag = record.auth_tag.clone();
-            Some((agent_keys, relay_url, display_name, avatar_url, auth_tag))
+            let respond_to = record.respond_to.as_str().to_string();
+            Some((
+                agent_keys,
+                relay_url,
+                display_name,
+                avatar_url,
+                auth_tag,
+                respond_to,
+            ))
         } else {
             None
         };
@@ -222,7 +234,9 @@ pub async fn update_managed_agent(
 
     // Phase 2: relay profile sync (async, best-effort, outside lock)
     let profile_sync_error =
-        if let Some((agent_keys, relay_url, display_name, avatar_url, auth_tag)) = sync_params {
+        if let Some((agent_keys, relay_url, display_name, avatar_url, auth_tag, respond_to)) =
+            sync_params
+        {
             match sync_managed_agent_profile(
                 &state,
                 &relay_url,
@@ -230,12 +244,13 @@ pub async fn update_managed_agent(
                 &display_name,
                 avatar_url.as_deref(),
                 auth_tag.as_deref(),
+                Some(respond_to.as_str()),
             )
             .await
             {
                 Ok(()) => None,
                 Err(e) => {
-                    eprintln!("sprout-desktop: relay profile sync failed after rename: {e}");
+                    eprintln!("sprout-desktop: relay profile sync failed after update: {e}");
                     Some(e)
                 }
             }

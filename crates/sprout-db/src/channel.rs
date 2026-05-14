@@ -487,6 +487,26 @@ pub async fn remove_member(
     Ok(())
 }
 
+/// Upgrade all active "member" role entries for `pubkey` to "bot" across all channels.
+/// Returns the number of rows updated. This is used when an agent's owner relationship
+/// is first materialized (NIP-OA auth) to fix pre-existing memberships that were
+/// incorrectly assigned the "member" role.
+pub async fn upgrade_member_to_bot(pool: &PgPool, pubkey: &[u8]) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        UPDATE channel_members
+        SET role = 'bot'::member_role
+        WHERE pubkey = $1
+          AND role = 'member'::member_role
+          AND removed_at IS NULL
+        "#,
+    )
+    .bind(pubkey)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// Returns `true` if the given pubkey is an active member of the channel.
 pub async fn is_member(pool: &PgPool, channel_id: Uuid, pubkey: &[u8]) -> Result<bool> {
     let row = sqlx::query(

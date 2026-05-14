@@ -406,6 +406,11 @@ impl Db {
         channel::remove_member(&self.pool, channel_id, pubkey, actor_pubkey).await
     }
 
+    /// Upgrade all active "member" role entries for `pubkey` to "bot" across all channels.
+    pub async fn upgrade_member_to_bot(&self, pubkey: &[u8]) -> Result<u64> {
+        channel::upgrade_member_to_bot(&self.pool, pubkey).await
+    }
+
     /// Returns `true` if the pubkey is an active member.
     pub async fn is_member(&self, channel_id: Uuid, pubkey: &[u8]) -> Result<bool> {
         channel::is_member(&self.pool, channel_id, pubkey).await
@@ -586,6 +591,11 @@ impl Db {
     /// Check whether `actor_pubkey` is the agent owner of `target_pubkey`.
     pub async fn is_agent_owner(&self, target_pubkey: &[u8], actor_pubkey: &[u8]) -> Result<bool> {
         user::is_agent_owner(&self.pool, target_pubkey, actor_pubkey).await
+    }
+
+    /// Check whether `pubkey` is a known agent (has `agent_owner_pubkey` set).
+    pub async fn is_agent(&self, pubkey: &[u8]) -> Result<bool> {
+        user::is_agent(&self.pool, pubkey).await
     }
 
     /// Set the channel_add_policy for a user.

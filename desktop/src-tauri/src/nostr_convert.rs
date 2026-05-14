@@ -299,6 +299,10 @@ pub fn users_batch_from_events(
                 .map(str::to_string),
             avatar_url: v.get("picture").and_then(Value::as_str).map(str::to_string),
             nip05_handle: v.get("nip05").and_then(Value::as_str).map(str::to_string),
+            respond_to: v
+                .get("respond_to")
+                .and_then(Value::as_str)
+                .map(str::to_string),
         };
         profiles.insert(pk.clone(), summary);
     }

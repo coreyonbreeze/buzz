@@ -106,6 +106,7 @@ export function mergeAgentNamesIntoProfiles(
         displayName: agent.name,
         avatarUrl: merged[key]?.avatarUrl ?? null,
         nip05Handle: merged[key]?.nip05Handle ?? null,
+        respondTo: merged[key]?.respondTo ?? null,
       };
     }
   }
