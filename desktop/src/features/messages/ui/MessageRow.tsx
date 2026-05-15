@@ -289,7 +289,6 @@ export const MessageRow = React.memo(
           data-message-id={message.id}
           data-testid="message-row"
         >
-          {actionBarNode}
           {isThreadReplyLayout ? (
             <div className="flex min-w-0 items-start gap-1.5">
               {message.pubkey ? (
@@ -391,6 +390,7 @@ export const MessageRow = React.memo(
               </div>
             </>
           )}
+          {actionBarNode}
         </article>
       </div>
     );
