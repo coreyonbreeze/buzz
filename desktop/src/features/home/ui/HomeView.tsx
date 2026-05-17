@@ -312,10 +312,12 @@ export function HomeView({
     );
   }
 
-  const canReply =
+  const canReact =
     selectedItem !== null &&
     selectedItem.item.channelId !== null &&
-    availableChannelIds.has(selectedItem.item.channelId) &&
+    availableChannelIds.has(selectedItem.item.channelId);
+  const canReply =
+    canReact &&
     selectedItem.item.kind !== 45001 &&
     selectedItem.item.kind !== 45003;
   const disabledReplyReason =
@@ -461,7 +463,7 @@ export function HomeView({
             }
           }}
           onToggleReaction={
-            canReply
+            canReact
               ? async (message, emoji, remove) => {
                   await toggleReactionMutation.mutateAsync({
                     emoji,
