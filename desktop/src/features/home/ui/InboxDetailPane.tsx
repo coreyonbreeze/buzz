@@ -86,6 +86,16 @@ export function InboxDetailPane({
   const [isFocusHighlightVisible, setIsFocusHighlightVisible] =
     React.useState(true);
   const selectedItemId = item?.id ?? null;
+  const selectedMessageScrollKey = React.useMemo(() => {
+    if (!selectedItemId) {
+      return null;
+    }
+
+    const selectedMessageIndex = messages.findIndex(
+      (message) => message.isSelected,
+    );
+    return `${selectedItemId}:${selectedMessageIndex}:${messages.length}`;
+  }, [messages, selectedItemId]);
 
   const focusComposer = React.useCallback(() => {
     window.requestAnimationFrame(() => {
@@ -113,6 +123,20 @@ export function InboxDetailPane({
       window.clearTimeout(timeoutId);
     };
   }, [selectedItemId]);
+
+  React.useEffect(() => {
+    if (!selectedMessageScrollKey) {
+      return;
+    }
+
+    window.requestAnimationFrame(() => {
+      detailPaneRef.current
+        ?.querySelector<HTMLElement>(
+          '[data-testid="home-inbox-selected-message"]',
+        )
+        ?.scrollIntoView({ block: "center" });
+    });
+  }, [selectedMessageScrollKey]);
 
   if (!item) {
     return (
