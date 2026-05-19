@@ -3,16 +3,20 @@
 //! All commands deal with *the local user's own* mesh-LLM state:
 //! - the persisted iroh endpoint id,
 //! - the persisted compute-sharing preferences (the avatar-menu sliders),
-//! - explicit toggle/save calls invoked when the user changes the prefs.
+//! - explicit toggle/save calls invoked when the user changes the prefs,
+//! - publishing / deleting the user's kind:31990 compute-offer event.
 //!
-//! Discovering and connecting to *other* members' offers happens through the
-//! existing relay WebSocket pipeline, not these commands.
+//! Discovering *other* members' offers happens through the relay
+//! WebSocket pipeline already exposed by `relayClientSession.ts`.
 
+use nostr::{EventBuilder, Kind, Tag};
 use serde::Serialize;
+use sprout_core::kind::KIND_MESH_LLM_DISCOVERY;
 use tauri::{AppHandle, State};
 
 use crate::app_state::AppState;
 use crate::mesh_llm;
+use crate::relay::submit_event;
 
 /// Result type for mesh-LLM commands: errors are surfaced as user-facing
 /// strings by the frontend.
@@ -69,4 +73,75 @@ pub async fn mesh_relay_iroh_url(
     mesh_llm::fetch_iroh_relay_url(&relay_ws_url)
         .await
         .map_err(|e| e.to_string())
+}
+
+// ── Publisher ──────────────────────────────────────────────────────────────
+
+/// Result of `mesh_publish_offer` — surface enough state so the frontend
+/// can show the user *which* offer just went on the wire.
+#[derive(Debug, Clone, Serialize)]
+pub struct PublishOfferResult {
+    /// `event_id` returned by the relay on accept.
+    pub event_id: String,
+    /// `true` if compute-sharing is currently enabled. When false, the
+    /// command publishes an *empty-content* kind:31990 event at the same
+    /// `(pubkey, d_tag)` address, which under NIP-33 is the canonical way
+    /// to indicate "this offer is no longer active". Consumers that observe
+    /// the empty content drop the offer from their cache.
+    pub published_offer: bool,
+}
+
+/// Publish (or revoke) the user's kind:31990 compute-offer event.
+///
+/// Reads the current prefs from disk and the local iroh endpoint id. If
+/// `enabled = true`, builds a kind:31990 with the offer envelope content
+/// and the matching `d` tag; signs and POSTs via the existing
+/// [`submit_event`] pipeline (NIP-98-authenticated to the configured relay).
+/// If `enabled = false`, publishes the *same address* with empty content
+/// to tell consumers the offer has been retired.
+///
+/// `iroh_relay_url` should be the relay's NIP-11 `iroh_relay_url` (fetched
+/// via [`mesh_relay_iroh_url`] at session start). The offer envelope
+/// carries it so consumers know where to dial.
+#[tauri::command]
+pub async fn mesh_publish_offer(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    iroh_relay_url: String,
+) -> CmdResult<PublishOfferResult> {
+    // Load prefs + endpoint key. These are sync; complete before any await.
+    let prefs = mesh_llm::offer::load_prefs(&app).map_err(|e| e.to_string())?;
+    let endpoint_key =
+        mesh_llm::load_or_create_endpoint_key(&app).map_err(|e| e.to_string())?;
+    let endpoint_id_str = endpoint_key.public().to_string();
+
+    let d_tag = prefs.d_tag.clone();
+    let d_tag_tag = Tag::parse(["d", &d_tag]).map_err(|e| format!("d tag: {e}"))?;
+
+    let (content, published_offer) = if prefs.enabled {
+        let offer = prefs
+            .build_offer(&endpoint_id_str, &iroh_relay_url)
+            .ok_or_else(|| {
+                "build_offer returned None despite enabled=true (logic bug)".to_string()
+            })?;
+        if !offer.is_publishable() {
+            return Err("offer envelope failed publishable check".to_string());
+        }
+        let json = serde_json::to_string(&offer).map_err(|e| format!("serialise: {e}"))?;
+        (json, true)
+    } else {
+        // NIP-33 "delete by replace": same (pubkey, kind, d) address, empty
+        // content. Consumers must treat an empty content as 'offer
+        // withdrawn'.
+        (String::new(), false)
+    };
+
+    let builder = EventBuilder::new(Kind::Custom(KIND_MESH_LLM_DISCOVERY as u16), content)
+        .tags(vec![d_tag_tag]);
+
+    let res = submit_event(builder, &state).await?;
+    Ok(PublishOfferResult {
+        event_id: res.event_id,
+        published_offer,
+    })
 }

@@ -85,8 +85,25 @@ export function MeshComputeSettingsCard() {
     setSaving(true);
     setError(null);
     try {
+      // Save first so a failed publish leaves the prefs in a sane state.
       await invoke("mesh_set_sharing_prefs", { prefs: next });
       setPrefs(next);
+
+      // Probe the connected relay for its iroh_relay_url. If it doesn't
+      // advertise mesh-LLM at all, the offer can't be published — but the
+      // local prefs are still saved (the user might re-connect to a
+      // mesh-capable relay later).
+      const relayWsUrl = await invoke<string>("get_relay_ws_url");
+      const irohUrl = await invoke<string | null>("mesh_relay_iroh_url", {
+        relayWsUrl,
+      });
+      if (irohUrl) {
+        await invoke("mesh_publish_offer", { irohRelayUrl: irohUrl });
+      } else if (next.enabled) {
+        setError(
+          "Saved locally, but this relay does not advertise iroh_relay_url — your offer will not be visible to other members until the relay is configured for mesh-LLM.",
+        );
+      }
     } catch (e) {
       setError(String(e));
     } finally {

@@ -459,6 +459,7 @@ pub fn run() {
             mesh_get_sharing_prefs,
             mesh_set_sharing_prefs,
             mesh_relay_iroh_url,
+            mesh_publish_offer,
             discover_acp_providers,
             discover_managed_agent_prereqs,
             sign_event,
