@@ -79,7 +79,7 @@ Agents are colleagues, not haunted cron jobs.
 
 ## Quick start
 
-You'll need [Docker](https://docs.docker.com/get-docker/) and [Hermit](https://cashapp.github.io/hermit/) (or Rust 1.88+, Node 24+, pnpm 10+, `just`).
+You'll need [Docker](https://docs.docker.com/get-docker/) and [Hermit](https://cashapp.github.io/hermit/) (or Rust 1.91+, Node 24+, pnpm 10+, `just`).
 
 **Once:**
 ```bash

@@ -58,9 +58,14 @@ url             = { workspace = true }
 moka            = { workspace = true }
 metrics         = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
+iroh-relay = { version = "=1.0.0-rc.0", features = ["server"] }
 
 [features]
 dev = ["sprout-auth/dev"]
+# Enables APIs that only exist on a locally-patched fork of iroh-relay
+# (notably the per-client max lifetime hook used by Step 3). Off by default
+# so the published rc.0 crate compiles unmodified.
+patched-iroh-relay = []
 
 [dev-dependencies]
 sprout-core = { workspace = true, features = ["test-utils"] }
