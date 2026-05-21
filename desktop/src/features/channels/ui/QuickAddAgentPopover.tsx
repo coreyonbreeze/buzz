@@ -515,7 +515,7 @@ export function QuickAddAgentPopover({
                       className="shrink-0"
                     >
                       <Toggle
-                        className="h-6 rounded-full px-2.5 text-[11px]"
+                        className="h-8 rounded-full px-3 text-xs"
                         onPressedChange={(pressed) =>
                           handleTeamToggle(team, pressed)
                         }
