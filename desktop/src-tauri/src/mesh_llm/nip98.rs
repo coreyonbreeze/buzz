@@ -8,6 +8,11 @@
 //! Both sides use the same `sprout_auth::nip98_canonical_url` helper, so
 //! path-prefix / trailing-slash / localhost-vs-127.0.0.1 drift cannot
 //! create undebuggable per-connection denials.
+//!
+//! Reserved for the deferred iroh dial path (upstream mesh-llm PR A); the
+//! verifier side in `sprout_relay::iroh_relay` is already wired and tested.
+//! Once the dial lands these become call-sites, not dead code.
+#![allow(dead_code)]
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
