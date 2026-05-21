@@ -497,7 +497,7 @@ export function QuickAddAgentPopover({
               {selectMode ? (
                 <motion.div
                   key="team-chips"
-                  className="flex flex-1 items-center gap-1.5 overflow-x-auto py-1.5"
+                  className="flex flex-1 items-center gap-1.5 overflow-x-auto"
                   initial={{ opacity: 0 }}
                   animate={{ opacity: 1 }}
                   exit={{ opacity: 0 }}
