@@ -595,7 +595,7 @@ export function QuickAddAgentPopover({
                     <button
                       aria-selected={isInChannel || isSelected}
                       className={cn(
-                        "flex w-full items-center gap-2.5 px-3 py-1.5 text-left text-sm transition-colors",
+                        "flex w-full items-center px-3 py-1.5 text-left text-sm transition-colors",
                         isInChannel
                           ? "cursor-default opacity-50"
                           : "cursor-pointer hover:bg-accent focus-visible:bg-accent focus-visible:outline-none",
@@ -612,7 +612,7 @@ export function QuickAddAgentPopover({
                     >
                       {!isInChannel ? (
                         <motion.div
-                          animate={{ width: selectMode ? 16 : 0, opacity: selectMode ? 1 : 0 }}
+                          animate={{ width: selectMode ? 16 : 0, marginRight: selectMode ? 8 : 0, opacity: selectMode ? 1 : 0 }}
                           initial={false}
                           transition={{ duration: 0.15 }}
                           className="shrink-0 overflow-hidden"
@@ -629,24 +629,26 @@ export function QuickAddAgentPopover({
                           </div>
                         </motion.div>
                       ) : null}
-                      <QuickAddAgentAvatar
-                        avatarUrl={item.avatarUrl}
-                        label={item.label}
-                        isRunning={item.kind !== "persona"}
-                      />
-                      <span className="min-w-0 flex-1 truncate font-medium">
-                        {item.label}
-                      </span>
-                      {isInChannel ? (
-                        <Check className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                      ) : item.kind === "running-available" && !selectMode ? (
-                        <span className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                          running
+                      <div className="flex min-w-0 flex-1 items-center gap-2.5">
+                        <QuickAddAgentAvatar
+                          avatarUrl={item.avatarUrl}
+                          label={item.label}
+                          isRunning={item.kind !== "persona"}
+                        />
+                        <span className="min-w-0 flex-1 truncate font-medium">
+                          {item.label}
                         </span>
-                      ) : null}
-                      {isItemPending ? (
-                        <Spinner className="h-3.5 w-3.5 shrink-0 text-primary" />
-                      ) : null}
+                        {isInChannel ? (
+                          <Check className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                        ) : item.kind === "running-available" && !selectMode ? (
+                          <span className="shrink-0 rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
+                            running
+                          </span>
+                        ) : null}
+                        {isItemPending ? (
+                          <Spinner className="h-3.5 w-3.5 shrink-0 text-primary" />
+                        ) : null}
+                      </div>
                     </button>
                   );
                 })}
