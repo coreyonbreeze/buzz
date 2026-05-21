@@ -1,4 +1,4 @@
-use crate::client::SproutClient;
+use crate::client::{normalize_write_response, SproutClient};
 use crate::error::CliError;
 use crate::validate::validate_hex64;
 
@@ -43,7 +43,22 @@ pub async fn cmd_get_users(
         "limit": authors.len()
     });
     let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let profiles: Vec<serde_json::Value> = events
+        .iter()
+        .filter_map(|e| {
+            let content_str = e.get("content")?.as_str()?;
+            let mut profile: serde_json::Value = serde_json::from_str(content_str).ok()?;
+            if let Some(obj) = profile.as_object_mut() {
+                obj.insert(
+                    "pubkey".to_string(),
+                    serde_json::json!(e.get("pubkey").and_then(|v| v.as_str()).unwrap_or("")),
+                );
+            }
+            Some(profile)
+        })
+        .collect();
+    println!("{}", serde_json::to_string(&profiles).unwrap_or_default());
     Ok(())
 }
 
@@ -72,26 +87,32 @@ async fn search_by_name(client: &SproutClient, query: &str) -> Result<(), CliErr
     };
 
     let lower_query = query.to_ascii_lowercase();
-    let matches: Vec<&serde_json::Value> = arr
+    let profiles: Vec<serde_json::Value> = arr
         .iter()
-        .filter(|event| {
-            let Some(content_str) = event.get("content").and_then(|v| v.as_str()) else {
-                return false;
-            };
-            let Ok(content) = serde_json::from_str::<serde_json::Value>(content_str) else {
-                return false;
-            };
+        .filter_map(|event| {
+            let content_str = event.get("content").and_then(|v| v.as_str())?;
+            let content: serde_json::Value = serde_json::from_str(content_str).ok()?;
             let display_name = content
                 .get("display_name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let name = content.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            display_name.to_ascii_lowercase().contains(&lower_query)
-                || name.to_ascii_lowercase().contains(&lower_query)
+            if !display_name.to_ascii_lowercase().contains(&lower_query)
+                && !name.to_ascii_lowercase().contains(&lower_query)
+            {
+                return None;
+            }
+            let mut profile = content;
+            if let Some(obj) = profile.as_object_mut() {
+                obj.insert(
+                    "pubkey".to_string(),
+                    serde_json::json!(event.get("pubkey").and_then(|v| v.as_str()).unwrap_or("")),
+                );
+            }
+            Some(profile)
         })
         .collect();
-
-    let output = serde_json::to_string(&matches).expect("serializing parsed JSON values");
+    let output = serde_json::to_string(&profiles).unwrap_or_default();
     println!("{output}");
     Ok(())
 }
@@ -158,7 +179,7 @@ pub async fn cmd_set_profile(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -209,7 +230,19 @@ pub async fn cmd_get_presence(client: &SproutClient, pubkeys_csv: &str) -> Resul
         "limit": pubkeys.len()
     });
     let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    let presence: Vec<serde_json::Value> = events
+        .iter()
+        .map(|e| {
+            serde_json::json!({
+                "pubkey": e.get("pubkey").and_then(|v| v.as_str()).unwrap_or(""),
+                "status": e.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                "updated_at": e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
+            })
+        })
+        .collect();
+    let output = serde_json::to_string(&presence).unwrap_or_default();
+    println!("{output}");
     Ok(())
 }
 
@@ -224,7 +257,7 @@ pub async fn cmd_set_presence(client: &SproutClient, status: &str) -> Result<(),
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 

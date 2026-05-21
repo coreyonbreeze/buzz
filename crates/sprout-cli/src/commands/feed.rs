@@ -1,4 +1,6 @@
-use crate::client::SproutClient;
+use std::cmp::Reverse;
+
+use crate::client::{normalize_events, SproutClient};
 use crate::error::CliError;
 
 /// Get activity feed — query events mentioning our pubkey (via p-tag).
@@ -21,7 +23,9 @@ pub async fn cmd_get_feed(
     }
 
     let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    events.sort_by_key(|e| Reverse(e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0)));
+    println!("{}", normalize_events(&events));
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use nostr::PublicKey;
 use sprout_sdk::{DiffMeta, ThreadRef, VoteDirection};
 use uuid::Uuid;
 
-use crate::client::SproutClient;
+use crate::client::{normalize_events, normalize_write_response, SproutClient};
 use crate::error::CliError;
 use crate::validate::{
     infer_language, parse_event_id, parse_uuid, read_or_stdin, truncate_diff,
@@ -234,7 +234,7 @@ pub async fn cmd_get_messages(
     let limit = limit.unwrap_or(50).min(200);
 
     let mut filter = serde_json::json!({
-        "kinds": [9, 40002],
+        "kinds": [9, 40002, 40008, 45001, 45003],
         "#h": [channel_id],
         "limit": limit
     });
@@ -255,7 +255,9 @@ pub async fn cmd_get_messages(
     }
 
     let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("{}", normalize_events(&events));
     Ok(())
 }
 
@@ -270,15 +272,23 @@ pub async fn cmd_get_thread(
     validate_hex64(event_id)?;
     let limit = limit.unwrap_or(100).min(500);
 
-    // Get the root event and all replies referencing it via e-tag
-    let filter = serde_json::json!({
-        "kinds": [9, 40002],
+    // Two filters ORed in a single HTTP call:
+    // 1. Replies referencing this event via e-tag (no kind restriction)
+    // 2. The root event itself by ID
+    let reply_filter = serde_json::json!({
+        "kinds": [9, 40002, 40003, 40008, 45003],
         "#h": [channel_id],
         "#e": [event_id],
         "limit": limit
     });
-    let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let root_filter = serde_json::json!({
+        "ids": [event_id],
+        "limit": 1
+    });
+    let resp = client.query_multi(&[reply_filter, root_filter]).await?;
+    let mut events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    events.sort_by_key(|e| e.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0));
+    println!("{}", normalize_events(&events));
     Ok(())
 }
 
@@ -289,11 +299,13 @@ pub async fn cmd_search(
 ) -> Result<(), CliError> {
     let limit = limit.unwrap_or(20).min(100);
     let filter = serde_json::json!({
+        "kinds": [9, 40002, 45001, 45003],
         "search": query,
         "limit": limit
     });
     let resp = client.query(&filter).await?;
-    println!("{resp}");
+    let events: Vec<serde_json::Value> = serde_json::from_str(&resp).unwrap_or_default();
+    println!("{}", normalize_events(&events));
     Ok(())
 }
 
@@ -304,7 +316,6 @@ pub async fn cmd_search(
 pub struct SendMessageParams {
     pub channel_id: String,
     pub content: String,
-    #[allow(dead_code)] // reserved for future kind routing
     pub kind: Option<u16>,
     pub reply_to: Option<String>,
     pub broadcast: bool,
@@ -370,20 +381,44 @@ pub async fn cmd_send_message(
     merge_mentions(&mut merged, &auto_resolved, MENTION_CAP);
     let mention_refs: Vec<&str> = merged.iter().map(|s| s.as_str()).collect();
 
-    let builder = sprout_sdk::build_message(
-        channel_uuid,
-        &final_content,
-        thread_ref.as_ref(),
-        &mention_refs,
-        p.broadcast,
-        &media_tags,
-    )
-    .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?;
+    let builder = match p.kind {
+        Some(45001) => {
+            sprout_sdk::build_forum_post(channel_uuid, &final_content, &mention_refs, &media_tags)
+                .map_err(|e| CliError::Other(format!("build_forum_post failed: {e}")))?
+        }
+        Some(45003) => {
+            let tr = thread_ref.as_ref().ok_or_else(|| {
+                CliError::Usage("--reply-to is required for forum comments (kind 45003)".into())
+            })?;
+            sprout_sdk::build_forum_comment(
+                channel_uuid,
+                &final_content,
+                tr,
+                &mention_refs,
+                &media_tags,
+            )
+            .map_err(|e| CliError::Other(format!("build_forum_comment failed: {e}")))?
+        }
+        None | Some(9) => sprout_sdk::build_message(
+            channel_uuid,
+            &final_content,
+            thread_ref.as_ref(),
+            &mention_refs,
+            p.broadcast,
+            &media_tags,
+        )
+        .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?,
+        Some(k) => {
+            return Err(CliError::Usage(format!(
+                "--kind {k} is not supported (use 9, 45001, or 45003)"
+            )))
+        }
+    };
 
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -474,7 +509,7 @@ pub async fn cmd_send_diff_message(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -491,7 +526,7 @@ pub async fn cmd_delete_message(client: &SproutClient, event_id: &str) -> Result
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -514,7 +549,7 @@ pub async fn cmd_edit_message(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
@@ -545,7 +580,7 @@ pub async fn cmd_vote_on_post(
     let event = client.sign_event(builder)?;
 
     let resp = client.submit_event(event).await?;
-    println!("{resp}");
+    println!("{}", normalize_write_response(&resp));
     Ok(())
 }
 
