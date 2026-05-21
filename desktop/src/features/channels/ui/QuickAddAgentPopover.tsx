@@ -682,7 +682,7 @@ export function QuickAddAgentPopover({
             {multiSelectActive ? (
               <motion.div
                 key="batch-add"
-                className="pointer-events-none absolute bottom-0 left-0 right-0 px-3 pb-2 pt-8 bg-gradient-to-t from-popover to-transparent"
+                className="pointer-events-none absolute bottom-0 left-0 right-0 px-3 pb-1.5 pt-8 bg-gradient-to-t from-popover to-transparent"
                 initial={{ opacity: 0, y: 8 }}
                 animate={{ opacity: 1, y: 0 }}
                 exit={{ opacity: 0, y: 8 }}
