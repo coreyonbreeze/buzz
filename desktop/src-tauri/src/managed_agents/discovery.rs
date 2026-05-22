@@ -25,8 +25,10 @@ pub(crate) struct KnownAcpProvider {
     pub adapter_install_commands: &'static [&'static str],
     /// Link to docs/repo for manual instructions.
     pub install_instructions_url: &'static str,
-    /// Human-readable guidance for the UI.
-    pub install_hint: &'static str,
+    /// Human-readable hint about installing the CLI binary.
+    pub cli_install_hint: &'static str,
+    /// Human-readable hint about installing the ACP adapter.
+    pub adapter_install_hint: &'static str,
 }
 
 const GOOSE_AVATAR_URL: &str = "https://goose-docs.ai/img/logo_dark.png";
@@ -70,7 +72,8 @@ const KNOWN_ACP_PROVIDERS: &[KnownAcpProvider] = &[
         cli_install_commands: &["curl -fsSL https://github.com/block-open-source/goose/releases/download/stable/download_cli.sh | CONFIGURE=false bash"],
         adapter_install_commands: &[],
         install_instructions_url: "https://block.github.io/goose/",
-        install_hint: "Install Goose via the official install script.",
+        cli_install_hint: "Install Goose via the official install script.",
+        adapter_install_hint: "",
     },
     KnownAcpProvider {
         id: "claude",
@@ -84,7 +87,8 @@ const KNOWN_ACP_PROVIDERS: &[KnownAcpProvider] = &[
         cli_install_commands: &["curl -fsSL https://claude.ai/install.sh | bash"],
         adapter_install_commands: &["npm install -g @agentclientprotocol/claude-agent-acp"],
         install_instructions_url: "https://github.com/agentclientprotocol/claude-agent-acp",
-        install_hint: "Install the Claude Code ACP adapter via npm.",
+        cli_install_hint: "Install the Claude Code CLI via the official install script.",
+        adapter_install_hint: "Install the Claude Code ACP adapter via npm.",
     },
     KnownAcpProvider {
         id: "codex",
@@ -98,7 +102,8 @@ const KNOWN_ACP_PROVIDERS: &[KnownAcpProvider] = &[
         cli_install_commands: &["curl -fsSL https://chatgpt.com/codex/install.sh | sh"],
         adapter_install_commands: &["npm install -g @zed-industries/codex-acp"],
         install_instructions_url: "https://github.com/zed-industries/codex-acp",
-        install_hint: "Install the Codex ACP adapter via npm.",
+        cli_install_hint: "Install the Codex CLI via the official install script.",
+        adapter_install_hint: "Install the Codex ACP adapter via npm.",
     },
     KnownAcpProvider {
         id: "sprout-agent",
@@ -112,7 +117,8 @@ const KNOWN_ACP_PROVIDERS: &[KnownAcpProvider] = &[
         cli_install_commands: &[],
         adapter_install_commands: &[],
         install_instructions_url: "https://github.com/block/sprout",
-        install_hint: "Ships with the Sprout desktop app.",
+        cli_install_hint: "Ships with the Sprout desktop app.",
+        adapter_install_hint: "",
     },
 ];
 
@@ -454,51 +460,19 @@ pub fn discover_acp_providers() -> Vec<AcpProviderCatalogEntry> {
             let can_auto_install = !provider.cli_install_commands.is_empty()
                 || !provider.adapter_install_commands.is_empty();
 
+            let cli_hint = provider.cli_install_hint;
+            let adapter_hint = provider.adapter_install_hint;
             let install_hint = match availability {
-                AcpAvailabilityStatus::Available => provider.install_hint.to_string(),
-                _ if provider.underlying_cli.is_none() => provider.install_hint.to_string(),
-                AcpAvailabilityStatus::CliMissing => {
-                    let has_cli_cmds = !provider.cli_install_commands.is_empty();
-                    if has_cli_cmds {
-                        format!(
-                            "ACP adapter found, but the {} CLI is missing. Install will set up the CLI.",
-                            provider.label
-                        )
-                    } else {
-                        format!(
-                            "ACP adapter found, but the {} CLI is missing. Install it manually.",
-                            provider.label
-                        )
-                    }
-                }
-                AcpAvailabilityStatus::AdapterMissing => {
-                    let has_adapter_cmds = !provider.adapter_install_commands.is_empty();
-                    if has_adapter_cmds {
-                        format!(
-                            "Install the {} ACP adapter via the Install button, or follow the manual instructions.",
-                            provider.label
-                        )
-                    } else {
-                        provider.install_hint.to_string()
-                    }
-                }
+                AcpAvailabilityStatus::Available => cli_hint.to_string(),
+                AcpAvailabilityStatus::CliMissing => cli_hint.to_string(),
+                AcpAvailabilityStatus::AdapterMissing => adapter_hint.to_string(),
                 AcpAvailabilityStatus::NotInstalled => {
-                    let has_cli_cmds = !provider.cli_install_commands.is_empty();
-                    let has_adapter_cmds = !provider.adapter_install_commands.is_empty();
-                    match (has_cli_cmds, has_adapter_cmds) {
-                        (true, true) => format!(
-                            "Install will set up the {} CLI and its ACP adapter.",
-                            provider.label
-                        ),
-                        (true, false) => format!(
-                            "Install will set up the {} CLI. Install the ACP adapter manually.",
-                            provider.label
-                        ),
-                        (false, true) => format!(
-                            "Install will set up the ACP adapter. Install the {} CLI manually.",
-                            provider.label
-                        ),
-                        (false, false) => provider.install_hint.to_string(),
+                    if !cli_hint.is_empty() && !adapter_hint.is_empty() {
+                        format!("{cli_hint} {adapter_hint}")
+                    } else if !cli_hint.is_empty() {
+                        cli_hint.to_string()
+                    } else {
+                        adapter_hint.to_string()
                     }
                 }
             };
