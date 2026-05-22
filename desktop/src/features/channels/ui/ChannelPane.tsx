@@ -417,35 +417,33 @@ export const ChannelPane = React.memo(function ChannelPane({
                   isOpen={isTerminalOpen}
                 />
               ) : null}
-              {hasComposerBotActivity || hasTypingActivity ? (
-                <div className="h-7 bg-background px-4 pb-1 pt-0 sm:px-6">
-                  <div className="flex h-full w-full items-center gap-2">
-                    {hasComposerBotActivity ? (
-                      <div className="shrink-0">
-                        <BotActivityComposerAction
-                          agents={activityAgents}
-                          channelId={activeChannel?.id ?? null}
-                          onOpenAgentSession={onOpenAgentSession}
-                          openAgentSessionPubkey={openAgentSessionPubkey}
-                          profiles={profiles}
-                          typingBotPubkeys={composerBotTypingPubkeys}
-                          variant="inline"
-                        />
-                      </div>
-                    ) : null}
-                    {hasTypingActivity ? (
-                      <TypingIndicatorRow
-                        channel={activeChannel}
-                        className="min-w-0 flex-1 px-0 py-0"
-                        currentPubkey={currentPubkey}
+              <div className="h-7 bg-background px-4 pb-1 pt-0 sm:px-6">
+                <div className="flex h-full w-full items-center gap-2">
+                  {hasComposerBotActivity ? (
+                    <div className="shrink-0">
+                      <BotActivityComposerAction
+                        agents={activityAgents}
+                        channelId={activeChannel?.id ?? null}
+                        onOpenAgentSession={onOpenAgentSession}
+                        openAgentSessionPubkey={openAgentSessionPubkey}
                         profiles={profiles}
-                        typingPubkeys={typingPubkeys}
-                        variant="activity"
+                        typingBotPubkeys={composerBotTypingPubkeys}
+                        variant="inline"
                       />
-                    ) : null}
-                  </div>
+                    </div>
+                  ) : null}
+                  {hasTypingActivity ? (
+                    <TypingIndicatorRow
+                      channel={activeChannel}
+                      className="min-w-0 flex-1 px-0 py-0"
+                      currentPubkey={currentPubkey}
+                      profiles={profiles}
+                      typingPubkeys={typingPubkeys}
+                      variant="activity"
+                    />
+                  ) : null}
                 </div>
-              ) : null}
+              </div>
             </div>
           </div>
         )}
