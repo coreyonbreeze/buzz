@@ -93,7 +93,7 @@ export function TerminalPanel({ channelId, isOpen }: TerminalPanelProps) {
           className="overflow-hidden px-4 pb-2 pt-1"
         >
           <div
-            className="pointer-events-auto relative flex h-full flex-col overflow-hidden rounded-2xl border border-border/50 shadow-[0_4px_24px_rgba(0,0,0,0.08)] dark:shadow-[0_4px_24px_rgba(0,0,0,0.35)]"
+            className="pointer-events-auto relative flex h-full flex-col overflow-hidden rounded-2xl border border-border/50 bg-terminal shadow-[0_4px_24px_rgba(0,0,0,0.08)] dark:shadow-[0_4px_24px_rgba(0,0,0,0.35)]"
             onPointerDown={handleResizeStart}
           >
             {/* Terminal content */}
