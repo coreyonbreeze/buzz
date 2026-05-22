@@ -96,6 +96,17 @@ export function MembersSidebar({
     enabled: open && rawMembers.length > 0,
   });
 
+  const presence = memberPresenceQuery.data;
+  const sortedBots = React.useMemo(() => {
+    if (!presence) return bots;
+    return [...bots].sort((a, b) => {
+      const aOnline = presence[normalizePubkey(a.pubkey)] === "online" ? 0 : 1;
+      const bOnline = presence[normalizePubkey(b.pubkey)] === "online" ? 0 : 1;
+      if (aOnline !== bOnline) return aOnline - bOnline;
+      return formatMemberName(a).localeCompare(formatMemberName(b));
+    });
+  }, [bots, presence]);
+
   const selfMember =
     rawMembers.find((member) => member.pubkey === currentPubkey) ?? null;
   const canManageMembers =
@@ -122,11 +133,11 @@ export function MembersSidebar({
   );
   const controllableManagedBots = React.useMemo(
     () =>
-      bots.flatMap((member) => {
+      sortedBots.flatMap((member) => {
         const agent = managedAgentByPubkey.get(normalizePubkey(member.pubkey));
         return agent ? [agent] : [];
       }),
-    [bots, managedAgentByPubkey],
+    [sortedBots, managedAgentByPubkey],
   );
   const canRemoveMember = React.useCallback(
     (member: ChannelMember) => {
@@ -141,7 +152,7 @@ export function MembersSidebar({
   );
   const removableManagedBots = React.useMemo(
     () =>
-      bots.flatMap((member) => {
+      sortedBots.flatMap((member) => {
         if (!canRemoveMember(member)) {
           return [];
         }
@@ -149,7 +160,7 @@ export function MembersSidebar({
         const agent = managedAgentByPubkey.get(normalizePubkey(member.pubkey));
         return agent ? [agent] : [];
       }),
-    [bots, canRemoveMember, managedAgentByPubkey],
+    [sortedBots, canRemoveMember, managedAgentByPubkey],
   );
   const {
     actionErrorMessage,
@@ -279,7 +290,7 @@ export function MembersSidebar({
               <div className="flex items-center gap-2">
                 <h2 className="text-sm font-semibold tracking-tight">Bots</h2>
                 <span className="rounded-full bg-muted px-2 py-0.5 text-[11px] font-medium text-muted-foreground">
-                  {bots.length}
+                  {sortedBots.length}
                 </span>
                 <div className="ml-auto flex items-center gap-0.5">
                   {canAddAgents ? (
@@ -322,8 +333,8 @@ export function MembersSidebar({
                 </div>
               </div>
               <div className="space-y-2" data-testid="members-sidebar-bots">
-                {bots.length > 0 ? (
-                  bots.map((member) => renderMemberCard(member, true))
+                {sortedBots.length > 0 ? (
+                  sortedBots.map((member) => renderMemberCard(member, true))
                 ) : (
                   <p className="text-sm text-muted-foreground">
                     {membersQuery.isLoading
