@@ -1,3 +1,4 @@
+import * as React from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
@@ -11,7 +12,6 @@ import {
   createManagedAgent,
   deleteManagedAgent,
   discoverAcpProviders,
-  discoverAllAcpProviders,
   discoverBackendProviders,
   discoverManagedAgentPrereqs,
   getManagedAgentLog,
@@ -38,6 +38,7 @@ import {
   updateTeam,
 } from "@/shared/api/tauriTeams";
 import type {
+  AcpProvider,
   AgentPersona,
   AgentTeam,
   CreateManagedAgentInput,
@@ -74,7 +75,6 @@ export const managedAgentsQueryKey = ["managed-agents"] as const;
 export const personasQueryKey = ["personas"] as const;
 export const teamsQueryKey = ["teams"] as const;
 export const acpProvidersQueryKey = ["acp-providers"] as const;
-export const allAcpProvidersQueryKey = ["all-acp-providers"] as const;
 export const managedAgentPrereqsQueryKey = ["managed-agent-prereqs"] as const;
 export const backendProvidersQueryKey = ["backend-providers"] as const;
 
@@ -108,12 +108,16 @@ export function useAcpProvidersQuery() {
   });
 }
 
-export function useAllAcpProvidersQuery() {
-  return useQuery({
-    queryKey: allAcpProvidersQueryKey,
-    queryFn: discoverAllAcpProviders,
-    staleTime: 60_000,
-  });
+export function useAvailableAcpProviders() {
+  const query = useAcpProvidersQuery();
+  const available = React.useMemo(
+    () =>
+      (query.data ?? []).filter(
+        (p): p is AcpProvider => p.availability === "available",
+      ),
+    [query.data],
+  );
+  return { ...query, data: available };
 }
 
 export function useInstallAcpRuntimeMutation() {
@@ -122,9 +126,6 @@ export function useInstallAcpRuntimeMutation() {
     mutationFn: (providerId: string) => installAcpRuntime(providerId),
     onSettled: () => {
       void queryClient.invalidateQueries({ queryKey: acpProvidersQueryKey });
-      void queryClient.invalidateQueries({
-        queryKey: allAcpProvidersQueryKey,
-      });
     },
   });
 }

@@ -1,5 +1,4 @@
 import type { AcpProvider, ManagedAgentPrereqs } from "@/shared/api/types";
-import { useAllAcpProvidersQuery } from "@/features/agents/hooks";
 import { cn } from "@/shared/lib/cn";
 import { Input } from "@/shared/ui/input";
 import { Textarea } from "@/shared/ui/textarea";
@@ -41,19 +40,16 @@ export function CreateAgentRuntimeProviderField({
   providersLoading,
   selectedProvider,
   selectedProviderId,
+  unavailableCount,
   onProviderChange,
 }: {
   providers: AcpProvider[];
   providersLoading: boolean;
   selectedProvider: AcpProvider | null;
   selectedProviderId: string;
+  unavailableCount: number;
   onProviderChange: (value: string) => void;
 }) {
-  const allProvidersQuery = useAllAcpProvidersQuery();
-  const unavailableCount = (allProvidersQuery.data ?? []).filter(
-    (p) => p.availability !== "available",
-  ).length;
-
   return (
     <div className="space-y-1.5">
       <label className="text-sm font-medium" htmlFor="agent-provider">

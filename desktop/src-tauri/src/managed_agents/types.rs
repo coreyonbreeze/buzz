@@ -275,17 +275,6 @@ pub struct ManagedAgentLogResponse {
     pub log_path: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct AcpProviderInfo {
-    pub id: String,
-    pub label: String,
-    pub command: String,
-    pub binary_path: String,
-    pub default_args: Vec<String>,
-    /// MCP server binary override. `None` means use the default (`sprout-mcp-server`).
-    pub mcp_command: Option<String>,
-}
-
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AcpAvailabilityStatus {

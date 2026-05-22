@@ -10,7 +10,7 @@ import {
 } from "lucide-react";
 
 import {
-  useAllAcpProvidersQuery,
+  useAcpProvidersQuery,
   useInstallAcpRuntimeMutation,
 } from "@/features/agents/hooks";
 import { describeResolvedCommand } from "@/features/agents/ui/agentUi";
@@ -165,9 +165,9 @@ function ProviderRow({
           </>
         )}
 
-        {installSuccess ? (
+        {installSuccess && provider.availability !== "available" ? (
           <p className="mt-2 rounded-lg border border-green-500/30 bg-green-500/10 px-3 py-1.5 text-xs text-green-700 dark:text-green-400">
-            Installed successfully. Re-run Doctor to verify.
+            Installed successfully!
           </p>
         ) : null}
         {installError ? (
@@ -181,7 +181,7 @@ function ProviderRow({
 }
 
 export function DoctorSettingsPanel() {
-  const providersQuery = useAllAcpProvidersQuery();
+  const providersQuery = useAcpProvidersQuery();
   const providers = providersQuery.data ?? [];
   const isRefreshing = providersQuery.isFetching;
   const installMutation = useInstallAcpRuntimeMutation();
@@ -208,7 +208,7 @@ export function DoctorSettingsPanel() {
             [providerId]: {
               success: false,
               error: lastStep
-                ? `Step "${lastStep.step}" failed: ${lastStep.stderr || "unknown error"}`
+                ? `Step "${lastStep.step}" failed: ${lastStep.stderr || lastStep.stdout || "unknown error"}`
                 : "Install failed with no output.",
             },
           }));

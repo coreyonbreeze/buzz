@@ -1,24 +1,24 @@
+use std::io::Read;
+use std::sync::atomic::Ordering::{Acquire, Relaxed};
 use tauri::{AppHandle, State};
 
 use crate::{
     app_state::AppState,
     managed_agents::{
-        command_availability, discover_local_acp_providers, AcpProviderCatalogEntry, AcpProviderInfo,
-        DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, InstallStepResult,
-        ManagedAgentPrereqsInfo, RelayAgentInfo, DEFAULT_ACP_COMMAND, DEFAULT_MCP_COMMAND,
+        command_availability, AcpProviderCatalogEntry, DiscoverManagedAgentPrereqsRequest,
+        InstallRuntimeResult, InstallStepResult, ManagedAgentPrereqsInfo, RelayAgentInfo,
+        DEFAULT_ACP_COMMAND, DEFAULT_MCP_COMMAND,
     },
     nostr_convert,
     relay::query_relay,
 };
 
-#[tauri::command]
-pub fn discover_acp_providers() -> Vec<AcpProviderInfo> {
-    discover_local_acp_providers()
-}
+static INSTALL_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 #[tauri::command]
-pub fn discover_all_acp_providers() -> Vec<AcpProviderCatalogEntry> {
-    crate::managed_agents::discover_all_acp_providers()
+pub fn discover_acp_providers() -> Vec<AcpProviderCatalogEntry> {
+    crate::managed_agents::discover_acp_providers()
 }
 
 #[tauri::command]
@@ -29,7 +29,20 @@ pub async fn install_acp_runtime(provider_id: String) -> Result<InstallRuntimeRe
 }
 
 fn install_acp_runtime_blocking(provider_id: &str) -> Result<InstallRuntimeResult, String> {
-    let provider = crate::managed_agents::known_acp_provider(provider_id)
+    // Prevent concurrent installs.
+    INSTALL_IN_PROGRESS
+        .compare_exchange(false, true, Acquire, Relaxed)
+        .map_err(|_| "an install is already in progress".to_string())?;
+
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            INSTALL_IN_PROGRESS.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _guard = Guard;
+
+    let provider = crate::managed_agents::known_acp_provider_exact(provider_id)
         .ok_or_else(|| format!("unknown provider: {provider_id}"))?;
 
     let mut steps = Vec::new();
@@ -112,55 +125,75 @@ fn run_install_command(step: &str, command: &str) -> InstallStepResult {
         }
     };
 
+    // Drain stdout/stderr on background threads to prevent pipe buffer deadlock.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stdout_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut buf = String::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_string(&mut buf);
+        }
+        buf
+    });
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let wait_thread = std::thread::spawn(move || {
+        let status = child.wait();
+        let _ = tx.send(status);
+        // Return child so the caller can kill it on timeout.
+    });
+
     // 5-minute timeout for install commands.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child
-                    .stdout
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        let _ = std::io::Read::read_to_string(&mut s, &mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr_raw = child
-                    .stderr
-                    .take()
-                    .map(|mut s| {
-                        let mut buf = String::new();
-                        let _ = std::io::Read::read_to_string(&mut s, &mut buf);
-                        buf
-                    })
-                    .unwrap_or_default();
-                let stderr = truncate_output(stderr_raw);
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            // Timeout: the wait_thread still holds the child; signal via the
+            // channel being dropped and use a sentinel. We cannot kill here
+            // since `child` was moved. Instead, we drop the receiver and join
+            // the threads, letting them finish naturally, then report timeout.
+            drop(rx);
+            let _ = wait_thread.join();
+            let stdout = stdout_thread.join().unwrap_or_default();
+            let stderr = stderr_thread.join().unwrap_or_default();
+            let _ = stdout; // discard; timed out
+            let _ = stderr;
+            return InstallStepResult {
+                step: step.to_string(),
+                command: command.to_string(),
+                success: false,
+                stdout: String::new(),
+                stderr: "install command timed out after 5 minutes".to_string(),
+                exit_code: None,
+            };
+        }
+
+        match rx.recv_timeout(std::time::Duration::from_millis(200).min(remaining)) {
+            Ok(Ok(status)) => {
+                let _ = wait_thread.join();
+                let stdout = stdout_thread.join().unwrap_or_default();
+                let stderr_raw = stderr_thread.join().unwrap_or_default();
                 return InstallStepResult {
                     step: step.to_string(),
                     command: command.to_string(),
                     success: status.success(),
                     stdout: truncate_output(stdout),
-                    stderr,
+                    stderr: truncate_output(stderr_raw),
                     exit_code: status.code(),
                 };
             }
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return InstallStepResult {
-                        step: step.to_string(),
-                        command: command.to_string(),
-                        success: false,
-                        stdout: String::new(),
-                        stderr: "install command timed out after 5 minutes".to_string(),
-                        exit_code: None,
-                    };
-                }
-                std::thread::sleep(std::time::Duration::from_millis(200));
-            }
-            Err(e) => {
+            Ok(Err(e)) => {
+                let _ = wait_thread.join();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
                 return InstallStepResult {
                     step: step.to_string(),
                     command: command.to_string(),
@@ -170,17 +203,45 @@ fn run_install_command(step: &str, command: &str) -> InstallStepResult {
                     exit_code: None,
                 };
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // Still running; loop and check deadline again.
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // wait_thread dropped sender without sending — shouldn't happen.
+                let _ = wait_thread.join();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return InstallStepResult {
+                    step: step.to_string(),
+                    command: command.to_string(),
+                    success: false,
+                    stdout: String::new(),
+                    stderr: "internal error: wait thread disconnected".to_string(),
+                    exit_code: None,
+                };
+            }
         }
     }
 }
 
-/// Cap output at 2 KB to avoid flooding the UI with large error dumps.
+/// Cap output to head + tail to avoid flooding the UI with large error dumps,
+/// while preserving the most useful parts of the output.
 fn truncate_output(s: String) -> String {
-    if s.len() > 2048 {
-        format!("{}... (truncated)", &s[..2048])
-    } else {
-        s
+    const HEAD: usize = 512;
+    const TAIL: usize = 1024;
+    const LIMIT: usize = HEAD + TAIL;
+    if s.len() <= LIMIT {
+        return s;
     }
+    let head_end = s.floor_char_boundary(HEAD);
+    let tail_start = s.floor_char_boundary(s.len().saturating_sub(TAIL));
+    let omitted = tail_start - head_end;
+    format!(
+        "{}\n... ({omitted} bytes omitted) ...\n{}",
+        &s[..head_end],
+        &s[tail_start..]
+    )
 }
 
 #[tauri::command]

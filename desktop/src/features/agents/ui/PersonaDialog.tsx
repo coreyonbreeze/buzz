@@ -266,6 +266,17 @@ export function PersonaDialog({
     importErrorMessage,
   });
 
+  const selectedProvider = providers.find((p) => p.id === provider);
+  const providerWarning =
+    selectedProvider && selectedProvider.availability !== "available" ? (
+      <p className="text-xs text-warning">
+        {selectedProvider.availability === "adapter_missing"
+          ? `${selectedProvider.label} CLI is installed but the ACP adapter is missing.`
+          : `${selectedProvider.label} is not installed.`}{" "}
+        Visit Settings &gt; Doctor to set it up.
+      </p>
+    ) : null;
+
   return (
     <Dialog onOpenChange={handleOpenChange} open={open}>
       <DialogContent className="max-w-2xl overflow-hidden p-0">
@@ -367,19 +378,7 @@ export function PersonaDialog({
                 be pre-selected. Unavailable runtimes can be installed from
                 Settings &gt; Doctor.
               </p>
-              {(() => {
-                const selected = providers.find((p) => p.id === provider);
-                if (!selected || selected.availability === "available")
-                  return null;
-                return (
-                  <p className="text-xs text-warning">
-                    {selected.availability === "adapter_missing"
-                      ? `${selected.label} CLI is installed but the ACP adapter is missing.`
-                      : `${selected.label} is not installed.`}{" "}
-                    Visit Settings &gt; Doctor to set it up.
-                  </p>
-                );
-              })()}
+              {providerWarning}
             </div>
 
             <div className="space-y-1.5">

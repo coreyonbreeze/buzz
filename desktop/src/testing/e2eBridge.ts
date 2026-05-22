@@ -4,6 +4,10 @@ import { finalizeEvent } from "nostr-tools/pure";
 import { parse as yamlParse } from "yaml";
 
 import type { RelayEvent } from "@/shared/api/types";
+import type {
+  RawAcpProviderCatalogEntry,
+  RawInstallRuntimeResult,
+} from "@/shared/api/tauri";
 
 type TestIdentity = {
   privateKey: string;
@@ -30,6 +34,8 @@ type E2eConfig = {
   mode?: "mock" | "relay";
   mock?: {
     acpProviders?: MockAcpProvider[];
+    acpProvidersCatalog?: RawAcpProviderCatalogEntry[];
+    installAcpRuntimeResult?: RawInstallRuntimeResult;
     managedAgentPrereqs?: {
       acp?: MockCommandAvailability;
       mcp?: MockCommandAvailability;
@@ -316,42 +322,6 @@ type RawCreateManagedAgentResponse = {
 type RawManagedAgentLog = {
   content: string;
   log_path: string;
-};
-
-type RawAcpProvider = {
-  id: string;
-  label: string;
-  command: string;
-  binary_path: string;
-  default_args: string[];
-  mcp_command: string | null;
-};
-
-type RawAcpProviderCatalogEntry = {
-  id: string;
-  label: string;
-  avatar_url: string;
-  availability: "available" | "adapter_missing" | "not_installed";
-  command: string | null;
-  binary_path: string | null;
-  default_args: string[];
-  mcp_command: string | null;
-  install_hint: string;
-  install_instructions_url: string;
-  can_auto_install: boolean;
-  underlying_cli_path: string | null;
-};
-
-type RawInstallRuntimeResult = {
-  success: boolean;
-  steps: Array<{
-    step: string;
-    command: string;
-    success: boolean;
-    stdout: string;
-    stderr: string;
-    exit_code: number | null;
-  }>;
 };
 
 type RawCommandAvailability = {
@@ -3495,42 +3465,11 @@ async function handleListRelayAgents(): Promise<RawRelayAgent[]> {
 
 async function handleDiscoverAcpProviders(
   config: E2eConfig | undefined,
-): Promise<RawAcpProvider[]> {
-  const configuredProviders = config?.mock?.acpProviders;
-  if (configuredProviders) {
-    return configuredProviders.map((provider) => ({
-      id: provider.id,
-      label: provider.label,
-      command: provider.command,
-      binary_path: provider.binaryPath,
-      default_args: [...provider.defaultArgs],
-      mcp_command: provider.mcpCommand ?? null,
-    }));
-  }
-
-  return [
-    {
-      id: "goose",
-      label: "Goose",
-      command: "goose",
-      binary_path: "/usr/local/bin/goose",
-      default_args: ["acp"],
-      mcp_command: null,
-    },
-    {
-      id: "codex",
-      label: "Codex",
-      command: "codex-acp",
-      binary_path: "/usr/local/bin/codex-acp",
-      default_args: [],
-      mcp_command: null,
-    },
-  ];
-}
-
-async function handleDiscoverAllAcpProviders(
-  _config: E2eConfig | undefined,
 ): Promise<RawAcpProviderCatalogEntry[]> {
+  const configured = config?.mock?.acpProvidersCatalog;
+  if (configured) {
+    return configured;
+  }
   return [
     {
       id: "goose",
@@ -3593,9 +3532,16 @@ async function handleDiscoverAllAcpProviders(
   ];
 }
 
-async function handleInstallAcpRuntime(args: {
-  providerId?: string;
-}): Promise<RawInstallRuntimeResult> {
+async function handleInstallAcpRuntime(
+  args: {
+    providerId?: string;
+  },
+  config: E2eConfig | undefined,
+): Promise<RawInstallRuntimeResult> {
+  const configured = config?.mock?.installAcpRuntimeResult;
+  if (configured) {
+    return configured;
+  }
   return {
     success: true,
     steps: [
@@ -4783,10 +4729,11 @@ export function maybeInstallE2eTauriMocks() {
         return getRelayHttpUrl(activeConfig);
       case "discover_acp_providers":
         return handleDiscoverAcpProviders(activeConfig);
-      case "discover_all_acp_providers":
-        return handleDiscoverAllAcpProviders(activeConfig);
       case "install_acp_runtime":
-        return handleInstallAcpRuntime(payload as { providerId?: string });
+        return handleInstallAcpRuntime(
+          payload as { providerId?: string },
+          activeConfig,
+        );
       case "discover_backend_providers":
         return [];
       case "probe_backend_provider":

@@ -3,7 +3,9 @@ use std::process::Command;
 
 use tauri::AppHandle;
 
-use crate::managed_agents::{AcpAvailabilityStatus, AcpProviderCatalogEntry, AcpProviderInfo, CommandAvailabilityInfo};
+use crate::managed_agents::{
+    AcpAvailabilityStatus, AcpProviderCatalogEntry, CommandAvailabilityInfo,
+};
 
 pub(crate) struct KnownAcpProvider {
     pub id: &'static str,
@@ -174,6 +176,10 @@ pub(crate) fn known_acp_provider(command: &str) -> Option<&'static KnownAcpProvi
     })
 }
 
+pub(crate) fn known_acp_provider_exact(id: &str) -> Option<&'static KnownAcpProvider> {
+    KNOWN_ACP_PROVIDERS.iter().find(|p| p.id == id)
+}
+
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
@@ -249,7 +255,8 @@ fn resolve_workspace_command(command: &str, app: Option<&AppHandle>) -> Option<P
         .find(|candidate| candidate.exists())
 }
 
-fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>> {
+fn resolve_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, Option<PathBuf>>>
+{
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
     static CACHE: OnceLock<Mutex<HashMap<String, Option<PathBuf>>>> = OnceLock::new();
@@ -388,27 +395,25 @@ pub fn missing_command_message(command: &str, role: &str) -> String {
     )
 }
 
-pub fn discover_local_acp_providers() -> Vec<AcpProviderInfo> {
-    KNOWN_ACP_PROVIDERS
-        .iter()
-        .filter_map(|provider| {
-            provider
-                .commands
-                .iter()
-                .find_map(|command| find_command(command).map(|path| (*command, path)))
-                .map(|(command, binary_path)| AcpProviderInfo {
-                    id: provider.id.to_string(),
-                    label: provider.label.to_string(),
-                    command: command.to_string(),
-                    binary_path: binary_path.display().to_string(),
-                    default_args: normalize_agent_args(command, Vec::new()),
-                    mcp_command: provider.mcp_command.map(str::to_string),
-                })
-        })
-        .collect()
+fn classify_provider(
+    adapter_result: Option<(&str, PathBuf)>,
+    underlying_cli: Option<&str>,
+    underlying_cli_found: bool,
+) -> (AcpAvailabilityStatus, Option<String>, Option<String>) {
+    if let Some((cmd, path)) = adapter_result {
+        (
+            AcpAvailabilityStatus::Available,
+            Some(cmd.to_string()),
+            Some(path.display().to_string()),
+        )
+    } else if underlying_cli.is_some() && underlying_cli_found {
+        (AcpAvailabilityStatus::AdapterMissing, None, None)
+    } else {
+        (AcpAvailabilityStatus::NotInstalled, None, None)
+    }
 }
 
-pub fn discover_all_acp_providers() -> Vec<AcpProviderCatalogEntry> {
+pub fn discover_acp_providers() -> Vec<AcpProviderCatalogEntry> {
     KNOWN_ACP_PROVIDERS
         .iter()
         .map(|provider| {
@@ -418,21 +423,15 @@ pub fn discover_all_acp_providers() -> Vec<AcpProviderCatalogEntry> {
                 .iter()
                 .find_map(|command| find_command(command).map(|path| (*command, path)));
 
-            let (availability, command, binary_path) = if let Some((cmd, path)) = adapter_result {
-                (
-                    AcpAvailabilityStatus::Available,
-                    Some(cmd.to_string()),
-                    Some(path.display().to_string()),
-                )
-            } else if let Some(cli) = provider.underlying_cli {
-                if find_command(cli).is_some() {
-                    (AcpAvailabilityStatus::AdapterMissing, None, None)
-                } else {
-                    (AcpAvailabilityStatus::NotInstalled, None, None)
-                }
-            } else {
-                (AcpAvailabilityStatus::NotInstalled, None, None)
-            };
+            let underlying_cli_found = provider
+                .underlying_cli
+                .map(|cli| find_command(cli).is_some())
+                .unwrap_or(false);
+            let (availability, command, binary_path) = classify_provider(
+                adapter_result,
+                provider.underlying_cli,
+                underlying_cli_found,
+            );
 
             let underlying_cli_path = provider
                 .underlying_cli
@@ -472,10 +471,13 @@ pub fn managed_agent_avatar_url(command: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::{
-        find_via_login_shell, managed_agent_avatar_url, normalize_agent_args,
+        classify_provider, find_via_login_shell, managed_agent_avatar_url, normalize_agent_args,
         CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL, SPROUT_AGENT_AVATAR_URL,
     };
+    use crate::managed_agents::AcpAvailabilityStatus;
 
     #[test]
     fn resolves_known_avatar_for_bare_command() {
@@ -565,5 +567,33 @@ mod tests {
             !marker.exists(),
             "shell lookup must not execute injected commands"
         );
+    }
+
+    #[test]
+    fn classifies_available_when_adapter_found() {
+        let (status, cmd, path) = classify_provider(
+            Some(("goose", PathBuf::from("/usr/local/bin/goose"))),
+            None,
+            false,
+        );
+        assert_eq!(status, AcpAvailabilityStatus::Available);
+        assert_eq!(cmd.as_deref(), Some("goose"));
+        assert_eq!(path.as_deref(), Some("/usr/local/bin/goose"));
+    }
+
+    #[test]
+    fn classifies_adapter_missing_when_cli_present() {
+        let (status, cmd, path) = classify_provider(None, Some("claude"), true);
+        assert_eq!(status, AcpAvailabilityStatus::AdapterMissing);
+        assert!(cmd.is_none());
+        assert!(path.is_none());
+    }
+
+    #[test]
+    fn classifies_not_installed_when_nothing_found() {
+        let (status, cmd, path) = classify_provider(None, Some("claude"), false);
+        assert_eq!(status, AcpAvailabilityStatus::NotInstalled);
+        assert!(cmd.is_none());
+        assert!(path.is_none());
     }
 }

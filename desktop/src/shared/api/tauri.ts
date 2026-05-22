@@ -39,8 +39,6 @@ import type {
   CreateManagedAgentInput,
   AgentModelsResponse,
   UpdateManagedAgentInput,
-  AcpAvailabilityStatus,
-  AcpProvider,
   AcpProviderCatalogEntry,
   CommandAvailability,
   InstallRuntimeResult,
@@ -248,16 +246,7 @@ type RawManagedAgentLog = {
   log_path: string;
 };
 
-type RawAcpProvider = {
-  id: string;
-  label: string;
-  command: string;
-  binary_path: string;
-  default_args: string[];
-  mcp_command: string | null;
-};
-
-type RawAcpProviderCatalogEntry = {
+export type RawAcpProviderCatalogEntry = {
   id: string;
   label: string;
   avatar_url: string;
@@ -272,7 +261,7 @@ type RawAcpProviderCatalogEntry = {
   underlying_cli_path: string | null;
 };
 
-type RawInstallStepResult = {
+export type RawInstallStepResult = {
   step: string;
   command: string;
   success: boolean;
@@ -281,7 +270,7 @@ type RawInstallStepResult = {
   exit_code: number | null;
 };
 
-type RawInstallRuntimeResult = {
+export type RawInstallRuntimeResult = {
   success: boolean;
   steps: RawInstallStepResult[];
 };
@@ -882,17 +871,6 @@ export function fromRawManagedAgent(agent: RawManagedAgent): ManagedAgent {
   };
 }
 
-function fromRawAcpProvider(provider: RawAcpProvider): AcpProvider {
-  return {
-    id: provider.id,
-    label: provider.label,
-    command: provider.command,
-    binaryPath: provider.binary_path,
-    defaultArgs: provider.default_args,
-    mcpCommand: provider.mcp_command,
-  };
-}
-
 function fromRawAcpProviderCatalogEntry(
   entry: RawAcpProviderCatalogEntry,
 ): AcpProviderCatalogEntry {
@@ -1080,19 +1058,11 @@ export async function getManagedAgentLog(pubkey: string, lineCount?: number) {
   };
 }
 
-export async function discoverAcpProviders(): Promise<AcpProvider[]> {
-  return (await invokeTauri<RawAcpProvider[]>("discover_acp_providers")).map(
-    fromRawAcpProvider,
-  );
-}
-
-export async function discoverAllAcpProviders(): Promise<
+export async function discoverAcpProviders(): Promise<
   AcpProviderCatalogEntry[]
 > {
   return (
-    await invokeTauri<RawAcpProviderCatalogEntry[]>(
-      "discover_all_acp_providers",
-    )
+    await invokeTauri<RawAcpProviderCatalogEntry[]>("discover_acp_providers")
   ).map(fromRawAcpProviderCatalogEntry);
 }
 
