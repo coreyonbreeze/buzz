@@ -35,6 +35,21 @@ export function TerminalProvider({ children }: { children: React.ReactNode }) {
     };
   }, []);
 
+  // Focus management: return focus to composer when terminal closes.
+  const prevOpenRef = React.useRef(isOpen);
+  React.useEffect(() => {
+    if (prevOpenRef.current && !isOpen) {
+      // Terminal just closed — focus the composer.
+      requestAnimationFrame(() => {
+        const editor = document.querySelector<HTMLElement>(
+          '[data-testid="message-composer"] .ProseMirror',
+        );
+        editor?.focus();
+      });
+    }
+    prevOpenRef.current = isOpen;
+  }, [isOpen]);
+
   const value = React.useMemo(
     () => ({ isOpen, toggle, close }),
     [isOpen, toggle, close],

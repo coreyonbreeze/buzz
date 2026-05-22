@@ -212,11 +212,12 @@ export function TerminalInstance({
     };
   }, [channelId, isVisible]);
 
-  // Re-fit when visibility changes.
+  // Re-fit and focus when visibility changes.
   React.useEffect(() => {
     if (isVisible && fitAddonRef.current) {
       requestAnimationFrame(() => {
         fitAddonRef.current?.fit();
+        termRef.current?.focus();
         if (sessionIdRef.current && termRef.current) {
           invoke("terminal_resize", {
             input: {
