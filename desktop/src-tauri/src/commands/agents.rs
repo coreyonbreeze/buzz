@@ -44,6 +44,17 @@ fn build_deploy_payload(
         crate::managed_agents::resolve_persona_env(app, record.persona_id.as_deref())?;
     let merged_env = crate::managed_agents::merged_user_env(&persona_env, &record.env_vars);
 
+    // Resolve system prompt and model via the persona (same as local spawn).
+    // Re-reads the persona store so edits take effect without recreating the agent.
+    let personas = load_personas(app).unwrap_or_default();
+    let (effective_prompt, effective_model) =
+        crate::managed_agents::resolve_effective_prompt_and_model(
+            record.persona_id.as_deref(),
+            &personas,
+            record.system_prompt.as_deref(),
+            record.model.as_deref(),
+        );
+
     Ok(serde_json::json!({
         "name": &record.name,
         "relay_url": &record.relay_url,
@@ -51,8 +62,8 @@ fn build_deploy_payload(
         "auth_tag": &record.auth_tag,
         "agent_command": &record.agent_command,
         "agent_args": &record.agent_args,
-        "system_prompt": &record.system_prompt,
-        "model": &record.model,
+        "system_prompt": &effective_prompt,
+        "model": &effective_model,
         "turn_timeout_seconds": record.turn_timeout_seconds,
         "idle_timeout_seconds": record.idle_timeout_seconds,
         "max_turn_duration_seconds": record.max_turn_duration_seconds,

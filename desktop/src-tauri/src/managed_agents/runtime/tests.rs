@@ -216,8 +216,18 @@ fn resolve_prompt_falls_back_when_no_persona_id() {
     assert_eq!(model.as_deref(), Some("record-model"));
 }
 
+/// Tests prompt/model resolution **in isolation** when the persona is missing.
+///
+/// In a real spawn, `resolve_persona_env()` (called later in `spawn_agent_child`)
+/// would **fail closed** if the persona cannot be found — because persona env_vars
+/// may contain required API credentials. This test only validates the
+/// `resolve_effective_prompt_and_model` helper's fallback behavior, NOT that a
+/// full agent spawn would succeed with a missing persona.
 #[test]
 fn resolve_prompt_falls_back_when_persona_not_found() {
+    // NOTE: This tests the prompt/model resolution layer only. A full spawn
+    // with a missing persona_id would fail at resolve_persona_env() before
+    // the process is ever created.
     let personas = vec![persona_fixture("custom:other", "Other prompt", None)];
 
     let (prompt, model) = resolve_effective_prompt_and_model(
