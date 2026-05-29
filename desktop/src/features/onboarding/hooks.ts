@@ -29,7 +29,42 @@ async function autoJoinDefaultChannel(
 }
 
 const ONBOARDING_COMPLETION_STORAGE_KEY = "sprout-onboarding-complete.v1";
+const FORCE_ONBOARDING_STORAGE_KEY = "sprout-force-onboarding";
 type OnboardingGateStage = "blocking" | "onboarding" | "ready";
+
+/**
+ * Developer/testing override: replay the onboarding flow even when the user
+ * already has a profile or has completed it before. Enable by setting
+ * `localStorage["sprout-force-onboarding"] = "true"` or loading with
+ * `?onboarding=force` (or `?onboarding=1`). Cleared automatically once the
+ * user finishes or skips so it never traps a real user.
+ */
+function isForceOnboarding(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  try {
+    const onboardingParam = new URLSearchParams(window.location.search).get(
+      "onboarding",
+    );
+    if (onboardingParam === "force" || onboardingParam === "1") {
+      window.localStorage.setItem(FORCE_ONBOARDING_STORAGE_KEY, "true");
+      return true;
+    }
+  } catch {
+    // Ignore malformed URLs and fall back to the storage flag.
+  }
+
+  return window.localStorage.getItem(FORCE_ONBOARDING_STORAGE_KEY) === "true";
+}
+
+function clearForceOnboarding() {
+  if (typeof window === "undefined") {
+    return;
+  }
+  window.localStorage.removeItem(FORCE_ONBOARDING_STORAGE_KEY);
+}
 
 type UseFirstRunOnboardingGateOptions = {
   currentPubkey: string | null;
@@ -96,15 +131,23 @@ function isSettledQueryStatus(status: QueryStatus) {
 
 function resolveOnboardingGateStage({
   currentPubkey,
+  forceOnboarding,
   gateState,
   identityIsFetching,
   identityStatus,
 }: {
   currentPubkey: string | null;
+  forceOnboarding: boolean;
   gateState: OnboardingGateState;
   identityIsFetching: boolean;
   identityStatus: QueryStatus;
 }): OnboardingGateStage {
+  // Forced replay only needs an identity to scope the flow; once we have a
+  // pubkey, show onboarding regardless of completion/profile state.
+  if (forceOnboarding && currentPubkey !== null) {
+    return "onboarding";
+  }
+
   const isBlockingCurrentPubkey =
     currentPubkey !== null &&
     !gateState.hasCompletedCurrentPubkey &&
@@ -233,6 +276,7 @@ export function useFirstRunOnboardingGate({
   ]);
 
   const skipForNow = React.useCallback(() => {
+    clearForceOnboarding();
     setGateState((current) =>
       updateActiveGateState(current, currentPubkey, (activeGateState) => ({
         ...activeGateState,
@@ -243,6 +287,7 @@ export function useFirstRunOnboardingGate({
   }, [currentPubkey]);
 
   const complete = React.useCallback(() => {
+    clearForceOnboarding();
     if (typeof window !== "undefined" && currentPubkey) {
       window.localStorage.setItem(
         onboardingCompletionStorageKey(currentPubkey),
@@ -263,6 +308,7 @@ export function useFirstRunOnboardingGate({
     skipForNow,
     stage: resolveOnboardingGateStage({
       currentPubkey,
+      forceOnboarding: isForceOnboarding(),
       gateState: activeGateState,
       identityIsFetching,
       identityStatus,

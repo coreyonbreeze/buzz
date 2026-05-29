@@ -14,9 +14,9 @@ import { getMyRelayMembershipLookup } from "@/shared/api/relayMembers";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import { pubkeyToNpub } from "@/shared/lib/nostrUtils";
 import { relayClient } from "@/shared/api/relayClient";
+import { AssistantSetupStep } from "./AssistantSetupStep";
 import { MembershipDenied } from "./MembershipDenied";
 import { ProfileStep } from "./ProfileStep";
-import { SetupStep } from "./SetupStep";
 import type {
   OnboardingActions,
   OnboardingPage,
@@ -136,7 +136,7 @@ export function OnboardingFlow({
   const { error: profileSaveError, isPending: isSavingProfile } =
     profileUpdateMutation;
   const [currentPage, setCurrentPage] =
-    React.useState<OnboardingPage>("profile");
+    React.useState<OnboardingPage>("assistant");
   const [profileDraft, setProfileDraft] =
     React.useState<OnboardingProfileValues>(savedProfile);
   const [deniedPubkey, setDeniedPubkey] = React.useState<string>("");
@@ -182,8 +182,8 @@ export function OnboardingFlow({
     [resetProfileSaveError],
   );
 
-  const showSetupPage = React.useCallback(() => {
-    setCurrentPage("setup");
+  const showAssistantPage = React.useCallback(() => {
+    setCurrentPage("assistant");
   }, []);
 
   const showProfilePage = React.useCallback(() => {
@@ -234,8 +234,8 @@ export function OnboardingFlow({
       }
     }
 
-    showSetupPage();
-  }, [profileDraft, profileUpdateMutation, savedProfile, showSetupPage]);
+    showAssistantPage();
+  }, [profileDraft, profileUpdateMutation, savedProfile, showAssistantPage]);
 
   const updateDisplayNameDraft = React.useCallback(
     (value: string) => {
@@ -328,14 +328,24 @@ export function OnboardingFlow({
 
   return (
     <div
-      className="flex min-h-dvh items-center justify-center bg-[radial-gradient(circle_at_top,hsl(var(--primary)/0.16),transparent_44%),linear-gradient(180deg,hsl(var(--background)),hsl(var(--muted)/0.5))] px-4 py-8"
+      className={
+        currentPage === "assistant"
+          ? "min-h-dvh bg-black"
+          : "flex min-h-dvh items-center justify-center bg-[radial-gradient(circle_at_top,hsl(var(--primary)/0.16),transparent_44%),linear-gradient(180deg,hsl(var(--background)),hsl(var(--muted)/0.5))] px-4 py-8"
+      }
       data-testid="onboarding-gate"
     >
-      <div className="w-full max-w-xl rounded-[32px] border border-border/70 bg-background/94 p-6 shadow-2xl backdrop-blur-sm sm:p-8">
+      <div
+        className={
+          currentPage === "assistant"
+            ? "min-h-dvh"
+            : "w-full max-w-xl rounded-[32px] border border-border/70 bg-background/94 p-6 shadow-2xl backdrop-blur-sm sm:p-8"
+        }
+      >
         {currentPage === "profile" ? (
           <ProfileStep
             actions={{
-              advanceWithoutSaving: showSetupPage,
+              advanceWithoutSaving: showAssistantPage,
               clearAvatarDraft: resetAvatarDraft,
               importIdentity: handleImportIdentity,
               onUploadingChange: setIsUploadingAvatar,
@@ -349,11 +359,13 @@ export function OnboardingFlow({
             state={profileStepState}
           />
         ) : (
-          <SetupStep
+          <AssistantSetupStep
             actions={{
               back: showProfilePage,
               complete,
             }}
+            initialProfile={profileDraft}
+            ownerPubkey={identityQuery.data?.pubkey ?? null}
           />
         )}
       </div>
