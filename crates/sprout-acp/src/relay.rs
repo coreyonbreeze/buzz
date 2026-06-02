@@ -669,6 +669,13 @@ impl HarnessRelay {
         auth_tag: Option<nostr::Tag>,
         serverless: bool,
     ) -> Result<Self, RelayError> {
+        // Serverless workspaces pass a comma-separated relay LIST
+        // (`wss://a,wss://b,...`). The harness is single-relay: connect to the
+        // first (primary) relay — connecting to the raw comma string fails DNS
+        // ("nodename nor servname provided"). The desktop client uses the same
+        // first-relay convention for its live subscription.
+        let relay_url = relay_url.split(',').next().unwrap_or(relay_url).trim();
+
         // Perform the initial connection and auth handshake.
         // Finding #8: capture the handshake buffer and pass it to the background
         // task so buffered messages aren't silently discarded.
@@ -3812,8 +3819,11 @@ mod tests {
         use nostr::{EventBuilder, Keys, Kind, Tag};
 
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let relay_url =
-            std::env::var("RELAY_URL").unwrap_or_else(|_| "wss://relay.damus.io".to_string());
+        // Pass a COMMA-SEPARATED relay list (as serverless workspaces do) to
+        // regress the DNS-crash bug where the harness connected to the raw
+        // comma string. connect_with_mode must split to the first relay.
+        let relay_url = std::env::var("RELAY_URL")
+            .unwrap_or_else(|_| "wss://relay.damus.io,wss://nos.lol".to_string());
 
         // The "agent" identity — connects in serverless mode like a managed agent.
         let agent = Keys::generate();
@@ -3855,7 +3865,9 @@ mod tests {
         {
             use futures_util::SinkExt;
             use tokio_tungstenite::{connect_async, tungstenite::Message};
-            let (ws, _) = connect_async(&relay_url).await.expect("sender connect");
+            // Sender publishes to the same first relay the agent connects to.
+            let sender_relay = relay_url.split(',').next().unwrap_or(&relay_url).trim();
+            let (ws, _) = connect_async(sender_relay).await.expect("sender connect");
             let (mut write, _read) = ws.split();
             let ev = serde_json::json!(["EVENT", wrap]).to_string();
             write
