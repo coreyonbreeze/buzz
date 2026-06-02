@@ -505,6 +505,19 @@ pub async fn unarchive_channel(
 #[tauri::command]
 pub async fn delete_channel(channel_id: String, state: State<'_, AppState>) -> Result<(), String> {
     let uuid = parse_channel_uuid(&channel_id)?;
+    if state.is_serverless() {
+        // No relay to process the kind:9008 delete command. Publish a NIP-09
+        // (kind 5) deletion targeting the channel's addressable 39000/39002
+        // coordinates so relays drop them. Only the owner (signer of those
+        // events) can effectively delete.
+        let my_pubkey = {
+            let keys = state.keys.lock().map_err(|e| e.to_string())?;
+            keys.public_key().to_hex()
+        };
+        let builder = events::build_delete_channel_serverless(&uuid.to_string(), &my_pubkey)?;
+        submit_event(builder, &state).await?;
+        return Ok(());
+    }
     let builder = events::build_delete_channel(uuid)?;
     submit_event(builder, &state).await?;
     Ok(())

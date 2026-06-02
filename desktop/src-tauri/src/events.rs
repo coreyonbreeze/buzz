@@ -299,6 +299,22 @@ pub fn build_message_edit(
     Ok(EventBuilder::new(Kind::Custom(40003), content).tags(tags))
 }
 
+/// Kind 5 — NIP-09 deletion of a serverless channel. Targets the addressable
+/// `a` coordinates of the channel's kind:39000 metadata and kind:39002 member
+/// list (both signed by `owner_pubkey_hex`), which generic relays honor.
+pub fn build_delete_channel_serverless(
+    channel_id: &str,
+    owner_pubkey_hex: &str,
+) -> Result<EventBuilder, String> {
+    let meta_coord = format!("39000:{owner_pubkey_hex}:{channel_id}");
+    let members_coord = format!("39002:{owner_pubkey_hex}:{channel_id}");
+    let tags = vec![
+        tag(vec!["a", &meta_coord])?,
+        tag(vec!["a", &members_coord])?,
+    ];
+    Ok(EventBuilder::new(Kind::Custom(5), "").tags(tags))
+}
+
 /// Kind 5 — NIP-09 deletion (messages).
 pub fn build_delete_compat(target_event_id: EventId) -> Result<EventBuilder, String> {
     let tags = vec![tag(vec!["e", &target_event_id.to_hex()])?];
@@ -997,6 +1013,26 @@ mod tests {
                 .any(|t| t.first().map(String::as_str) == Some("p") && t.get(1) == Some(&me)),
             "self p-tag was stripped — .allow_self_tagging() missing; tags={tags:?}"
         );
+    }
+
+    #[test]
+    fn serverless_delete_channel_targets_addressable_coords() {
+        // Deletion must reference both the 39000 metadata and 39002 members
+        // addressable coordinates so a generic relay drops them.
+        let event = sign(build_delete_channel_serverless("chan-del", PK_A).unwrap());
+        assert_eq!(event.kind, Kind::Custom(5));
+        let coords: Vec<String> = event
+            .tags
+            .iter()
+            .filter_map(|t| {
+                let s = t.as_slice();
+                (s.first().map(String::as_str) == Some("a"))
+                    .then(|| s.get(1).cloned())
+                    .flatten()
+            })
+            .collect();
+        assert!(coords.contains(&format!("39000:{PK_A}:chan-del")));
+        assert!(coords.contains(&format!("39002:{PK_A}:chan-del")));
     }
 
     #[test]

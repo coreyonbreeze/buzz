@@ -184,20 +184,45 @@ pub async fn submit_event_ws(
         .sign_with_keys(&keys)
         .map_err(|e| format!("failed to sign event: {e}"))?;
 
-    let futures = relay_urls
-        .iter()
-        .map(|url| submit_event_ws_one(&event, &keys, url));
-    let results = futures_util::future::join_all(futures).await;
+    // Publish to all relays, succeeding if any accepts. Public relays often
+    // rate-limit bursts ("noting too much"); since the same event going to N
+    // relays is idempotent (dedup by id), a transient rate-limit on one relay
+    // is fine as long as another accepts. If ALL relays rate-limit, retry once
+    // after a short backoff — adding an agent fires several writes in quick
+    // succession, which is the usual trigger.
+    for attempt in 0..2 {
+        let futures = relay_urls
+            .iter()
+            .map(|url| submit_event_ws_one(&event, &keys, url));
+        let results = futures_util::future::join_all(futures).await;
 
-    let mut last_err = None;
-    for r in results {
-        match r {
-            Ok(resp) if resp.accepted => return Ok(resp),
-            Ok(resp) => last_err = Some(format!("relay rejected event: {}", resp.message)),
-            Err(e) => last_err = Some(e),
+        let mut last_err = None;
+        let mut all_rate_limited = !results.is_empty();
+        for r in results {
+            match r {
+                Ok(resp) if resp.accepted => return Ok(resp),
+                Ok(resp) => {
+                    if !resp.message.contains("rate-limit") {
+                        all_rate_limited = false;
+                    }
+                    last_err = Some(format!("relay rejected event: {}", resp.message));
+                }
+                Err(e) => {
+                    all_rate_limited = false;
+                    last_err = Some(e);
+                }
+            }
         }
+
+        // Only the rate-limit case is worth retrying; other rejections won't
+        // change on retry.
+        if attempt == 0 && all_rate_limited {
+            tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+            continue;
+        }
+        return Err(last_err.unwrap_or_else(|| "all relays failed".to_string()));
     }
-    Err(last_err.unwrap_or_else(|| "all relays failed".to_string()))
+    unreachable!("loop returns on both attempts")
 }
 
 async fn submit_event_ws_one(
