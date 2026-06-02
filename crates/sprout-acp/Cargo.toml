@@ -23,6 +23,7 @@ sprout-persona = { path = "../sprout-persona" }
 
 # Nostr
 nostr = { workspace = true }
+nostr-relay-pool = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

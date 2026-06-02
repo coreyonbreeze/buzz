@@ -8,6 +8,7 @@ mod observer;
 mod pool;
 mod queue;
 mod relay;
+mod serverless_relay;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

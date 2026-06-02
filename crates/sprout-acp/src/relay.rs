@@ -114,6 +114,10 @@ pub struct RestClient {
     /// down or rate-limiting — the standard Nostr client model (damus
     /// `RelayPool`, nostr-tools `SimplePool`).
     pub ws_urls: Vec<String>,
+    /// Shared serverless relay pool. When `Some`, `query`/`submit_event` use the
+    /// pool (auto-reconnect, multi-relay merge/dedup) instead of the hand-rolled
+    /// `query_ws`/`submit_event_ws`. `None` in server mode.
+    pub pool: Option<nostr_relay_pool::RelayPool>,
 }
 
 /// Whether an HTTP status code is retriable (transient server/rate-limit errors).
@@ -274,6 +278,19 @@ impl RestClient {
     /// Accepts a slice of `nostr::Filter` (serialized as JSON array).
     /// Returns the events as a `serde_json::Value` (JSON array of event objects).
     pub async fn query(&self, filters: &[nostr::Filter]) -> Result<Value, RelayError> {
+        if let Some(pool) = &self.pool {
+            let events = pool
+                .fetch_events(
+                    filters.to_vec(),
+                    std::time::Duration::from_secs(8),
+                    nostr_relay_pool::relay::ReqExitPolicy::ExitOnEOSE,
+                )
+                .await
+                .map_err(|e| RelayError::Http(format!("fetch failed: {e}")))?;
+            let events: Vec<Event> = events.into_iter().collect();
+            return serde_json::to_value(events)
+                .map_err(|e| RelayError::Http(format!("event serialize error: {e}")));
+        }
         if self.serverless {
             return self.query_ws(filters).await;
         }
@@ -289,6 +306,13 @@ impl RestClient {
     ///
     /// The event must already be signed. Returns the relay response JSON.
     pub async fn submit_event(&self, event: &Event) -> Result<Value, RelayError> {
+        if let Some(pool) = &self.pool {
+            let output = pool
+                .send_event(event)
+                .await
+                .map_err(|e| RelayError::Http(format!("publish failed: {e}")))?;
+            return Ok(serde_json::json!({"accepted": !output.success.is_empty()}));
+        }
         if self.serverless {
             return self.submit_event_ws(event).await;
         }
@@ -686,13 +710,13 @@ enum RelayMessage {
 // ── Commands sent from HarnessRelay to the background task ───────────────────
 
 /// Subscription ID for the global membership notification subscription.
-const MEMBERSHIP_NOTIF_SUB_ID: &str = "membership-notif";
+pub(crate) const MEMBERSHIP_NOTIF_SUB_ID: &str = "membership-notif";
 /// Subscription ID for encrypted owner-to-agent observer control frames.
-const OBSERVER_CONTROL_SUB_ID: &str = "agent-observer-control";
+pub(crate) const OBSERVER_CONTROL_SUB_ID: &str = "agent-observer-control";
 /// Subscription ID for the agent's NIP-17 gift-wrap inbox (encrypted serverless
 /// private channels / DMs). The relay only stores `kind 1059` blobs addressed
 /// by `#p`; the agent unwraps each and routes the inner message by its `h` tag.
-const GIFT_WRAP_SUB_ID: &str = "agent-gift-wrap-inbox";
+pub(crate) const GIFT_WRAP_SUB_ID: &str = "agent-gift-wrap-inbox";
 /// NIP-59 gift wrap kind.
 const KIND_GIFT_WRAP: u16 = 1059;
 
@@ -764,17 +788,32 @@ pub struct HarnessRelay {
     /// Handles to all background tasks (one per relay + the command fan-out),
     /// for clean shutdown.
     bg_handles: Vec<tokio::task::JoinHandle<()>>,
+    /// Serverless backend (nostr-relay-pool). When `Some`, all subscribe /
+    /// query / publish / next_event calls dispatch here instead of the
+    /// hand-rolled background-task path above. Built only in serverless mode;
+    /// server mode leaves this `None` and uses the original code unchanged.
+    serverless_backend: Option<crate::serverless_relay::ServerlessRelay>,
 }
 
-/// Cloneable publisher handle for signed events on the relay background socket.
+/// Cloneable publisher handle for signed events. In server mode it sends to the
+/// relay background task via `cmd_tx`; in serverless it publishes through the
+/// shared `RelayPool` (clone-cheap, Arc inside).
 #[derive(Clone)]
 pub struct RelayEventPublisher {
     cmd_tx: mpsc::Sender<RelayCommand>,
+    pool: Option<nostr_relay_pool::RelayPool>,
 }
 
 impl RelayEventPublisher {
-    /// Publish a signed event through the relay background task.
+    /// Publish a signed event through the relay background task (server) or the
+    /// pool (serverless).
     pub async fn publish_event(&self, event: Event) -> Result<(), RelayError> {
+        if let Some(pool) = &self.pool {
+            pool.send_event(&event)
+                .await
+                .map_err(|e| RelayError::Http(format!("publish failed: {e}")))?;
+            return Ok(());
+        }
         self.cmd_tx
             .send(RelayCommand::PublishEvent {
                 event: Box::new(event),
@@ -800,6 +839,42 @@ impl HarnessRelay {
         auth_tag: Option<nostr::Tag>,
         serverless: bool,
     ) -> Result<Self, RelayError> {
+        // Serverless: delegate the entire relay layer to nostr-relay-pool
+        // (persistent multi-relay REQ + auto-reconnect + auto-resubscribe +
+        // merge/dedup). The hand-rolled background-task path below is used ONLY
+        // for server mode (NIP-42 AUTH against the Sprout relay).
+        if serverless {
+            let backend = crate::serverless_relay::ServerlessRelay::connect(
+                relay_url,
+                keys,
+                agent_pubkey_hex,
+            )
+            .await?;
+            let relay_urls = backend.relay_urls().to_vec();
+            let primary = relay_urls
+                .first()
+                .cloned()
+                .unwrap_or_else(|| relay_url.to_string());
+            // Unused channels/clients in serverless mode — the backend owns the
+            // real streams. We keep the struct shape uniform.
+            let (_dead_event_tx, event_rx) = mpsc::channel::<Option<SproutEvent>>(1);
+            let (cmd_tx, _dead_cmd_rx) = mpsc::channel::<RelayCommand>(1);
+            return Ok(Self {
+                event_rx,
+                observer_control_rx: None,
+                cmd_tx,
+                http: reqwest::Client::new(),
+                relay_url: primary,
+                relay_urls,
+                keys: keys.clone(),
+                auth_tag,
+                serverless,
+                seen_event_ids: std::collections::VecDeque::new(),
+                bg_handles: Vec::new(),
+                serverless_backend: Some(backend),
+            });
+        }
+
         // Serverless workspaces pass a comma-separated relay LIST
         // (`wss://a,wss://b,...`). Connect to ALL of them and merge — this is
         // the standard Nostr client pattern (damus `RelayPool`, nostr-tools
@@ -931,6 +1006,7 @@ impl HarnessRelay {
             serverless,
             seen_event_ids: std::collections::VecDeque::new(),
             bg_handles,
+            serverless_backend: None,
         })
     }
 
@@ -1063,6 +1139,7 @@ impl HarnessRelay {
             } else {
                 self.relay_urls.clone()
             },
+            pool: self.serverless_backend.as_ref().map(|b| b.pool()),
         }
     }
 
@@ -1075,6 +1152,9 @@ impl HarnessRelay {
         channel_id: Uuid,
         filter: ChannelFilter,
     ) -> Result<(), RelayError> {
+        if let Some(backend) = &self.serverless_backend {
+            return backend.subscribe_channel(channel_id, filter).await;
+        }
         self.cmd_tx
             .send(RelayCommand::Subscribe { channel_id, filter })
             .await
@@ -1085,6 +1165,13 @@ impl HarnessRelay {
 
     /// Subscribe to membership notifications for this agent.
     pub async fn subscribe_membership_notifications(&mut self) -> Result<(), RelayError> {
+        if let Some(backend) = &self.serverless_backend {
+            // Generic relays don't emit Sprout's kind:44100 membership push
+            // (that's a server side effect). In serverless the harness relies
+            // on the periodic re-discovery loop instead — nothing to subscribe.
+            // Still subscribe the gift-wrap inbox so encrypted DMs/privates work.
+            return backend.subscribe_gift_wrap().await;
+        }
         self.cmd_tx
             .send(RelayCommand::SubscribeMembership)
             .await
@@ -1094,6 +1181,10 @@ impl HarnessRelay {
 
     /// Subscribe to encrypted observer control frames addressed to this agent.
     pub async fn subscribe_observer_controls(&mut self) -> Result<(), RelayError> {
+        if self.serverless_backend.is_some() {
+            // Observer controls are a Sprout-relay feature; no-op in serverless.
+            return Ok(());
+        }
         self.cmd_tx
             .send(RelayCommand::SubscribeObserverControls)
             .await
@@ -1110,11 +1201,16 @@ impl HarnessRelay {
     pub fn event_publisher(&self) -> RelayEventPublisher {
         RelayEventPublisher {
             cmd_tx: self.cmd_tx.clone(),
+            pool: self.serverless_backend.as_ref().map(|b| b.pool()),
         }
     }
 
     /// Unsubscribe from a channel.
     pub async fn unsubscribe_channel(&mut self, channel_id: Uuid) -> Result<(), RelayError> {
+        if let Some(backend) = &self.serverless_backend {
+            backend.unsubscribe_channel(channel_id).await;
+            return Ok(());
+        }
         self.cmd_tx
             .send(RelayCommand::Unsubscribe { channel_id })
             .await
@@ -1128,6 +1224,10 @@ impl HarnessRelay {
     /// Reads from the background task's event channel. Returns `None` on
     /// connection loss — the caller should call [`reconnect`](Self::reconnect).
     pub async fn next_event(&mut self) -> Option<SproutEvent> {
+        if let Some(backend) = &mut self.serverless_backend {
+            // The pool already dedups across relays — no local ring needed.
+            return backend.next_event().await;
+        }
         // The background tasks send `None` to signal connection loss. With
         // multiple relays the same event arrives from each relay it's stored on,
         // so dedup by event id (bounded ring, like damus's `seenEvents`).
@@ -1152,6 +1252,9 @@ impl HarnessRelay {
     /// (typing indicators) prefer [`try_publish_event`] which never blocks.
     #[allow(dead_code)] // Public API — callers outside the harness may use this
     pub async fn publish_event(&self, event: Event) -> Result<(), RelayError> {
+        if let Some(backend) = &self.serverless_backend {
+            return backend.publish(&event).await;
+        }
         self.cmd_tx
             .send(RelayCommand::PublishEvent {
                 event: Box::new(event),
@@ -1165,6 +1268,15 @@ impl HarnessRelay {
     /// Suitable for ephemeral commands like typing indicators where dropping
     /// the event on a full command channel is acceptable.
     pub fn try_publish_event(&self, event: Event) -> Result<(), RelayError> {
+        if let Some(backend) = &self.serverless_backend {
+            // Ephemeral (typing): fire-and-forget on the pool. Spawn so we don't
+            // block; dropping on error is acceptable for typing indicators.
+            let pool = backend.pool();
+            tokio::spawn(async move {
+                let _ = pool.send_event(&event).await;
+            });
+            return Ok(());
+        }
         self.cmd_tx
             .try_send(RelayCommand::PublishEvent {
                 event: Box::new(event),
@@ -1218,6 +1330,10 @@ impl HarnessRelay {
     /// Reconnect after connection loss. Instructs the background task to
     /// re-authenticate and resubscribe to all previously active channels.
     pub async fn reconnect(&mut self) -> Result<(), RelayError> {
+        if self.serverless_backend.is_some() {
+            // The pool auto-reconnects + auto-resubscribes; nothing to do.
+            return Ok(());
+        }
         warn!("relay connection lost — reconnecting…");
         self.cmd_tx
             .send(RelayCommand::Reconnect)
@@ -1232,6 +1348,10 @@ impl HarnessRelay {
     /// the background task to finish. Use this from async contexts instead of
     /// relying on `Drop` (which aborts immediately).
     pub async fn shutdown(mut self) {
+        if let Some(backend) = &self.serverless_backend {
+            backend.shutdown().await;
+            return;
+        }
         let _ = self.cmd_tx.send(RelayCommand::Shutdown).await;
         let handles = std::mem::take(&mut self.bg_handles);
         for handle in handles {
@@ -3038,7 +3158,10 @@ fn jittered_duration(base: Duration) -> Duration {
 /// cryptographically verified `sender`, so we trust the rumor's author; the
 /// downstream pipeline reads only id/pubkey/kind/created_at/tags/content (never
 /// `.sig`). We materialize an `Event` via JSON with an empty signature.
-fn rumor_to_event(rumor: &nostr::UnsignedEvent, sender: nostr::PublicKey) -> Option<nostr::Event> {
+pub(crate) fn rumor_to_event(
+    rumor: &nostr::UnsignedEvent,
+    sender: nostr::PublicKey,
+) -> Option<nostr::Event> {
     let id = rumor.id?;
     // Rumors carry no signature (NIP-17). The seal already verified `sender`,
     // and the downstream pipeline never inspects `.sig`, so we attach an
@@ -3055,7 +3178,7 @@ fn rumor_to_event(rumor: &nostr::UnsignedEvent, sender: nostr::PublicKey) -> Opt
     ))
 }
 
-fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
+pub(crate) fn extract_h_tag_uuid(event: &nostr::Event) -> Option<Uuid> {
     event.tags.iter().find_map(|tag| {
         let tag_vec = tag.as_slice();
         if tag_vec.len() >= 2 && tag_vec[0] == "h" {
