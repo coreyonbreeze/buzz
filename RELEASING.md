@@ -24,9 +24,11 @@ This creates a `version-bump/<version>` PR that bumps all version manifests, reg
 
 1. **`just release`** runs locally on `main` — computes the next version, creates a `version-bump/<version>` branch, bumps versions in all manifests, regenerates lockfiles, generates a changelog entry, commits, pushes, and opens a PR.
 
-2. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge and pushes a `v<version>` tag.
+2. **The release PR stays in sync** — if other PRs merge to `main` while the release PR is open, the `sync-release-changelog` workflow automatically updates the changelog on the release PR branch so the final release notes reflect everything that will be in the binary. No manual action needed.
 
-3. **Tag triggers `release.yml`** — the existing release workflow builds, signs, notarizes, and publishes the desktop app for macOS and Linux.
+3. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge and pushes a `v<version>` tag.
+
+4. **Tag triggers `release.yml`** — the existing release workflow builds, signs, notarizes, and publishes the desktop app for macOS and Linux.
 
 ---
 
@@ -121,3 +123,6 @@ The version string must be valid semver: `MAJOR.MINOR.PATCH` with an optional pr
 
 ### Auto-updater reports "no update available"
 Verify that the `sprout-desktop-latest` release exists and contains a valid `latest.json`.
+
+### `sync-release-changelog` workflow fails with "Multiple open release PRs"
+More than one `version-bump/*` PR is open. Close or merge the stale one before the sync can resume.

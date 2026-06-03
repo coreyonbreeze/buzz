@@ -1,0 +1,154 @@
+name: Sync Release PR Changelog
+
+on:
+  push:
+    branches: [main]
+
+# Collapse rapid successive main pushes into one sync run.
+concurrency:
+  group: sync-release-changelog
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    name: Sync changelog on open release PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find open release PR
+        id: find-pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          # Filter to same-repo PRs only (exclude forks) with version-bump/<semver> branches.
+          PRS=$(gh pr list \
+            --repo block/sprout \
+            --state open \
+            --json number,headRefName,headRepository \
+            --jq '[.[] |
+              select(.headRepository.nameWithOwner == "block/sprout") |
+              select(.headRefName | test("^version-bump/[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$"))
+            ]')
+
+          COUNT=$(echo "$PRS" | jq 'length')
+
+          if [[ "$COUNT" -eq 0 ]]; then
+            echo "No open release PR found — nothing to sync"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [[ "$COUNT" -gt 1 ]]; then
+            echo "::error::Multiple open release PRs found — cannot auto-sync. Resolve manually."
+            echo "$PRS" | jq -r '.[].headRefName'
+            exit 1
+          fi
+
+          BRANCH=$(echo "$PRS" | jq -r '.[0].headRefName')
+          NUMBER=$(echo "$PRS" | jq -r '.[0].number')
+          VERSION="${BRANCH#version-bump/}"
+
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "number=$NUMBER" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Found release PR #${NUMBER} (${BRANCH})"
+
+      - name: Check out release PR branch
+        if: steps.find-pr.outputs.found == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ steps.find-pr.outputs.branch }}
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Regenerate changelog section
+        if: steps.find-pr.outputs.found == 'true'
+        env:
+          VERSION: ${{ steps.find-pr.outputs.version }}
+          PR_NUMBER: ${{ steps.find-pr.outputs.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+          # Refresh origin/main so the log range reflects what's actually on main now.
+          git fetch origin main
+
+          # Most recent release tag reachable from origin/main (i.e., the previous release).
+          # Using origin/main — not HEAD — so the release commit on this PR branch is excluded.
+          LAST_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' origin/main 2>/dev/null || echo "")
+
+          if [[ -z "$LAST_TAG" ]]; then
+            NEW_ENTRIES="Initial release"
+          else
+            # Entries since the last tag up to current main tip, excluding merge commits.
+            # Upper bound is origin/main, NOT HEAD, so release/sync commits on this PR
+            # branch never appear in the changelog.
+            NEW_ENTRIES=$(git log "${LAST_TAG}..origin/main" --oneline --no-merges || echo "")
+          fi
+
+          echo "Changelog range: ${LAST_TAG:-<beginning>}..origin/main"
+          echo "New entries:"
+          echo "${NEW_ENTRIES:-  (none)}"
+
+          # Locate the ## v<VERSION> section in CHANGELOG.md.
+          START=$(grep -n "^## v${VERSION}$" CHANGELOG.md | head -1 | cut -d: -f1)
+          if [[ -z "$START" ]]; then
+            echo "::error::Section '## v${VERSION}' not found in CHANGELOG.md — cannot sync"
+            exit 1
+          fi
+
+          # Line number of the next ## v section after our section (may be empty if last).
+          NEXT=$(awk -v start="$START" 'NR > start && /^## v[0-9]/{print NR; exit}' CHANGELOG.md)
+
+          TMPFILE=$(mktemp)
+
+          # Lines before the version section (the "# Changelog" header block).
+          if [[ "$START" -gt 1 ]]; then
+            head -n $((START - 1)) CHANGELOG.md >> "$TMPFILE"
+          fi
+
+          # Write the refreshed version section.
+          printf '## v%s\n\n' "$VERSION" >> "$TMPFILE"
+          if [[ -n "$NEW_ENTRIES" ]]; then
+            printf '%s\n' "$NEW_ENTRIES" >> "$TMPFILE"
+          else
+            printf 'No changes.\n' >> "$TMPFILE"
+          fi
+          printf '\n' >> "$TMPFILE"
+
+          # Append the remainder of the changelog (previous releases).
+          if [[ -n "$NEXT" ]]; then
+            tail -n "+${NEXT}" CHANGELOG.md >> "$TMPFILE"
+          fi
+
+          mv "$TMPFILE" CHANGELOG.md
+
+          # Skip commit if nothing changed.
+          if git diff --quiet CHANGELOG.md; then
+            echo "Changelog already up to date — nothing to commit"
+            exit 0
+          fi
+
+          git add CHANGELOG.md
+          git commit -m "chore(release): sync changelog for v${VERSION}"
+          git push origin "HEAD:refs/heads/version-bump/${VERSION}"
+
+          # Update the PR body with the refreshed commit list.
+          if [[ -n "$LAST_TAG" ]]; then
+            PR_HEADER="### Changes since ${LAST_TAG}:"$'\n\n'"${NEW_ENTRIES}"
+          else
+            PR_HEADER="Initial release."
+          fi
+          PR_BODY="## Release v${VERSION}"$'\n\n'"${PR_HEADER}"$'\n\n'"**To release:** merge this PR. The tag and build will happen automatically."
+
+          gh pr edit "$PR_NUMBER" --body "$PR_BODY"
+          echo "Changelog synced and PR #${PR_NUMBER} body updated"
