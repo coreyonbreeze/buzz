@@ -121,7 +121,7 @@ export function ProfilePopover({
         <PopoverContent
           side="top"
           align="start"
-          sideOffset={8}
+          sideOffset={-32}
           className="w-[280px] rounded-xl border border-border bg-popover p-0 shadow-lg"
           data-testid="profile-popover"
           onInteractOutside={(event) => {
@@ -277,10 +277,7 @@ export function ProfilePopover({
               <>
                 <hr className="mx-3 my-1 h-px border-0 bg-border" />
                 {/* ── Workspace / relay selector ─────────────────── */}
-                <div
-                  className="px-4 py-2"
-                  data-testid="profile-popover-workspace"
-                >
+                <div data-testid="profile-popover-workspace">
                   {workspaceSwitcherSlot}
                 </div>
               </>

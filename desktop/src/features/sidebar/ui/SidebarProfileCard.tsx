@@ -54,10 +54,19 @@ export function SidebarProfileCard({
     [],
   );
   const hasStatus = Boolean(selfUserStatus?.text || selfUserStatus?.emoji);
+  const workspaceLabel = activeWorkspace?.name ?? "No workspace";
+  const readonlyWorkspaceLabel = (
+    <span className="flex min-w-0 items-center gap-1 text-xs leading-snug text-sidebar-foreground/70">
+      <span aria-hidden="true" className="shrink-0 text-[10px] leading-none">
+        🌱
+      </span>
+      <span className="truncate">{workspaceLabel}</span>
+    </span>
+  );
 
   return (
     <div
-      className="group/profile-card rounded-xl px-2 py-2 transition-colors hover:bg-sidebar-border/35 focus-within:bg-sidebar-border/35 dark:hover:bg-sidebar-border/30 dark:focus-within:bg-sidebar-border/30"
+      className="group/profile-card rounded-xl px-2 py-2 transition-colors hover:bg-sidebar-border/35 dark:hover:bg-sidebar-border/30"
       data-testid="sidebar-profile-card"
       ref={profileCardRef}
     >
@@ -132,7 +141,7 @@ export function SidebarProfileCard({
               <button
                 aria-label={`Open profile menu for ${resolvedDisplayName}`}
                 className={cn(
-                  "flex w-full min-w-0 items-center truncate rounded-sm text-left text-xs text-sidebar-foreground/70 outline-hidden transition-opacity duration-150 focus:outline-none focus-visible:outline-none group-hover/profile-card:opacity-0 group-focus-within/profile-card:opacity-0",
+                  "flex w-full min-w-0 items-center truncate rounded-sm text-left text-xs leading-snug text-sidebar-foreground/70 outline-hidden transition-opacity duration-150 focus:outline-none focus-visible:outline-none group-hover/profile-card:opacity-0",
                   profilePopoverOpen && "opacity-100",
                 )}
                 data-testid="sidebar-profile-user-status"
@@ -146,27 +155,15 @@ export function SidebarProfileCard({
               </button>
               <div
                 className={cn(
-                  "pointer-events-none absolute inset-0 flex min-w-0 items-center text-xs leading-none text-sidebar-foreground/70 opacity-0 transition-opacity duration-150 group-hover/profile-card:opacity-100 group-focus-within/profile-card:opacity-100",
+                  "pointer-events-none absolute inset-0 flex min-w-0 items-center text-xs leading-snug text-sidebar-foreground/70 opacity-0 transition-opacity duration-150 group-hover/profile-card:opacity-100",
                   profilePopoverOpen && "opacity-0",
                 )}
               >
-                <span className="truncate">
-                  {activeWorkspace?.name ?? "No workspace"}
-                </span>
+                {readonlyWorkspaceLabel}
               </div>
             </div>
           ) : (
-            <div className="relative mt-0.5">
-              <WorkspaceSwitcher
-                activeWorkspace={activeWorkspace}
-                onAddWorkspace={onOpenAddWorkspace}
-                onRemoveWorkspace={onRemoveWorkspace}
-                onSwitchWorkspace={onSwitchWorkspace}
-                onUpdateWorkspace={onUpdateWorkspace}
-                variant="profile"
-                workspaces={workspaces}
-              />
-            </div>
+            <div className="relative mt-0.5">{readonlyWorkspaceLabel}</div>
           )}
         </div>
       </div>
