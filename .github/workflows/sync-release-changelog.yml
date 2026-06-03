@@ -4,10 +4,10 @@ on:
   push:
     branches: [main]
 
-# Collapse rapid successive main pushes into one sync run.
+# Serialize successive main pushes — each run generates the correct changelog.
 concurrency:
   group: sync-release-changelog
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -29,6 +29,8 @@ jobs:
           PRS=$(gh pr list \
             --repo block/sprout \
             --state open \
+            --base main \
+            --limit 100 \
             --json number,headRefName,headRepository \
             --jq '[.[] |
               select(.headRepository.nameWithOwner == "block/sprout") |
@@ -59,6 +61,14 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Found release PR #${NUMBER} (${BRANCH})"
 
+      - name: Generate GitHub App token
+        if: steps.find-pr.outputs.found == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@v3
+        with:
+          client-id: ${{ vars.RELEASE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+
       - name: Check out release PR branch
         if: steps.find-pr.outputs.found == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -66,13 +76,14 @@ jobs:
           ref: ${{ steps.find-pr.outputs.branch }}
           fetch-depth: 0
           fetch-tags: true
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Regenerate changelog section
         if: steps.find-pr.outputs.found == 'true'
         env:
           VERSION: ${{ steps.find-pr.outputs.version }}
           PR_NUMBER: ${{ steps.find-pr.outputs.number }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
         run: |
           set -euo pipefail
 

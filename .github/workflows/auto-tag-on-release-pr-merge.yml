@@ -60,3 +60,25 @@ jobs:
           gh workflow run release.yml \
             -f version="$VERSION" \
             -f ref="v$VERSION"
+
+      - name: Trigger internal release build
+        env:
+          BUILDKITE_API_TOKEN: ${{ secrets.BUILDKITE_API_TOKEN }}
+          VERSION: ${{ env.version }}
+        run: |
+          curl -sf -X POST \
+            "https://api.buildkite.com/v2/organizations/runway/pipelines/sprout-releases/builds" \
+            -H "Authorization: Bearer ${BUILDKITE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"commit\": \"HEAD\",
+              \"branch\": \"main\",
+              \"message\": \"Release v${VERSION}\",
+              \"meta_data\": {
+                \"version\": \"${VERSION}\",
+                \"sprout_ref\": \"v${VERSION}\",
+                \"relay_url\": \"wss://sprout-oss.stage.blox.sqprod.co\",
+                \"publish_latest\": \"true\"
+              }
+            }"
+

@@ -26,9 +26,9 @@ This creates a `version-bump/<version>` PR that bumps all version manifests, reg
 
 2. **The release PR stays in sync** — if other PRs merge to `main` while the release PR is open, the `sync-release-changelog` workflow automatically updates the changelog on the release PR branch so the final release notes reflect everything that will be in the binary. No manual action needed.
 
-3. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge and pushes a `v<version>` tag.
+3. **Merge the PR** — the `auto-tag-on-release-pr-merge` workflow detects the `version-bump/*` branch merge, pushes a `v<version>` tag, and triggers both the OSS release build and the internal Buildkite pipeline automatically.
 
-4. **Tag triggers `release.yml`** — the existing release workflow builds, signs, notarizes, and publishes the desktop app for macOS and Linux.
+4. **Builds run in parallel** — `release.yml` builds, signs, notarizes, and publishes the OSS desktop app. The `sprout-releases` Buildkite pipeline produces Block-signed macOS and iOS builds with the `-block` version suffix.
 
 ---
 
@@ -70,7 +70,13 @@ If the automated flow isn't suitable (e.g., building from a non-main ref):
 
 ## Internal Releases
 
-After the OSS release ships, trigger an internal build via the **sprout-releases** Buildkite pipeline:
+Internal builds are triggered automatically when the release PR merges. The `auto-tag-on-release-pr-merge` workflow calls the Buildkite REST API to start the [sprout-releases pipeline](https://buildkite.com/runway/sprout-releases) with the correct version, tag ref, relay URL, and `publish_latest=true`. No manual action needed.
+
+Internal desktop builds display a `-block` suffix in the version (e.g., `v0.3.0-block` in the Settings panel). This distinguishes them from OSS builds at a glance. iOS builds and GitHub release tags use the clean version (`0.3.0`) since Apple's `CFBundleShortVersionString` rejects pre-release suffixes.
+
+### Manual Buildkite Trigger (Fallback)
+
+If the automated trigger fails or you need a custom build (different relay URL, `publish_latest=false`, non-tag ref):
 
 1. Go to the [sprout-releases pipeline](https://buildkite.com/runway/sprout-releases) and click **New Build**
 2. Fill in the input fields:
@@ -80,9 +86,7 @@ After the OSS release ships, trigger an internal build via the **sprout-releases
    | `version` | `0.3.0` | Semver, no `v` prefix |
    | `sprout_ref` | `v0.3.0` | The OSS git tag — use the tag, not a branch name |
    | `relay_url` | *(default)* | Pre-filled with the production relay; usually leave as-is |
-   | `publish_latest` | `true` | Updates `latest.json` on Artifactory so installed apps auto-update. Set to `false` for test builds. |
-
-Internal desktop builds display a `-block` suffix in the version (e.g., `v0.3.0-block` in the Settings panel). This distinguishes them from OSS builds at a glance. iOS builds and GitHub release tags use the clean version (`0.3.0`) since Apple's `CFBundleShortVersionString` rejects pre-release suffixes.
+   | `publish_latest` | `true` | Set to `false` for test builds |
 
 ---
 
@@ -102,11 +106,14 @@ Each release produces two GitHub releases:
 - **`gh` CLI** authenticated (`gh auth status`)
 - The following **GitHub Actions secrets** must be configured:
 
-  | Secret | Purpose |
-  |--------|---------|
+  | Secret / Variable | Purpose |
+  |-------------------|---------|
   | `SPROUT_UPDATER_PUBLIC_KEY` | Tauri updater public key (minisign) |
   | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater private key |
   | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Password for the private key |
+  | `RELEASE_APP_CLIENT_ID` (variable) | GitHub App client ID for release automation |
+  | `RELEASE_APP_PRIVATE_KEY` (secret) | GitHub App private key for release automation |
+  | `BUILDKITE_API_TOKEN` | Runway Buildkite API token (`write_builds` scope) |
 
 ---
 
@@ -126,3 +133,6 @@ Verify that the `sprout-desktop-latest` release exists and contains a valid `lat
 
 ### `sync-release-changelog` workflow fails with "Multiple open release PRs"
 More than one `version-bump/*` PR is open. Close or merge the stale one before the sync can resume.
+
+### Internal Buildkite build didn't trigger after release PR merge
+Check the `auto-tag-on-release-pr-merge` workflow run for errors in the "Trigger internal release build" step. Common causes: expired `BUILDKITE_API_TOKEN`, pipeline slug changed, or the token lacks `BUILD_AND_READ` access on the pipeline. Fall back to a [manual Buildkite trigger](#manual-buildkite-trigger-fallback).

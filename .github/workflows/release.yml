@@ -50,6 +50,8 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
           ref: ${{ github.event_name == 'push' && github.ref || inputs.ref }}
+          fetch-depth: 0
+          fetch-tags: true
           persist-credentials: false
 
       - uses: cashapp/activate-hermit@e49f5cb4dd64ff0b0b659d1d8df499595451155a # v1
@@ -229,12 +231,11 @@ jobs:
           DMG_PATH: ${{ steps.artifacts.outputs.dmg }}
         run: |
           RELEASE_SHA=$(git rev-parse HEAD)
-          NOTES=""
-          if [[ -f CHANGELOG.md ]]; then
-            NOTES=$(awk "/^## v${VERSION}$/,/^## v/" CHANGELOG.md | sed '$d')
-          fi
-          if [[ -z "$NOTES" ]]; then
-            NOTES="Sprout Desktop v${VERSION}"
+          PREV_TAG=$(git describe --tags --abbrev=0 --match 'v[0-9]*' HEAD^ 2>/dev/null || echo "")
+          if [[ -n "$PREV_TAG" ]]; then
+            NOTES=$(git log "${PREV_TAG}..HEAD" --oneline --no-merges)
+          else
+            NOTES="Initial release"
           fi
           gh release create "v${VERSION}" \
             --target "$RELEASE_SHA" \
