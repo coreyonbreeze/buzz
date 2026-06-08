@@ -258,14 +258,23 @@ pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<Strin
 }
 
 fn command_search_dirs() -> Vec<PathBuf> {
+    // Prefer the profile this app was built with: a debug desktop build (e.g.
+    // `tauri dev` via `just staging`) should pick up debug sidecars, not stale
+    // release artifacts left in `target/`.
+    let (preferred, fallback) = if cfg!(debug_assertions) {
+        ("target/debug", "target/release")
+    } else {
+        ("target/release", "target/debug")
+    };
+
     let mut dirs = vec![
-        workspace_root_dir().join("target/release"),
-        workspace_root_dir().join("target/debug"),
+        workspace_root_dir().join(preferred),
+        workspace_root_dir().join(fallback),
     ];
 
     if let Ok(current_dir) = std::env::current_dir() {
-        dirs.push(current_dir.join("target/release"));
-        dirs.push(current_dir.join("target/debug"));
+        dirs.push(current_dir.join(preferred));
+        dirs.push(current_dir.join(fallback));
     }
 
     if let Ok(exe_path) = std::env::current_exe() {
@@ -539,10 +548,30 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{
-        classify_runtime, find_via_login_shell, managed_agent_avatar_url, normalize_agent_args,
-        CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL, SPROUT_AGENT_AVATAR_URL,
+        classify_runtime, command_search_dirs, find_via_login_shell, managed_agent_avatar_url,
+        normalize_agent_args, CLAUDE_CODE_AVATAR_URL, CODEX_AVATAR_URL, GOOSE_AVATAR_URL,
+        SPROUT_AGENT_AVATAR_URL,
     };
     use crate::managed_agents::AcpAvailabilityStatus;
+
+    #[test]
+    fn search_dirs_prefer_this_builds_profile() {
+        let dirs = command_search_dirs();
+        let release = dirs
+            .iter()
+            .position(|d| d.ends_with("target/release"))
+            .expect("release dir present");
+        let debug = dirs
+            .iter()
+            .position(|d| d.ends_with("target/debug"))
+            .expect("debug dir present");
+
+        // This test binary is built debug, so debug must be searched first.
+        assert!(
+            debug < release,
+            "debug build must search target/debug first"
+        );
+    }
 
     #[test]
     fn resolves_known_avatar_for_bare_command() {

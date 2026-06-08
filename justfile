@@ -547,7 +547,7 @@ goose relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROU
     if [[ "{{heartbeat}}" != "0" ]]; then
         env_args+=(SPROUT_ACP_HEARTBEAT_INTERVAL={{heartbeat}})
     fi
-    exec env "${env_args[@]}" ./target/debug/sprout-acp
+    exec env PATH="$PWD/target/debug:$PATH" "${env_args[@]}" ./target/debug/sprout-acp
 
 # Run a goose agent in the background (screen session named 'goose-agent-N')
 goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SPROUT_PRIVATE_KEY":
@@ -566,5 +566,5 @@ goose-bg relay="ws://localhost:3000" agents="1" heartbeat="0" prompt="" key="$SP
     if [[ "{{heartbeat}}" != "0" ]]; then
         env_args+=(SPROUT_ACP_HEARTBEAT_INTERVAL={{heartbeat}})
     fi
-    screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env "${env_args[@]}") ./target/debug/sprout-acp"
+    screen -dmS goose-agent-{{agents}} bash -c "$(printf '%q ' env PATH="$PWD/target/debug:$PATH" "${env_args[@]}") ./target/debug/sprout-acp"
     echo "Agent running in screen session 'goose-agent-{{agents}}'. Attach with: screen -r goose-agent-{{agents}}"
