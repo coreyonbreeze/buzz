@@ -320,6 +320,9 @@ pub enum RelayError {
 
     #[error("Unexpected message: {0}")]
     UnexpectedMessage(String),
+
+    #[error("Event build error: {0}")]
+    EventBuild(String),
 }
 
 impl From<nostr::event::builder::Error> for RelayError {
@@ -760,17 +763,30 @@ impl HarnessRelay {
         use sprout_core::kind::KIND_STREAM_MESSAGE;
 
         let h_tag = Tag::parse(["h", &channel_id.to_string()])
-            .map_err(|e| RelayError::AuthFailed(e.to_string()))?;
+            .map_err(|e| RelayError::EventBuild(e.to_string()))?;
         let mut tags = vec![h_tag];
         if let Some(root_id) = thread_root {
-            let e_tag = Tag::parse(["e", root_id, "", "reply"])
-                .map_err(|e| RelayError::AuthFailed(e.to_string()))?;
+            let e_tag = Tag::parse(["e", root_id, "", "root"])
+                .map_err(|e| RelayError::EventBuild(e.to_string()))?;
             tags.push(e_tag);
         }
         let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), message)
             .tags(tags)
             .sign_with_keys(&self.keys)?;
         Ok(event)
+    }
+
+    /// Build and publish a death notice, logging any failure rather than
+    /// propagating it. Used by both the timeout and transport-error paths.
+    pub fn publish_death_notice(&self, channel_id: Uuid, message: &str, thread_root: Option<&str>) {
+        match self.build_death_notice(channel_id, message, thread_root) {
+            Ok(event) => {
+                if let Err(e) = self.try_publish_event(event) {
+                    warn!("failed to publish death notice: {e}");
+                }
+            }
+            Err(e) => warn!("failed to build death notice: {e}"),
+        }
     }
 
     /// Set the startup watermark timestamp (Finding #22).

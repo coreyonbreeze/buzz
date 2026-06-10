@@ -2096,16 +2096,7 @@ fn handle_prompt_result(
             // Post a visible death notice to the channel so humans know why
             // the agent went silent.
             if let Some(ch) = channel_id {
-                match relay.build_death_notice(ch, death_message, thread_root.as_deref()) {
-                    Ok(event) => {
-                        if let Err(e) = relay.try_publish_event(event) {
-                            tracing::warn!("failed to publish death notice: {e}");
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("failed to build death notice: {e}");
-                    }
-                }
+                relay.publish_death_notice(ch, death_message, thread_root.as_deref());
             }
             let index = result.agent.index;
             let slot_history = &mut crash_history[index];
@@ -2166,20 +2157,11 @@ fn handle_prompt_result(
 
                 // Post a visible death notice for transport errors too.
                 if let Some(ch) = channel_id {
-                    match relay.build_death_notice(
+                    relay.publish_death_notice(
                         ch,
                         "Agent connection lost (transport error)",
                         thread_root.as_deref(),
-                    ) {
-                        Ok(event) => {
-                            if let Err(e) = relay.try_publish_event(event) {
-                                tracing::warn!("failed to publish death notice: {e}");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::warn!("failed to build death notice: {e}");
-                        }
-                    }
+                    );
                 }
 
                 let index = result.agent.index;
