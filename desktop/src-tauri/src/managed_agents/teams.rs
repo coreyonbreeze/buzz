@@ -165,6 +165,7 @@ pub fn save_teams(app: &AppHandle, records: &[TeamRecord]) -> Result<(), String>
 // ---------------------------------------------------------------------------
 
 /// Teams directory: `<AppDataDir>/agents/teams/`
+#[cfg(feature = "legacy_team_sync")]
 fn teams_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let dir = managed_agents_base_dir(app)?.join("teams");
     fs::create_dir_all(&dir).map_err(|e| format!("failed to create teams dir: {e}"))?;
@@ -172,6 +173,7 @@ fn teams_dir(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 /// Validate team/pack ID: only `[a-zA-Z0-9._-]+` allowed (zip-slip defense).
+#[cfg(feature = "legacy_team_sync")]
 pub(crate) fn validate_team_id(id: &str) -> Result<(), String> {
     if id.is_empty() {
         return Err("team ID is empty".into());
@@ -199,6 +201,7 @@ pub(crate) fn validate_team_id(id: &str) -> Result<(), String> {
 }
 
 /// Copy a directory tree, skipping symlinks (zip-slip defense).
+#[cfg(feature = "legacy_team_sync")]
 fn copy_dir_no_symlinks(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
     fs::create_dir_all(dst).map_err(|e| format!("failed to create {}: {e}", dst.display()))?;
     for entry in fs::read_dir(src).map_err(|e| format!("failed to read {}: {e}", src.display()))? {
@@ -225,6 +228,7 @@ fn copy_dir_no_symlinks(src: &std::path::Path, dst: &std::path::Path) -> Result<
 ///
 /// Copies the directory into `<data>/agents/teams/<resolved.id>/`,
 /// creates PersonaRecords for each persona, creates a TeamRecord with source_dir set.
+#[cfg(feature = "legacy_team_sync")]
 pub fn import_team_from_directory(
     app: &AppHandle,
     source_dir: &std::path::Path,
@@ -415,6 +419,7 @@ pub fn delete_team_with_cascade(app: &AppHandle, team_id: &str) -> Result<(), St
 }
 
 /// Re-reads a directory-backed team and reconciles with stored records.
+#[cfg(feature = "legacy_team_sync")]
 pub fn sync_team_from_dir(
     app: &AppHandle,
     team_id: &str,
@@ -715,6 +720,13 @@ pub fn parse_team_json(json_bytes: &[u8]) -> Result<ParsedTeamPreview, String> {
 /// Sync all directory-backed teams on launch — the team equivalent of the
 /// former `sync_pack_personas`. Silently skips teams whose source directory
 /// is missing (e.g., external drive unmounted).
+///
+/// Superseded by `fleet_update::check_fleet_updates`, which propagates persona
+/// edits to agent engrams instead of directory files. Retained behind
+/// `legacy_team_sync` for one release as a rollback path; `#[allow(dead_code)]`
+/// because the launch call site moved to fleet update.
+#[cfg(feature = "legacy_team_sync")]
+#[allow(dead_code)]
 pub fn sync_team_personas(app: &AppHandle) -> Result<(), String> {
     let teams = load_teams(app)?;
     for team in &teams {
