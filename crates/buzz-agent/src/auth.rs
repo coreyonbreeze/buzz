@@ -120,7 +120,17 @@ impl PkceOAuthTokenSource {
             fs::create_dir_all(parent)
                 .map_err(|e| AgentError::Llm(format!("oauth cache dir {parent:?}: {e}")))?;
         }
-        let initial = read_cache(&cache_path);
+        let initial = read_cache(&cache_path).or_else(|| {
+            // One-time migration: check the legacy sprout-agent cache path.
+            let legacy = legacy_cache_path(&cache_path)?;
+            let token = read_cache(&legacy)?;
+            // Copy to the new location so subsequent starts skip this fallback.
+            if let Ok(body) = fs::read(&legacy) {
+                let _ = fs::write(&cache_path, &body);
+            }
+            tracing::info!("migrated oauth cache from legacy path {legacy:?}");
+            Some(token)
+        });
         Ok(Arc::new(Self {
             cfg,
             http: Client::new(),
@@ -301,6 +311,19 @@ fn cache_path_for(cfg: &PkceOAuthConfig) -> Result<PathBuf, AgentError> {
 fn read_cache(path: &PathBuf) -> Option<CachedToken> {
     let body = fs::read(path).ok()?;
     serde_json::from_slice(&body).ok()
+}
+
+/// Compute the legacy cache path under `~/.config/sprout-agent/oauth/` for
+/// a given primary path under `~/.config/buzz-agent/oauth/`. Returns `None`
+/// if the path doesn't contain the expected `buzz-agent/oauth` segment.
+fn legacy_cache_path(primary: &std::path::Path) -> Option<PathBuf> {
+    let s = primary.to_str()?;
+    let marker = "/buzz-agent/oauth/";
+    if s.contains(marker) {
+        Some(PathBuf::from(s.replacen(marker, "/sprout-agent/oauth/", 1)))
+    } else {
+        None
+    }
 }
 
 /// Parse a token-endpoint JSON response. Fails loudly when `access_token`
@@ -548,5 +571,64 @@ mod tests {
     fn token_from_response_rejects_empty_access_token() {
         let v: Value = serde_json::from_str(r#"{"access_token":""}"#).unwrap();
         assert!(token_from_response(&v, None).is_err());
+    }
+
+    #[test]
+    fn legacy_cache_path_rewrites_buzz_agent_to_sprout_agent() {
+        let primary = PathBuf::from("/home/user/.config/buzz-agent/oauth/databricks/abc123.json");
+        let legacy = legacy_cache_path(&primary).unwrap();
+        assert_eq!(
+            legacy,
+            PathBuf::from("/home/user/.config/sprout-agent/oauth/databricks/abc123.json")
+        );
+    }
+
+    #[test]
+    fn legacy_cache_path_returns_none_for_override_path() {
+        // cache_dir_override paths won't contain the buzz-agent segment
+        let primary = PathBuf::from("/tmp/test-cache/databricks/abc123.json");
+        assert!(legacy_cache_path(&primary).is_none());
+    }
+
+    #[test]
+    fn legacy_cache_migration_copies_token() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Set up the legacy path with a cached token
+        let legacy_dir = tmp.path().join("sprout-agent/oauth/databricks");
+        fs::create_dir_all(&legacy_dir).unwrap();
+        let token = CachedToken {
+            access_token: "migrated-token".into(),
+            refresh_token: Some("migrated-refresh".into()),
+            expires_at: Some(9999999999),
+        };
+        let legacy_file = legacy_dir.join("hash.json");
+        fs::write(&legacy_file, serde_json::to_vec(&token).unwrap()).unwrap();
+
+        // Primary path does not exist yet
+        let primary_dir = tmp.path().join("buzz-agent/oauth/databricks");
+        fs::create_dir_all(&primary_dir).unwrap();
+        let primary_file = primary_dir.join("hash.json");
+        assert!(!primary_file.exists());
+
+        // Simulate the migration: read_cache on primary fails, legacy_cache_path
+        // rewrites, read_cache on legacy succeeds, file is copied.
+        let initial = read_cache(&primary_file).or_else(|| {
+            let legacy = legacy_cache_path(&primary_file)?;
+            let tok = read_cache(&legacy)?;
+            if let Ok(body) = fs::read(&legacy) {
+                let _ = fs::write(&primary_file, &body);
+            }
+            Some(tok)
+        });
+
+        let loaded = initial.unwrap();
+        assert_eq!(loaded.access_token, "migrated-token");
+        assert_eq!(loaded.refresh_token.as_deref(), Some("migrated-refresh"));
+        // Verify the file was copied to the new location
+        assert!(primary_file.exists());
+        let copied: CachedToken =
+            serde_json::from_slice(&fs::read(&primary_file).unwrap()).unwrap();
+        assert_eq!(copied.access_token, "migrated-token");
     }
 }
