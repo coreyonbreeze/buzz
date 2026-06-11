@@ -20,6 +20,7 @@ const presenceSpring = {
 export const MessageComposerToolbar = React.memo(
   function MessageComposerToolbar({
     composerDisabled,
+    agentModelSelector,
     editor,
     extraActions,
     formattingDisabled,
@@ -36,6 +37,7 @@ export const MessageComposerToolbar = React.memo(
     sendDisabled,
   }: {
     composerDisabled: boolean;
+    agentModelSelector?: React.ReactNode;
     editor: Editor | null;
     extraActions?: React.ReactNode;
     formattingDisabled: boolean;
@@ -235,6 +237,7 @@ export const MessageComposerToolbar = React.memo(
                     <TooltipContent>Formatting</TooltipContent>
                   </Tooltip>
                 </motion.div>
+                {agentModelSelector}
               </motion.div>
             )}
           </AnimatePresence>

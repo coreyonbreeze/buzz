@@ -32,7 +32,7 @@ import {
 import { useTypingBroadcast } from "@/features/messages/useTypingBroadcast";
 import { getSproutCodeBlockClipboardText } from "@/shared/lib/codeBlockClipboard";
 import { cn } from "@/shared/lib/cn";
-import type { ChannelType } from "@/shared/api/types";
+import type { AgentPersona, ChannelType } from "@/shared/api/types";
 import { Button } from "@/shared/ui/button";
 import { ChannelAutocomplete } from "./ChannelAutocomplete";
 import { ComposerAttachments, DropZoneOverlay } from "./ComposerAttachments";
@@ -41,6 +41,7 @@ import {
   MentionAutocomplete,
   type MentionSuggestion,
 } from "./MentionAutocomplete";
+import { AgentMentionModelSelector } from "./AgentMentionModelSelector";
 import { MessageComposerToolbar } from "./MessageComposerToolbar";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useMentionSendFlow } from "./useMentionSendFlow";
@@ -236,6 +237,7 @@ export function MessageComposer({
     channelId,
     channelLinks,
     channelType,
+    content,
     contentRef,
     customEmoji,
     drafts,
@@ -362,6 +364,30 @@ export function MessageComposer({
     [
       applyAutocompleteEdit,
       mentions.insertMention,
+      richText.getPlainTextAndCursor,
+    ],
+  );
+
+  const applyPersonaMentionInsert = React.useCallback(
+    (persona: AgentPersona) => {
+      if (!richText.editor) return;
+
+      const { text, cursor } = richText.getPlainTextAndCursor();
+      const previousChar = text.slice(0, cursor).slice(-1);
+      const prefix =
+        cursor > 0 && previousChar && !/\s/.test(previousChar) ? " " : "";
+
+      richText.editor
+        .chain()
+        .focus()
+        .insertContent(`${prefix}@${persona.displayName} `)
+        .run();
+      mentions.registerMentionPersona(persona.displayName, persona.id);
+      setIsEmojiPickerOpen(false);
+    },
+    [
+      mentions.registerMentionPersona,
+      richText.editor,
       richText.getPlainTextAndCursor,
     ],
   );
@@ -842,6 +868,21 @@ export function MessageComposer({
             </div>
 
             <MessageComposerToolbar
+              agentModelSelector={
+                <AgentMentionModelSelector
+                  disabled={disabled}
+                  error={mentionSendFlow.agentModelPromptError}
+                  isLoading={mentionSendFlow.isLoadingAgentModelTargets}
+                  isLoadingPersonas={
+                    mentionSendFlow.isLoadingAgentModelPersonas
+                  }
+                  onModelChange={mentionSendFlow.onAgentModelChange}
+                  onPersonaSelect={applyPersonaMentionInsert}
+                  onTriggerMouseDown={handleCaptureSelection}
+                  personas={mentionSendFlow.agentModelPersonas}
+                  targets={mentionSendFlow.agentModelTargets}
+                />
+              }
               composerDisabled={disabled}
               editor={richText.editor}
               extraActions={toolbarExtraActions}
