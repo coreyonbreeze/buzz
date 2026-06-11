@@ -6,7 +6,7 @@
     "buzz": {
       "name": "Buzz",
       "source": {
-        "image": "ghcr.io/block/buzz:latest"
+        "image": "ghcr.io/block/buzz:main"
       },
       "deploy": {
         "healthcheckPath": "/_readiness",

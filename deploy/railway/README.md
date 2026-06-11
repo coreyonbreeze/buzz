@@ -10,7 +10,7 @@ This directory contains Buzz's first-party Railway template draft. It is intenti
 
 `railway.template.json` models the current full Buzz deployment as six Railway services:
 
-- `Buzz` (`ghcr.io/block/buzz:latest`) — the relay and bundled web UI.
+- `Buzz` (`ghcr.io/block/buzz:main`) — the relay and bundled web UI. `:main` is the rolling pre-release image published from the repository's default branch; production operators should pin `:sha-<7>` or a semver tag once releases exist.
 - `Postgres` — persistent database volume with daily backups requested in the template.
 - `Redis` — authenticated persistent pub/sub/cache service.
 - `Typesense` — persistent search service.
@@ -43,7 +43,7 @@ This template is mechanically valid JSON and follows the v2 template mechanics o
 
 End-to-end click-through validation is intentionally blocked until:
 
-1. `ghcr.io/block/buzz:<version>` is publicly published.
+1. `ghcr.io/block/buzz:main` is publicly published by the image pipeline.
 2. Buzz owns fresh-database migrations at startup or through the same image.
 
 Until both land, this template should be treated as first-party deploy wiring, not a proven production install.
