@@ -31,6 +31,7 @@ type ManagedAgentSessionPanelProps = {
   compact?: boolean;
   emptyDescription?: string;
   isWorking?: boolean;
+  rawLayout?: "responsive" | "exclusive";
   showHeader?: boolean;
   showInterventionHint?: boolean;
   showRaw?: boolean;
@@ -44,6 +45,7 @@ export function ManagedAgentSessionPanel({
   compact = false,
   emptyDescription = "Mention this agent in a channel to watch the next turn.",
   isWorking = false,
+  rawLayout = "responsive",
   showHeader = true,
   showInterventionHint = false,
   showRaw = true,
@@ -108,6 +110,7 @@ export function ManagedAgentSessionPanel({
         hasObserver={hasObserver}
         isWorking={isWorking}
         profiles={profiles}
+        rawLayout={rawLayout}
         showInterventionHint={showInterventionHint}
         showRaw={showRaw}
         transcript={scopedTranscript}
@@ -161,6 +164,7 @@ function SessionBody({
   hasObserver,
   isWorking,
   profiles,
+  rawLayout,
   showInterventionHint,
   showRaw,
   transcript,
@@ -174,10 +178,26 @@ function SessionBody({
   hasObserver: boolean;
   isWorking: boolean;
   profiles?: UserProfileLookup;
+  rawLayout: "responsive" | "exclusive";
   showInterventionHint: boolean;
   showRaw: boolean;
   transcript: TranscriptItem[];
 }) {
+  if (showRaw && rawLayout === "exclusive") {
+    return (
+      <>
+        <RawEventRail events={events} />
+
+        {errorMessage ? (
+          <p className="mt-4 inline-flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <CircleAlert className="h-4 w-4" />
+            {errorMessage}
+          </p>
+        ) : null}
+      </>
+    );
+  }
+
   return (
     <>
       {!hasObserver ? (
@@ -187,7 +207,7 @@ function SessionBody({
       ) : (
         <div
           className={cn(
-            showRaw
+            showRaw && rawLayout === "responsive"
               ? "mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_20rem]"
               : "mt-0",
           )}
@@ -201,7 +221,9 @@ function SessionBody({
             profiles={profiles}
             showInterventionHint={showInterventionHint}
           />
-          {showRaw ? <RawEventRail events={events} /> : null}
+          {showRaw && rawLayout === "responsive" ? (
+            <RawEventRail events={events} />
+          ) : null}
         </div>
       )}
 

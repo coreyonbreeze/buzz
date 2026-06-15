@@ -1,4 +1,5 @@
-import { ArrowLeft, CircleDot, Octagon, X } from "lucide-react";
+import * as React from "react";
+import { ArrowLeft, CircleDot, Octagon, TerminalSquare, X } from "lucide-react";
 import { toast } from "sonner";
 
 import { ManagedAgentSessionPanel } from "@/features/agents/ui/ManagedAgentSessionPanel";
@@ -25,6 +26,7 @@ import {
   PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS,
 } from "@/shared/ui/OverlayPanelBackdrop";
 import { THREAD_PANEL_MIN_WIDTH_PX } from "@/shared/hooks/useThreadPanelWidth";
+import { Switch } from "@/shared/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import type { ChannelAgentSessionAgent } from "./useChannelAgentSessions";
 
@@ -60,6 +62,19 @@ export function AgentSessionThreadPanel({
   useEscapeKey(onClose, isOverlay || isSinglePanelView);
 
   const { ref: scrollRef, onScroll } = useStickToBottom<HTMLDivElement>();
+  const rawFeedScopeKey = `${agent.pubkey}:${channel.id}`;
+  const [rawFeedState, setRawFeedState] = React.useState(() => ({
+    scopeKey: rawFeedScopeKey,
+    show: false,
+  }));
+  const showRawFeed =
+    rawFeedState.scopeKey === rawFeedScopeKey && rawFeedState.show;
+  const handleRawFeedChange = React.useCallback(
+    (checked: boolean) => {
+      setRawFeedState({ scopeKey: rawFeedScopeKey, show: checked });
+    },
+    [rawFeedScopeKey],
+  );
 
   async function handleInterruptTurn() {
     try {
@@ -86,6 +101,32 @@ export function AgentSessionThreadPanel({
           <CircleDot className="h-2.5 w-2.5" />
           Live
         </Badge>
+      ) : null}
+      {isLive ? (
+        <div
+          className="flex min-w-19 shrink-0 items-center justify-end gap-2"
+          title={
+            showRawFeed
+              ? "Hide raw JSON-RPC payloads."
+              : "Show raw JSON-RPC payloads for this channel."
+          }
+        >
+          <label
+            className="flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-muted-foreground"
+            htmlFor="agent-session-raw-feed-switch"
+          >
+            <TerminalSquare className="h-3 w-3" />
+            Raw
+          </label>
+          <Switch
+            aria-label={showRawFeed ? "Hide raw feed" : "Show raw feed"}
+            checked={showRawFeed}
+            className="shrink-0 data-[state=unchecked]:bg-muted-foreground/45 [&>span]:bg-white"
+            data-testid="agent-session-toggle-raw-feed"
+            id="agent-session-raw-feed-switch"
+            onCheckedChange={handleRawFeedChange}
+          />
+        </div>
       ) : null}
       {isLive && isWorking ? (
         <Tooltip>
@@ -140,7 +181,9 @@ export function AgentSessionThreadPanel({
         >
           <ArrowLeft />
         </Button>
-        <AuxiliaryPanelTitle>Activity</AuxiliaryPanelTitle>
+        <AuxiliaryPanelTitle>
+          {showRawFeed ? "Raw ACP Activity" : "Activity"}
+        </AuxiliaryPanelTitle>
       </AuxiliaryPanelHeaderGroup>
       {agentHeaderActions}
     </>
@@ -164,9 +207,10 @@ export function AgentSessionThreadPanel({
         emptyDescription={`Mention ${agent.name} in the channel to see its work here.`}
         isWorking={isWorking}
         profiles={profiles}
+        rawLayout="exclusive"
         showHeader={false}
         showInterventionHint={canInterruptTurn}
-        showRaw={false}
+        showRaw={showRawFeed}
       />
     </div>
   );
