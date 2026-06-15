@@ -63,19 +63,31 @@ test("buildCompactToolSummary formats shell command preview", () => {
   assert.equal(summary.preview, "git status");
 });
 
-test("buildCompactToolSummary formats view_image source preview", () => {
+test("buildCompactToolSummary formats view_image thumbnail source", () => {
+  const source =
+    "https://sprout-oss.stage.blox.sqprod.co/media/ffd1b2721f2d52e19f0ca2be9aa7842cdec5b4e0215aaab2a67c26a2a76a6a83.png";
   const summary = buildCompactToolSummary(
     makeTool({
       toolName: "buzz-dev-mcp__view_image",
-      args: {
-        source:
-          "https://sprout-oss.stage.blox.sqprod.co/media/ffd1b2721f2d52e19f0ca2be9aa7842cdec5b4e0215aaab2a67c26a2a76a6a83.png",
-      },
+      args: { source },
     }),
   );
 
   assert.equal(summary.label, "Viewed image");
-  assert.ok(summary.preview?.startsWith("https://sprout-oss"));
+  assert.equal(summary.thumbnailSrc, source);
+  assert.equal(summary.preview, source);
+});
+
+test("buildCompactToolSummary uses basename for local view_image paths", () => {
+  const summary = buildCompactToolSummary(
+    makeTool({
+      toolName: "view_image",
+      args: { source: "desktop/assets/screenshot.png" },
+    }),
+  );
+
+  assert.equal(summary.thumbnailSrc, null);
+  assert.equal(summary.preview, "screenshot.png");
 });
 
 test("buildCompactToolSummary formats read_file path preview", () => {
