@@ -31,6 +31,17 @@ type ObserverEvent = {
 const SESSION_ID = "sess-pr3-001";
 const TURN_ID = "turn-pr3-001";
 
+// Canonical seed identities, mirroring the conventions used by the other
+// screenshot specs (active-turn-screenshots.spec.ts):
+//   - agent pubkey is a deterministic all-`aa` hex string
+//   - the channel is the well-known mock "general" channel id
+export const OBSERVER_SEED_AGENT_PUBKEY = "aa".repeat(32);
+export const OBSERVER_SEED_CHANNEL_ID = "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50";
+
+// Human author whose prompt triggers the seeded turn (drives the prompt avatar).
+const OBSERVER_SEED_AUTHOR_PUBKEY =
+  "e5ebc6cdb579be112e336cc319b5989b4bb6af11786ea90dbe52b5f08d741b34";
+
 // A tiny 1x1 transparent PNG data URL — stands in for a view_image thumbnail
 // so the mediaInset rendering path lights up without shipping a binary asset.
 const SAMPLE_IMAGE_DATA_URL =
@@ -54,16 +65,19 @@ export function buildPopulatedObserverEvents(
     kind: string,
     payload: unknown,
     offsetMs: number,
-  ): ObserverEvent => ({
-    seq: (seq += 1),
-    timestamp: at(offsetMs),
-    kind,
-    agentIndex: 0,
-    channelId,
-    sessionId: SESSION_ID,
-    turnId: TURN_ID,
-    payload,
-  });
+  ): ObserverEvent => {
+    seq += 1;
+    return {
+      seq,
+      timestamp: at(offsetMs),
+      kind,
+      agentIndex: 0,
+      channelId,
+      sessionId: SESSION_ID,
+      turnId: TURN_ID,
+      payload,
+    };
+  };
 
   const sessionUpdate = (update: Record<string, unknown>) => ({
     method: "session/update",
@@ -72,11 +86,7 @@ export function buildPopulatedObserverEvents(
 
   return [
     // ── lifecycle ──────────────────────────────────────────────────────────
-    ev(
-      "turn_started",
-      { triggeringEventIds: ["evt-aaaa", "evt-bbbb"] },
-      0,
-    ),
+    ev("turn_started", { triggeringEventIds: ["evt-aaaa", "evt-bbbb"] }, 0),
     ev("session_resolved", { isNewSession: true }, 200),
 
     // ── user prompt with [Buzz event] context (drives grouped prompt + avatar)
@@ -155,7 +165,7 @@ export function buildPopulatedObserverEvents(
         toolCallId: "tool-read-1",
         status: "completed",
         content: {
-          text: "[server]\nport = 3000\nrelay = \"wss://sprout-oss.stage.blox.sqprod.co\"\n[features]\nobserver = true",
+          text: '[server]\nport = 3000\nrelay = "wss://sprout-oss.stage.blox.sqprod.co"\n[features]\nobserver = true',
         },
       }),
       1200,
@@ -229,3 +239,10 @@ export function buildPopulatedObserverEvents(
     ),
   ];
 }
+
+// Pre-built populated transcript for the canonical seed agent + channel. The
+// screenshot spec feeds this straight into `__BUZZ_E2E_SEED_OBSERVER_FRAMES__`.
+export const observerSeedFrames = buildPopulatedObserverEvents({
+  channelId: OBSERVER_SEED_CHANNEL_ID,
+  authorPubkey: OBSERVER_SEED_AUTHOR_PUBKEY,
+});
