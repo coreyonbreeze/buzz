@@ -92,6 +92,9 @@ type MockBridgeOptions = {
   };
   managedAgents?: MockManagedAgentSeed[];
   createManagedAgentDelayMs?: number;
+  channelsReadError?: string;
+  feedReadError?: string;
+  canvasReadError?: string;
   profileReadDelayMs?: number;
   profileReadError?: string;
   profileUpdateError?: string;
@@ -135,6 +138,11 @@ type MockBridgeOptions = {
     size: number;
     type: string;
     uploaded: number;
+    dim?: string;
+    blurhash?: string;
+    thumb?: string;
+    duration?: number;
+    image?: string;
     filename?: string;
   }[];
 };
@@ -438,6 +446,7 @@ export async function installMockBridge(
   page: Page,
   mock?: MockBridgeOptions,
   options?: {
+    relayWsUrl?: string;
     skipOnboardingSeed?: boolean;
     skipWorkspaceSeed?: boolean;
     seedPreviewFeatures?: boolean;
@@ -446,6 +455,7 @@ export async function installMockBridge(
   await installBridge(page, {
     mode: "mock",
     mock,
+    relayWsUrl: options?.relayWsUrl,
     skipOnboardingSeed: options?.skipOnboardingSeed,
     skipWorkspaceSeed: options?.skipWorkspaceSeed,
     seedPreviewFeatures: options?.seedPreviewFeatures,
