@@ -35,7 +35,6 @@ type ManagedAgentSessionPanelProps = {
   isWorking?: boolean;
   rawLayout?: "responsive" | "exclusive";
   showHeader?: boolean;
-  showInterventionHint?: boolean;
   showRaw?: boolean;
   profiles?: UserProfileLookup;
 };
@@ -49,7 +48,6 @@ export function ManagedAgentSessionPanel({
   isWorking = false,
   rawLayout = "responsive",
   showHeader = true,
-  showInterventionHint = false,
   showRaw = true,
   profiles,
 }: ManagedAgentSessionPanelProps) {
@@ -115,7 +113,6 @@ export function ManagedAgentSessionPanel({
         isWorking={isWorking}
         profiles={profiles}
         rawLayout={rawLayout}
-        showInterventionHint={showInterventionHint}
         showRaw={showRaw}
         transcript={scopedTranscript}
       />
@@ -171,7 +168,6 @@ function SessionBody({
   isWorking,
   profiles,
   rawLayout,
-  showInterventionHint,
   showRaw,
   transcript,
 }: {
@@ -187,7 +183,6 @@ function SessionBody({
   isWorking: boolean;
   profiles?: UserProfileLookup;
   rawLayout: "responsive" | "exclusive";
-  showInterventionHint: boolean;
   showRaw: boolean;
   transcript: TranscriptItem[];
 }) {
@@ -229,7 +224,6 @@ function SessionBody({
             isWorking={isWorking}
             items={transcript}
             profiles={profiles}
-            showInterventionHint={showInterventionHint}
           />
           {showRaw && rawLayout === "responsive" ? (
             <RawEventRail events={events} />

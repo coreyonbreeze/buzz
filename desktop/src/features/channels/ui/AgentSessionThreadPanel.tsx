@@ -206,7 +206,6 @@ export function AgentSessionThreadPanel({
         profiles={profiles}
         rawLayout="exclusive"
         showHeader={false}
-        showInterventionHint={canInterruptTurn}
         showRaw={showRawFeed}
       />
     </div>

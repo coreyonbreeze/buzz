@@ -1,15 +1,12 @@
 import * as React from "react";
 import {
   AlertCircle,
-  Bot,
   Brain,
   CheckCheck,
   ChevronDown,
   CircleDot,
-  Loader2,
   Radio,
   TerminalSquare,
-  Wrench,
 } from "lucide-react";
 
 import {
@@ -20,7 +17,6 @@ import { cn } from "@/shared/lib/cn";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Badge } from "@/shared/ui/badge";
 import { Markdown } from "@/shared/ui/markdown";
-import { Shimmer } from "@/shared/ui/Shimmer";
 import { Toggle } from "@/shared/ui/toggle";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import type { PromptSection, TranscriptItem } from "./agentSessionTypes";
@@ -55,14 +51,12 @@ export function AgentSessionTranscriptList({
   isWorking = false,
   items,
   profiles,
-  showInterventionHint = false,
 }: AgentTranscriptIdentityProps & {
   compact?: boolean;
   emptyDescription: string;
   isWorking?: boolean;
   items: TranscriptItem[];
   profiles?: UserProfileLookup;
-  showInterventionHint?: boolean;
 }) {
   const presentation = React.useMemo(
     () => buildTranscriptPresentation(items, isWorking),
@@ -90,13 +84,6 @@ export function AgentSessionTranscriptList({
 
   return (
     <div className="w-full">
-      <TranscriptNowSummary
-        agentName={agentName}
-        compact={compact}
-        isWorking={isWorking}
-        presentation={presentation}
-        showInterventionHint={showInterventionHint}
-      />
       <div
         aria-label="Live ACP transcript"
         aria-live="polite"
@@ -130,202 +117,6 @@ function TranscriptAcpSourceBadge({ source }: { source: string }) {
       {source}
     </span>
   );
-}
-
-function TranscriptNowSummary({
-  agentName,
-  compact,
-  isWorking,
-  presentation,
-  showInterventionHint,
-}: {
-  agentName: string;
-  compact: boolean;
-  isWorking: boolean;
-  presentation: ReturnType<typeof buildTranscriptPresentation>;
-  showInterventionHint: boolean;
-}) {
-  const { counts, hasError, headline, lastUpdatedAt, state } = presentation;
-  const showSummary = isWorking || hasError || itemsHaveActivity(counts);
-
-  if (!showSummary) {
-    return null;
-  }
-
-  const StateIcon = getStateIcon(state, isWorking);
-  const statusLabel = getStateLabel(state, isWorking);
-  const lastUpdated = lastUpdatedAt
-    ? formatTranscriptTime(lastUpdatedAt)
-    : null;
-
-  return (
-    <div
-      className={cn(
-        "sticky top-0 z-10 mb-3 rounded-lg border bg-background/95 backdrop-blur-sm",
-        hasError
-          ? "border-destructive/30 bg-destructive/[0.04]"
-          : "border-border/70",
-        compact ? "px-2.5 py-2" : "px-3 py-2.5",
-      )}
-      data-testid="agent-transcript-now-summary"
-    >
-      <div className="flex items-start gap-2">
-        <span
-          className={cn(
-            "mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full",
-            hasError
-              ? "bg-destructive/10 text-destructive"
-              : isWorking
-                ? "bg-primary/10 text-primary"
-                : "bg-muted text-muted-foreground",
-          )}
-        >
-          <StateIcon
-            className={cn(
-              "h-3 w-3",
-              isWorking &&
-                state !== "error" &&
-                state !== "idle" &&
-                "animate-pulse",
-            )}
-          />
-        </span>
-        <div className="min-w-0 flex-1">
-          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-              Now
-            </p>
-            <span className="text-xs text-muted-foreground/70">·</span>
-            <p className="text-xs text-muted-foreground">{agentName}</p>
-            {lastUpdated ? (
-              <>
-                <span className="text-xs text-muted-foreground/70">·</span>
-                <p className="text-xs text-muted-foreground/70">
-                  {lastUpdated}
-                </p>
-              </>
-            ) : null}
-          </div>
-          <p
-            className={cn(
-              "mt-0.5 text-sm font-medium leading-snug",
-              hasError ? "text-destructive" : "text-foreground",
-            )}
-          >
-            {isWorking && state !== "idle" && state !== "error" ? (
-              <Shimmer>{headline}</Shimmer>
-            ) : (
-              headline
-            )}
-          </p>
-          <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-            <Badge
-              className="h-5 px-1.5 text-xs font-normal"
-              variant={
-                hasError ? "destructive" : isWorking ? "default" : "secondary"
-              }
-            >
-              {statusLabel}
-            </Badge>
-            {counts.tools > 0 ? (
-              <ActivityCountBadge
-                count={counts.tools}
-                label="tool"
-                tone={counts.toolErrors > 0 ? "error" : "default"}
-              />
-            ) : null}
-            {counts.thoughts > 0 ? (
-              <ActivityCountBadge count={counts.thoughts} label="thought" />
-            ) : null}
-            {counts.messages > 0 ? (
-              <ActivityCountBadge count={counts.messages} label="message" />
-            ) : null}
-          </div>
-          {showInterventionHint && isWorking ? (
-            <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
-              Use <span className="font-medium text-foreground">Stop</span>{" "}
-              above to interrupt this turn without stopping the agent process.
-            </p>
-          ) : null}
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ActivityCountBadge({
-  count,
-  label,
-  tone = "default",
-}: {
-  count: number;
-  label: string;
-  tone?: "default" | "error";
-}) {
-  return (
-    <Badge
-      className="h-5 px-1.5 text-xs font-normal"
-      variant={tone === "error" ? "destructive" : "outline"}
-    >
-      {count} {label}
-      {count === 1 ? "" : "s"}
-    </Badge>
-  );
-}
-
-function itemsHaveActivity(
-  counts: ReturnType<typeof buildTranscriptPresentation>["counts"],
-) {
-  return (
-    counts.tools > 0 ||
-    counts.thoughts > 0 ||
-    counts.messages > 0 ||
-    counts.lifecycle > 0
-  );
-}
-
-function getStateIcon(
-  state: ReturnType<typeof buildTranscriptPresentation>["state"],
-  isWorking: boolean,
-) {
-  if (state === "error") {
-    return AlertCircle;
-  }
-  if (!isWorking) {
-    return CircleDot;
-  }
-  switch (state) {
-    case "tool_running":
-      return Wrench;
-    case "thinking":
-      return Brain;
-    case "responding":
-      return Bot;
-    default:
-      return Loader2;
-  }
-}
-
-function getStateLabel(
-  state: ReturnType<typeof buildTranscriptPresentation>["state"],
-  isWorking: boolean,
-) {
-  if (state === "error") {
-    return "Error";
-  }
-  if (!isWorking) {
-    return "Idle";
-  }
-  switch (state) {
-    case "tool_running":
-      return "Running tool";
-    case "thinking":
-      return "Thinking";
-    case "responding":
-      return "Responding";
-    default:
-      return "Working";
-  }
 }
 
 function getDisplayBlockKey(block: TranscriptDisplayBlock) {
