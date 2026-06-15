@@ -19,6 +19,8 @@ export type CompactToolSummary = {
   kind: CompactToolKind;
   label: string;
   preview: string | null;
+  /** When set, the compact row renders a tiny image instead of text preview. */
+  thumbnailSrc: string | null;
 };
 
 const DEVELOPER_TOOL_BASES = new Set([
@@ -44,11 +46,12 @@ export function isCompactDeveloperTool(item: ToolItem): boolean {
 /** Build the compact summary label and preview for developer MCP tool rows. */
 export function buildCompactToolSummary(item: ToolItem): CompactToolSummary {
   const kind = resolveDeveloperToolKind(item) ?? "dev_mcp";
-  const preview = extractCompactToolPreview(item, kind);
+  const { preview, thumbnailSrc } = extractCompactToolPreview(item, kind);
   return {
     kind,
     label: compactToolLabel(kind, item.status, item.isError),
     preview,
+    thumbnailSrc,
   };
 }
 
@@ -153,31 +156,68 @@ function compactToolLabel(
   return set.completed;
 }
 
+type CompactToolPreview = {
+  preview: string | null;
+  thumbnailSrc: string | null;
+};
+
 function extractCompactToolPreview(
   item: ToolItem,
   kind: CompactToolKind,
-): string | null {
+): CompactToolPreview {
   const args = item.args;
 
   switch (kind) {
     case "shell":
-      return getToolString(args, ["command"]);
+      return textPreview(getToolString(args, ["command"]));
     case "read_file":
     case "str_replace":
-      return getToolString(args, ["path"]);
+      return textPreview(getToolString(args, ["path"]));
     case "view_image":
-      return getToolString(args, ["source"]);
+      return getViewImagePreview(getToolString(args, ["source"]));
     case "todo":
-      return getTodoPreview(args);
+      return textPreview(getTodoPreview(args));
     case "stop_hook":
     case "post_compact_hook":
-      return null;
+      return emptyPreview();
     case "dev_mcp":
-      return (
+      return textPreview(
         getToolString(args, ["command", "path", "source", "query", "name"]) ??
-        null
+          null,
       );
   }
+}
+
+function textPreview(preview: string | null): CompactToolPreview {
+  return { preview, thumbnailSrc: null };
+}
+
+function emptyPreview(): CompactToolPreview {
+  return { preview: null, thumbnailSrc: null };
+}
+
+function getViewImagePreview(source: string | null): CompactToolPreview {
+  if (!source) {
+    return emptyPreview();
+  }
+
+  const trimmed = source.trim();
+  if (
+    trimmed.startsWith("data:image/") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://")
+  ) {
+    return {
+      preview: trimmed,
+      thumbnailSrc: trimmed,
+    };
+  }
+
+  const basename = trimmed.split(/[/\\]/).pop() ?? trimmed;
+  return {
+    preview: basename,
+    thumbnailSrc: null,
+  };
 }
 
 function getTodoPreview(args: Record<string, unknown>): string | null {
