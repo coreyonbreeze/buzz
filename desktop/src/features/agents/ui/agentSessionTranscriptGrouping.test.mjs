@@ -146,16 +146,28 @@ test("buildTranscriptDisplayBlocks collapses setup lifecycle inside prompt bundl
   );
 });
 
-test("buildTranscriptDisplayBlocks keeps lifecycle visible when prompt is missing", () => {
+test("buildTranscriptDisplayBlocks hides setup lifecycle when prompt is missing", () => {
+  const rawItems = [
+    lifecycle("turn", "Turn started", "turn_started", "turn-1"),
+    lifecycle("session", "Session ready", "session_resolved", "turn-1"),
+    promptContext("context", "turn-1"),
+  ];
+
+  const blocks = buildTranscriptDisplayBlocks(rawItems);
+  const displayOrder = flattenDisplayBlocks(blocks).map((item) => item.id);
+
+  assert.deepEqual(displayOrder, ["context"]);
+});
+
+test("buildTranscriptDisplayBlocks drops setup-only turns", () => {
   const rawItems = [
     lifecycle("turn", "Turn started", "turn_started", "turn-1"),
     lifecycle("session", "Session ready", "session_resolved", "turn-1"),
   ];
 
   const blocks = buildTranscriptDisplayBlocks(rawItems);
-  const displayOrder = flattenDisplayBlocks(blocks).map((item) => item.id);
 
-  assert.deepEqual(displayOrder, ["turn", "session"]);
+  assert.deepEqual(blocks, []);
 });
 
 test("buildTranscriptDisplayBlocks leaves error lifecycle prominent outside prompt bundle", () => {

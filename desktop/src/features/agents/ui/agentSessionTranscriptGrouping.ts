@@ -62,12 +62,12 @@ function classifyTurnItems(items: TranscriptItem[]): TranscriptTurnSegment[] {
 
   if (userPrompt) consumed.add(userPrompt);
   for (const item of setupLifecycle) consumed.add(item);
-  if (promptContext) consumed.add(promptContext);
+  if (userPrompt && promptContext) consumed.add(promptContext);
 
   const activity = items.filter((item) => !consumed.has(item));
 
   if (!userPrompt) {
-    return items.map((item) => ({ kind: "item", item }));
+    return activity.map((item) => ({ kind: "item", item }));
   }
 
   const segments: TranscriptTurnSegment[] = [
@@ -134,11 +134,14 @@ export function buildTranscriptDisplayBlocks(
       continue;
     }
 
-    blocks.push({
-      kind: "turn",
-      turnId: entry.turnId,
-      segments: classifyTurnItems(bucket.items),
-    });
+    const segments = classifyTurnItems(bucket.items);
+    if (segments.length > 0) {
+      blocks.push({
+        kind: "turn",
+        turnId: entry.turnId,
+        segments,
+      });
+    }
   }
 
   return blocks;
