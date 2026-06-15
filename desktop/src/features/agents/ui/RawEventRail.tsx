@@ -22,7 +22,7 @@ export function RawEventRail({ events }: { events: ObserverEvent[] }) {
                   </span>{" "}
                   {describeRawEvent(event)}
                 </summary>
-                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap wrap-break-word rounded-md border border-border/40 bg-background/45 p-2 text-[11px] leading-5 text-muted-foreground">
+                <pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap wrap-break-word rounded-md border border-border/40 bg-background/45 p-2 font-mono text-xs leading-5 text-muted-foreground">
                   {JSON.stringify(event.payload, null, 2)}
                 </pre>
               </details>

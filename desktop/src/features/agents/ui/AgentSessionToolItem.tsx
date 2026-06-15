@@ -81,7 +81,7 @@ export function ToolItem({
           </span>
           {isActive ? (
             <Badge
-              className="h-4 gap-0.5 px-1 text-[9px] font-normal"
+              className="h-4 gap-0.5 px-1 text-xs font-normal"
               variant="default"
             >
               <CircleDot className="h-2 w-2" />
@@ -220,7 +220,7 @@ function ToolTimestamp({
   return (
     <Tooltip>
       <TooltipTrigger asChild>
-        <span className="shrink-0 cursor-default text-[11px] text-muted-foreground/60">
+        <span className="shrink-0 cursor-default text-xs text-muted-foreground/60">
           {time}
           {duration ? ` · ${duration}` : null}
         </span>
@@ -282,7 +282,7 @@ function BuzzToolInlineAction({
   if (action.onClick) {
     return (
       <button
-        className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-primary/20 bg-primary/[0.05] px-1.5 py-0.5 text-[11px] font-normal leading-none text-primary/90 transition-colors hover:border-primary/35 hover:bg-primary/10 hover:text-primary"
+        className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-primary/20 bg-primary/[0.05] px-1.5 py-0.5 text-xs font-normal leading-none text-primary/90 transition-colors hover:border-primary/35 hover:bg-primary/10 hover:text-primary"
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
@@ -301,7 +301,7 @@ function BuzzToolInlineAction({
 
   return (
     <span
-      className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-1.5 py-0.5 text-[11px] font-normal leading-none text-muted-foreground"
+      className="inline-flex max-w-[14rem] shrink min-w-0 items-center gap-1 rounded-full border border-border/60 bg-muted/40 px-1.5 py-0.5 text-xs font-normal leading-none text-muted-foreground"
       title={action.title}
     >
       {action.avatar}

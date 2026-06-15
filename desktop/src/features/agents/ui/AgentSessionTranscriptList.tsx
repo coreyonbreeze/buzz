@@ -800,7 +800,7 @@ function MessageItem({
           <div className="mb-0.5 flex items-center gap-1.5 text-xs">
             <UserAvatar
               avatarUrl={assistantAvatarUrl}
-              className="h-5 w-5 shrink-0 text-[8px]"
+              className="shrink-0"
               displayName={assistantLabel}
               size="xs"
               testId="transcript-assistant-avatar"
