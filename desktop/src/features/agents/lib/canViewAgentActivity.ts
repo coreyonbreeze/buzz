@@ -4,6 +4,7 @@ export type CanViewAgentActivityInput = {
   relayOwnership: AgentOwnershipStatus | undefined;
   isManagedAgent: boolean | undefined;
   isOwnershipLoading: boolean;
+  isOwnershipError: boolean;
   isManagedLoading: boolean;
 };
 
@@ -22,6 +23,7 @@ export function resolveCanViewAgentActivity({
   relayOwnership,
   isManagedAgent,
   isOwnershipLoading,
+  isOwnershipError,
   isManagedLoading,
 }: CanViewAgentActivityInput): CanViewAgentActivityResult {
   if (relayOwnership?.isOwner === true) {
@@ -35,8 +37,8 @@ export function resolveCanViewAgentActivity({
   const isLoading =
     isOwnershipLoading || (isManagedAgent === undefined && isManagedLoading);
 
-  if (isManagedAgent === true && isOwnershipLoading) {
-    return { canView: true, isLoading: true };
+  if (isManagedAgent === true && (isOwnershipLoading || isOwnershipError)) {
+    return { canView: true, isLoading };
   }
 
   return { canView: false, isLoading };

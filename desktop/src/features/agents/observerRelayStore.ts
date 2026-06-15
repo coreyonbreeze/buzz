@@ -41,6 +41,7 @@ const snapshotByAgent = new Map<string, ObserverSnapshot>();
 // Normalized pubkeys of agents we are actively managing. Only events whose
 // "agent" tag matches an entry here will be decrypted (defense-in-depth).
 const knownAgentPubkeys = new Set<string>();
+const knownAgentPubkeysByBridge = new Map<symbol, Set<string>>();
 
 let connectionState: ConnectionState = "idle";
 let errorMessage: string | null = null;
@@ -275,6 +276,7 @@ export function getAgentTranscript(
 export function useManagedAgentObserverBridge(
   agents: readonly Pick<ManagedAgent, "pubkey" | "status">[],
 ) {
+  const bridgeIdRef = React.useRef<symbol>(Symbol("managed-agent-observer"));
   const hasActiveAgent = React.useMemo(
     () =>
       agents.some(
@@ -285,10 +287,27 @@ export function useManagedAgentObserverBridge(
 
   // Keep the trusted-pubkey set in sync with the current managed agent list.
   React.useEffect(() => {
+    const bridgeId = bridgeIdRef.current;
+    knownAgentPubkeysByBridge.set(
+      bridgeId,
+      new Set(agents.map((agent) => normalizePubkey(agent.pubkey))),
+    );
     knownAgentPubkeys.clear();
-    for (const agent of agents) {
-      knownAgentPubkeys.add(normalizePubkey(agent.pubkey));
+    for (const pubkeys of knownAgentPubkeysByBridge.values()) {
+      for (const pubkey of pubkeys) {
+        knownAgentPubkeys.add(pubkey);
+      }
     }
+
+    return () => {
+      knownAgentPubkeysByBridge.delete(bridgeId);
+      knownAgentPubkeys.clear();
+      for (const pubkeys of knownAgentPubkeysByBridge.values()) {
+        for (const pubkey of pubkeys) {
+          knownAgentPubkeys.add(pubkey);
+        }
+      }
+    };
   }, [agents]);
 
   React.useEffect(() => {
@@ -309,6 +328,7 @@ export function resetAgentObserverStore() {
   transcriptByAgent.clear();
   snapshotByAgent.clear();
   knownAgentPubkeys.clear();
+  knownAgentPubkeysByBridge.clear();
   connectionState = "idle";
   errorMessage = null;
   notifyListeners();

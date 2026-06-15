@@ -1,4 +1,5 @@
 import { invokeTauri } from "@/shared/api/tauri";
+import { resolveOaOwner } from "@/shared/api/tauriIdentityArchive";
 
 export type AgentOwnershipStatus = {
   /** Lowercase hex pubkey of the queried agent. */
@@ -22,13 +23,26 @@ type RawAgentOwnershipStatus = {
 export async function resolveAgentOwnership(
   agentPubkey: string,
 ): Promise<AgentOwnershipStatus> {
-  const raw = await invokeTauri<RawAgentOwnershipStatus>(
-    "resolve_agent_ownership",
-    { agentPubkey },
-  );
-  return {
-    agentPubkey: raw.agent_pubkey,
-    ownerPubkey: raw.owner_pubkey,
-    isOwner: raw.is_owner,
-  };
+  try {
+    const raw = await invokeTauri<RawAgentOwnershipStatus>(
+      "resolve_agent_ownership",
+      { agentPubkey },
+    );
+    return {
+      agentPubkey: raw.agent_pubkey,
+      ownerPubkey: raw.owner_pubkey,
+      isOwner: raw.is_owner,
+    };
+  } catch (error) {
+    const owner = await resolveOaOwner(agentPubkey).catch(() => null);
+    if (!owner) {
+      throw error;
+    }
+
+    return {
+      agentPubkey: agentPubkey.toLowerCase(),
+      ownerPubkey: owner.owner,
+      isOwner: owner.isMe,
+    };
+  }
 }

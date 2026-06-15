@@ -98,7 +98,8 @@ export function UserProfilePopover({
   const profile = profileQuery.data;
   const presenceStatus = presenceQuery.data?.[pubkey.toLowerCase()];
   const userStatus = userStatusQuery.data?.[pubkey.toLowerCase()];
-  const activeTurns = useActiveAgentTurns(role === "bot" ? pubkey : null);
+  const activeTurns = useActiveAgentTurns(pubkey);
+  const canShowActivity = canViewActivity || activeTurns.length > 0;
   const channelsQuery = useChannelsQuery();
   const channelIdToName = React.useMemo(() => {
     const map: Record<string, string> = {};
@@ -278,7 +279,7 @@ export function UserProfilePopover({
             </p>
           ) : null}
 
-          {canViewActivity && onOpenAgentSession ? (
+          {canShowActivity && onOpenAgentSession ? (
             <button
               className="flex w-full items-center gap-2 rounded-lg border border-border/60 px-3 py-2 text-left text-xs font-medium text-foreground transition-colors hover:bg-muted/50"
               data-testid={`user-profile-view-activity-${pubkey}`}

@@ -124,7 +124,8 @@ export function ProfileSummaryView({
   userStatus,
 }: ProfileSummaryViewProps) {
   const { goChannel } = useAppNavigation();
-  const activeTurns = useActiveAgentTurns(isBot ? pubkey : null);
+  const activeTurns = useActiveAgentTurns(pubkey);
+  const canShowActivity = canViewActivity || activeTurns.length > 0;
 
   const metadataFields = [
     ...buildPublicFields({
@@ -185,7 +186,7 @@ export function ProfileSummaryView({
         </div>
       ) : null}
 
-      {showMemoriesIngress || showChannelsIngress || canViewActivity ? (
+      {showMemoriesIngress || showChannelsIngress || canShowActivity ? (
         <section className="space-y-2">
           {showMemoriesIngress ? (
             <ProfileIngressRow
@@ -217,7 +218,7 @@ export function ProfileSummaryView({
               }
             />
           ) : null}
-          {canViewActivity ? (
+          {canShowActivity ? (
             <ProfileIngressRow
               icon={Activity}
               label="Activity log"

@@ -38,6 +38,7 @@ export function useCanViewAgentActivity(
     relayOwnership: ownershipQuery.data,
     isManagedAgent,
     isOwnershipLoading: ownershipQuery.isLoading,
+    isOwnershipError: ownershipQuery.isError,
     isManagedLoading: isManagedAgent === undefined,
   });
 }

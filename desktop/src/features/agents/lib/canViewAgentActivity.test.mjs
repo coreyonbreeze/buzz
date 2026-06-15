@@ -12,6 +12,7 @@ test("resolveCanViewAgentActivity returns true when relay confirms ownership", (
     },
     isManagedAgent: false,
     isOwnershipLoading: false,
+    isOwnershipError: false,
     isManagedLoading: false,
   });
 
@@ -28,6 +29,7 @@ test("resolveCanViewAgentActivity returns false when relay denies ownership", ()
     },
     isManagedAgent: true,
     isOwnershipLoading: false,
+    isOwnershipError: false,
     isManagedLoading: false,
   });
 
@@ -40,6 +42,7 @@ test("resolveCanViewAgentActivity optimistically allows locally managed agents w
     relayOwnership: undefined,
     isManagedAgent: true,
     isOwnershipLoading: true,
+    isOwnershipError: false,
     isManagedLoading: false,
   });
 
@@ -52,9 +55,36 @@ test("resolveCanViewAgentActivity stays closed for non-managed agents while load
     relayOwnership: undefined,
     isManagedAgent: false,
     isOwnershipLoading: true,
+    isOwnershipError: false,
     isManagedLoading: false,
   });
 
   assert.equal(result.canView, false);
   assert.equal(result.isLoading, true);
+});
+
+test("resolveCanViewAgentActivity keeps locally managed agents visible when ownership lookup errors", () => {
+  const result = resolveCanViewAgentActivity({
+    relayOwnership: undefined,
+    isManagedAgent: true,
+    isOwnershipLoading: false,
+    isOwnershipError: true,
+    isManagedLoading: false,
+  });
+
+  assert.equal(result.canView, true);
+  assert.equal(result.isLoading, false);
+});
+
+test("resolveCanViewAgentActivity stays closed for non-managed agents when ownership lookup errors", () => {
+  const result = resolveCanViewAgentActivity({
+    relayOwnership: undefined,
+    isManagedAgent: false,
+    isOwnershipLoading: false,
+    isOwnershipError: true,
+    isManagedLoading: false,
+  });
+
+  assert.equal(result.canView, false);
+  assert.equal(result.isLoading, false);
 });
