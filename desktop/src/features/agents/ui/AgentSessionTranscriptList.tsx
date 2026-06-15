@@ -608,17 +608,13 @@ function TurnSetupFooter({
       {showContext ? (
         <Toggle
           aria-label={`${contextOpen ? "Hide" : "Show"} prompt context`}
-          className="h-5 min-h-0 min-w-0 gap-1 rounded-md px-1.5 text-xs font-medium data-[state=on]:bg-muted data-[state=on]:text-foreground"
           data-testid="transcript-prompt-context-toggle"
           onPressedChange={onContextOpenChange}
           pressed={contextOpen}
-          size="sm"
+          size="xs"
           variant="outline"
         >
           Context
-          <span className="text-muted-foreground/70">
-            {context.sections.length}
-          </span>
         </Toggle>
       ) : null}
       <TranscriptTimestamp timestamp={timestamp} />
