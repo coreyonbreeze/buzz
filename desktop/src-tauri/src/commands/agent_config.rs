@@ -6,13 +6,15 @@ use crate::{
         config_bridge::{
             reader::read_config_surface,
             types::{
-                AcpConfigOptionEntry, AcpConfigOptionValue, AcpModelEntry, ConfigWriteMechanism,
-                RuntimeConfigSurface, SessionConfigCache, WriteConfigFieldRequest,
-                WriteConfigResult, WriteConfigTarget,
+                AcpConfigOptionEntry, AcpConfigOptionValue, AcpModelEntry, ConfigOrigin,
+                ConfigWriteMechanism, RuntimeConfigSurface, SessionConfigCache,
+                WriteConfigFieldRequest, WriteConfigResult, WriteConfigTarget,
             },
             writer::plan_config_write,
         },
-        known_acp_runtime, load_managed_agents, save_managed_agents, sync_managed_agent_processes,
+        known_acp_runtime, load_managed_agents, load_personas,
+        resolve_effective_prompt_model_provider, save_managed_agents,
+        sync_managed_agent_processes,
     },
 };
 
@@ -20,13 +22,15 @@ use crate::{
 ///
 /// Returns normalized + advanced config from all available tiers.
 /// Pre-spawn agents show config file values with ACP tiers marked as pending.
+/// Persona-sourced values are resolved here (call-site) and re-tagged as
+/// `PersonaDefault` after the reader produces the surface.
 #[tauri::command]
 pub async fn get_agent_config_surface(
     pubkey: String,
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<RuntimeConfigSurface, String> {
-    let record = {
+    let mut record = {
         let _store_guard = state
             .managed_agents_store_lock
             .lock()
@@ -45,14 +49,74 @@ pub async fn get_agent_config_surface(
             .ok_or_else(|| format!("agent {pubkey} not found"))?
     };
 
-    let runtime_meta = known_acp_runtime(&record.agent_command);
-    let session_cache = state.get_session_cache(&pubkey);
+    // Resolve persona values at the call site (not inside the reader).
+    // Track which fields were absent on the record so we can re-tag them
+    // as PersonaDefault after the reader produces the surface.
+    let personas = load_personas(&app).unwrap_or_default();
+    let had_prompt = record.system_prompt.is_some()
+        || record.env_vars.contains_key("BUZZ_ACP_SYSTEM_PROMPT");
+    let had_model = record.model.is_some();
 
-    Ok(read_config_surface(
-        &record,
-        runtime_meta,
-        session_cache.as_ref(),
-    ))
+    let runtime_meta = known_acp_runtime(&record.agent_command);
+    let provider_env_key = runtime_meta
+        .and_then(|m| m.provider_env_var)
+        .unwrap_or("");
+    let had_provider = record.env_vars.contains_key(provider_env_key);
+
+    let (persona_prompt, persona_model, persona_provider) =
+        resolve_effective_prompt_model_provider(
+            record.persona_id.as_deref(),
+            &personas,
+            record.system_prompt.clone(),
+            record.model.clone(),
+        );
+
+    // Inject resolved persona values into the record where absent.
+    if !had_prompt {
+        if let Some(ref p) = persona_prompt {
+            record
+                .env_vars
+                .insert("BUZZ_ACP_SYSTEM_PROMPT".to_string(), p.clone());
+        }
+    }
+    if !had_model {
+        record.model = persona_model;
+    }
+    if !had_provider && !provider_env_key.is_empty() {
+        if let Some(ref prov) = persona_provider {
+            record
+                .env_vars
+                .insert(provider_env_key.to_string(), prov.clone());
+        }
+    }
+
+    let session_cache = state.get_session_cache(&pubkey);
+    let mut surface = read_config_surface(&record, runtime_meta, session_cache.as_ref());
+
+    // Re-tag persona-sourced fields from BuzzExplicit to PersonaDefault.
+    if !had_prompt {
+        if let Some(ref mut field) = surface.normalized.system_prompt {
+            if field.origin == ConfigOrigin::BuzzExplicit {
+                field.origin = ConfigOrigin::PersonaDefault;
+            }
+        }
+    }
+    if !had_model {
+        if let Some(ref mut field) = surface.normalized.model {
+            if field.origin == ConfigOrigin::BuzzExplicit {
+                field.origin = ConfigOrigin::PersonaDefault;
+            }
+        }
+    }
+    if !had_provider {
+        if let Some(ref mut field) = surface.normalized.provider {
+            if field.origin == ConfigOrigin::BuzzExplicit {
+                field.origin = ConfigOrigin::PersonaDefault;
+            }
+        }
+    }
+
+    Ok(surface)
 }
 
 /// Write a config field value for a managed agent.
@@ -60,6 +124,10 @@ pub async fn get_agent_config_surface(
 /// Plans the write mechanism based on the current config surface, then
 /// executes: either updating the record (for env var respawn) or returning
 /// the mechanism for the frontend to send via observer control (for ACP writes).
+///
+// TODO: When inline editing lands, this function needs the same persona
+// injection as get_agent_config_surface — without it, plan_config_write
+// won't see persona-sourced fields and will return "field not available".
 #[tauri::command]
 pub async fn write_agent_config_field(
     request: WriteConfigFieldRequest,
