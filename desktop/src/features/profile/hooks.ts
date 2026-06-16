@@ -1,5 +1,10 @@
 import * as React from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  keepPreviousData,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 
 import {
   getProfile,
@@ -283,6 +288,15 @@ export function useUsersBatchQuery(
     queryFn: () => getUsersBatch(normalizedPubkeys),
     staleTime: 60_000,
     gcTime: 5 * 60 * 1_000,
+    // As messages stream in, new author pubkeys join the set and the queryKey
+    // changes — React Query treats that as a brand-new query and would drop
+    // `data` to undefined for a frame. That collapses the consumer's profile
+    // lookup to {}, reverting already-resolved rows to truncated pubkeys with
+    // no avatar (content-bust) AND handing the timeline a near-empty messages
+    // array that churns the virtualizer's measurement cache (gaping space).
+    // keepPreviousData retains the prior resolved batch through the key
+    // transition so settled rows stay settled while the new batch fetches.
+    placeholderData: keepPreviousData,
   });
 
   // Seed individual "user-profile" cache entries so avatar clicks are instant
