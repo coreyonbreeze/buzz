@@ -1,12 +1,15 @@
 import * as React from "react";
 
-import {
-  formatDayHeading,
-  isSameDay,
-} from "@/features/messages/lib/dateFormatters";
+import { formatDayHeading } from "@/features/messages/lib/dateFormatters";
 import { buildMainTimelineEntries } from "@/features/messages/lib/threadPanel";
+import {
+  buildVideoReviewCommentsByRootId,
+  buildVideoReviewContextForMessage,
+} from "@/features/messages/lib/videoReviewContext";
+import { buildDayGroupBoundaries } from "@/features/messages/lib/timelineSnapshot";
 import type { TimelineMessage } from "@/features/messages/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
+import type { ChannelType } from "@/shared/api/types";
 import { KIND_SYSTEM_MESSAGE } from "@/shared/constants/kinds";
 import { cn } from "@/shared/lib/cn";
 import { DayDivider } from "./DayDivider";
@@ -15,7 +18,10 @@ import { MessageThreadSummaryRow } from "./MessageThreadSummaryRow";
 import { SystemMessageRow } from "./SystemMessageRow";
 
 type TimelineMessageListProps = {
+  agentPubkeys?: ReadonlySet<string>;
   channelId?: string | null;
+  channelName?: string;
+  channelType?: ChannelType | null;
   currentPubkey?: string;
   followThreadById?: (rootId: string) => void;
   highlightedMessageId?: string | null;
@@ -26,6 +32,14 @@ type TimelineMessageListProps = {
   onEdit?: (message: TimelineMessage) => void;
   onMarkUnread?: (message: TimelineMessage) => void;
   onReply?: (message: TimelineMessage) => void;
+  isSendingVideoReviewComment?: boolean;
+  onSendVideoReviewComment?: (
+    message: TimelineMessage,
+    content: string,
+    mentionPubkeys: string[],
+    mediaTags?: string[][],
+    parentEventId?: string,
+  ) => Promise<void>;
   unfollowThreadById?: (rootId: string) => void;
   onToggleReaction?: (
     message: TimelineMessage,
@@ -44,7 +58,10 @@ type TimelineMessageListProps = {
 };
 
 export const TimelineMessageList = React.memo(function TimelineMessageList({
+  agentPubkeys,
   channelId,
+  channelName,
+  channelType,
   currentPubkey,
   followThreadById,
   highlightedMessageId = null,
@@ -55,6 +72,8 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
   onEdit,
   onMarkUnread,
   onReply,
+  isSendingVideoReviewComment = false,
+  onSendVideoReviewComment,
   onToggleReaction,
   personaLookup,
   profiles,
@@ -67,6 +86,48 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
     () => buildMainTimelineEntries(messages),
     [messages],
   );
+  const reviewCommentsByRootId = React.useMemo(
+    () => buildVideoReviewCommentsByRootId(messages),
+    [messages],
+  );
+  // Contexts are memoized per message id so MessageRow/Markdown memo
+  // comparisons hold across unrelated timeline re-renders (typing
+  // indicators, presence updates) — a fresh context object per render would
+  // defeat the memo and re-render every video message on every pass.
+  const videoReviewContextById = React.useMemo(() => {
+    const contexts = new Map<
+      string,
+      NonNullable<ReturnType<typeof buildVideoReviewContextForMessage>>
+    >();
+    for (const message of messages) {
+      const comments = reviewCommentsByRootId.get(message.id) ?? [];
+      const context = buildVideoReviewContextForMessage({
+        channelId,
+        channelName,
+        channelType,
+        comments,
+        isSendingVideoReviewComment,
+        message,
+        onSendVideoReviewComment,
+        onToggleReaction,
+        profiles,
+      });
+      if (context) {
+        contexts.set(message.id, context);
+      }
+    }
+    return contexts;
+  }, [
+    channelId,
+    channelName,
+    channelType,
+    isSendingVideoReviewComment,
+    messages,
+    onSendVideoReviewComment,
+    onToggleReaction,
+    profiles,
+    reviewCommentsByRootId,
+  ]);
   const dayGroups: Array<{
     key: string;
     label: string;
@@ -74,11 +135,21 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
   }> = [];
   let currentDayGroup: (typeof dayGroups)[number] | null = null;
 
+  // Day-divider decision delegated to a pure, lib-tested helper: a new group
+  // starts at index 0 and whenever a message falls on a different calendar day
+  // than the one before it. We index the boundary start positions so the render
+  // loop below stays a straight walk while the grouping logic lives in `lib/`.
+  const dayGroupStartIndices = new Set(
+    buildDayGroupBoundaries(entries.map((entry) => entry.message)).map(
+      (boundary) => boundary.startIndex,
+    ),
+  );
+
   for (let i = 0; i < entries.length; i++) {
     const { message, summary } = entries[i];
-    const prev = i > 0 ? entries[i - 1]?.message : null;
+    const messageRenderKey = message.renderKey ?? message.id;
 
-    if (!prev || !isSameDay(prev.createdAt, message.createdAt)) {
+    if (dayGroupStartIndices.has(i)) {
       currentDayGroup = {
         key: `day-${message.createdAt}`,
         label: formatDayHeading(message.createdAt),
@@ -90,9 +161,10 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
     if (message.kind === KIND_SYSTEM_MESSAGE) {
       const footer = messageFooters?.[message.id] ?? null;
       currentDayGroup?.elements.push(
-        <div key={message.id} className="flex flex-col gap-1">
+        <div key={messageRenderKey} className="flex flex-col gap-1">
           <SystemMessageRow
             message={message}
+            agentPubkeys={agentPubkeys}
             currentPubkey={currentPubkey}
             onToggleReaction={onToggleReaction}
             personaLookup={personaLookup}
@@ -106,7 +178,7 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
       const isHighlighted = message.id === highlightedMessageId;
       currentDayGroup?.elements.push(
         <div
-          key={message.id}
+          key={messageRenderKey}
           className={cn(
             "group/message relative -mx-1 flex flex-col gap-0 rounded-2xl px-1 py-1 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
             isHighlighted &&
@@ -114,6 +186,7 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
           )}
         >
           <MessageRow
+            agentPubkeys={agentPubkeys}
             channelId={channelId}
             highlighted={false}
             hoverBackground={false}
@@ -145,11 +218,14 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
                 : undefined
             }
             profiles={profiles}
+            showDepthGuides={false}
+            videoReviewContext={videoReviewContextById.get(message.id)}
           />
           <MessageThreadSummaryRow
             depth={message.depth}
             message={message}
             onOpenThread={onReply}
+            showDepthGuides={false}
             summary={summary}
           />
           {footer}
@@ -161,8 +237,9 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
       const footer = messageFooters?.[message.id] ?? null;
 
       currentDayGroup?.elements.push(
-        <div key={message.id} className="flex flex-col gap-1">
+        <div key={messageRenderKey} className="flex flex-col gap-1">
           <MessageRow
+            agentPubkeys={agentPubkeys}
             channelId={channelId}
             highlighted={message.id === highlightedMessageId || isSearchActive}
             message={message}
@@ -181,6 +258,8 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
             onReply={onReply}
             profiles={profiles}
             searchQuery={isSearchMatch ? searchQuery : undefined}
+            showDepthGuides={false}
+            videoReviewContext={videoReviewContextById.get(message.id)}
           />
           {footer}
         </div>,
@@ -189,7 +268,10 @@ export const TimelineMessageList = React.memo(function TimelineMessageList({
   }
 
   return dayGroups.map((group) => (
-    <section className="flex flex-col gap-2.5" key={group.key}>
+    <section
+      className="relative flex flex-col gap-2.5 before:absolute before:inset-x-0 before:top-[15px] before:h-px before:bg-border/35 before:content-['']"
+      key={group.key}
+    >
       <DayDivider label={group.label} />
       {group.elements}
     </section>

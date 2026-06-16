@@ -30,6 +30,28 @@ async function openMembersSidebar(
   await expect(page.getByTestId("members-sidebar")).toBeVisible();
 }
 
+async function readMembersTriggerCount(page: import("@playwright/test").Page) {
+  const label =
+    (await page
+      .getByTestId("channel-members-trigger")
+      .getAttribute("aria-label")) ?? "";
+  const match = label.match(/\((\d+)\)$/);
+  if (!match) {
+    throw new Error(`Could not read member count from label: ${label}`);
+  }
+  return Number(match[1]);
+}
+
+async function expectMembersTriggerCount(
+  page: import("@playwright/test").Page,
+  count: number,
+) {
+  await expect(page.getByTestId("channel-members-trigger")).toHaveAttribute(
+    "aria-label",
+    `View channel members (${count})`,
+  );
+}
+
 async function waitForMockLiveSubscription(
   page: import("@playwright/test").Page,
   channelName: string,
@@ -42,12 +64,12 @@ async function waitForMockLiveSubscription(
           return (
             (
               window as Window & {
-                __SPROUT_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
+                __BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?: (input: {
                   channelName: string;
                   kind?: number;
                 }) => boolean;
               }
-            ).__SPROUT_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
+            ).__BUZZ_E2E_HAS_MOCK_LIVE_SUBSCRIPTION__?.({
               channelName: currentChannelName,
               kind,
             }) ?? false
@@ -117,11 +139,23 @@ async function getManagedAgentPubkey(
 async function readCommandLog(page: import("@playwright/test").Page) {
   return page.evaluate(() => {
     return (
+      (window as Window & { __BUZZ_E2E_COMMANDS__?: string[] })
+        .__BUZZ_E2E_COMMANDS__ ?? []
+    );
+  });
+}
+
+async function readCommandPayloadLog(page: import("@playwright/test").Page) {
+  return page.evaluate(() => {
+    return (
       (
         window as Window & {
-          __SPROUT_E2E_COMMANDS__?: string[];
+          __BUZZ_E2E_COMMAND_LOG__?: Array<{
+            command: string;
+            payload: unknown;
+          }>;
         }
-      ).__SPROUT_E2E_COMMANDS__ ?? []
+      ).__BUZZ_E2E_COMMAND_LOG__ ?? []
     );
   });
 }
@@ -135,9 +169,9 @@ async function invokeMockCommand<T>(
     return Boolean(
       (
         window as Window & {
-          __SPROUT_E2E_INVOKE_MOCK_COMMAND__?: unknown;
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: unknown;
         }
-      ).__SPROUT_E2E_INVOKE_MOCK_COMMAND__,
+      ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__,
     );
   });
 
@@ -151,12 +185,12 @@ async function invokeMockCommand<T>(
     }) => {
       const invoke = (
         window as Window & {
-          __SPROUT_E2E_INVOKE_MOCK_COMMAND__?: (
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
             command: string,
             payload?: Record<string, unknown>,
           ) => Promise<unknown>;
         }
-      ).__SPROUT_E2E_INVOKE_MOCK_COMMAND__;
+      ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
 
       if (!invoke) {
         throw new Error("Mock bridge is not installed.");
@@ -166,6 +200,97 @@ async function invokeMockCommand<T>(
     },
     { command, payload },
   ) as Promise<T>;
+}
+
+async function expectSameLeftInset(
+  page: import("@playwright/test").Page,
+  firstTestId: string,
+  secondTestId: string,
+) {
+  const firstBox = await page.getByTestId(firstTestId).boundingBox();
+  const secondBox = await page.getByTestId(secondTestId).first().boundingBox();
+
+  if (!firstBox || !secondBox) {
+    throw new Error(`Could not measure ${firstTestId} against ${secondTestId}`);
+  }
+
+  expect(Math.abs(firstBox.x - secondBox.x)).toBeLessThanOrEqual(1);
+}
+
+async function expectIntroBalancedAroundDayDivider(
+  page: import("@playwright/test").Page,
+  introTestId: string,
+) {
+  const introBox = await page.getByTestId(introTestId).boundingBox();
+  const dividerBox = await page
+    .getByTestId("message-timeline-day-divider")
+    .first()
+    .boundingBox();
+  const messageBox = await page
+    .getByTestId("message-row")
+    .first()
+    .boundingBox();
+
+  if (!introBox || !dividerBox || !messageBox) {
+    throw new Error(`Could not measure timeline spacing for ${introTestId}`);
+  }
+
+  const gapAboveDivider = dividerBox.y - (introBox.y + introBox.height);
+  const gapBelowDivider = messageBox.y - (dividerBox.y + dividerBox.height);
+
+  expect(Math.abs(gapAboveDivider - gapBelowDivider)).toBeLessThanOrEqual(1);
+}
+
+async function expectIntroActionCardLayout(
+  page: import("@playwright/test").Page,
+  actionTestId: string,
+) {
+  const actionBox = await page.getByTestId(actionTestId).boundingBox();
+  const iconBox = await page.getByTestId(`${actionTestId}-icon`).boundingBox();
+
+  if (!actionBox || !iconBox) {
+    throw new Error(`Could not measure intro action card: ${actionTestId}`);
+  }
+
+  expect(actionBox.height).toBeGreaterThan(actionBox.width);
+  expect(Math.round(actionBox.width)).toBe(220);
+  expect(Math.round(iconBox.width)).toBe(48);
+  expect(Math.round(iconBox.height)).toBe(48);
+  const introIconRadius = await page
+    .getByTestId("message-channel-intro-icon")
+    .evaluate((element) => window.getComputedStyle(element).borderRadius);
+  const actionRadius = await page
+    .getByTestId(actionTestId)
+    .evaluate((element) => window.getComputedStyle(element).borderRadius);
+  expect(actionRadius).toBe(introIconRadius);
+  await expect(page.getByTestId(`${actionTestId}-title`)).toHaveCSS(
+    "white-space",
+    "normal",
+  );
+  await expect(page.getByTestId(`${actionTestId}-description`)).toHaveCSS(
+    "white-space",
+    "normal",
+  );
+}
+
+async function expectIntroActionsShareRow(
+  page: import("@playwright/test").Page,
+  actionTestIds: string[],
+) {
+  const boxes = await Promise.all(
+    actionTestIds.map((testId) => page.getByTestId(testId).boundingBox()),
+  );
+  const measuredBoxes = boxes.filter(
+    (box): box is NonNullable<typeof box> => box !== null,
+  );
+  const [firstBox] = measuredBoxes;
+  if (!firstBox || measuredBoxes.length !== actionTestIds.length) {
+    throw new Error("Could not measure intro action row");
+  }
+
+  for (const box of measuredBoxes.slice(1)) {
+    expect(Math.abs(firstBox.y - box.y)).toBeLessThanOrEqual(1);
+  }
 }
 
 test.beforeEach(async ({ page }) => {
@@ -230,17 +355,119 @@ test("start a new direct message from the sidebar", async ({ page }) => {
   await expect(page.getByTestId("new-dm-dialog")).toBeVisible();
 
   await page.getByTestId("new-dm-search").fill("charlie");
+  await expect(
+    page.getByTestId(`new-dm-result-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(
+    page.getByTestId(`new-dm-selected-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await expect(page.getByTestId("new-dm-search")).toHaveValue("");
   await page
-    .getByTestId(`new-dm-result-${TEST_IDENTITIES.charlie.pubkey}`)
+    .getByTestId(`new-dm-selected-${TEST_IDENTITIES.charlie.pubkey}`)
     .click();
+  await expect(
+    page.getByTestId(`new-dm-selected-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).not.toBeVisible();
+  await page.getByTestId("new-dm-search").fill("charlie");
+  await expect(
+    page.getByTestId(`new-dm-result-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toBeVisible();
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("new-dm-search")).toHaveValue("");
   await expect(
     page.getByTestId(`new-dm-selected-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toBeVisible();
 
-  await page.getByTestId("new-dm-submit").click();
+  await page.keyboard.press("Enter");
 
   await expect(page.getByTestId("dm-list")).toContainText("charlie");
   await expect(page.getByTestId("chat-title")).toHaveText("charlie");
+});
+
+test("shows capped participant stack in group direct message header", async ({
+  page,
+}) => {
+  await page.goto("/");
+
+  await page.getByTestId("new-dm-trigger").click();
+  await expect(page.getByTestId("new-dm-dialog")).toBeVisible();
+
+  for (const identity of [
+    TEST_IDENTITIES.alice,
+    TEST_IDENTITIES.bob,
+    TEST_IDENTITIES.charlie,
+    TEST_IDENTITIES.outsider,
+  ]) {
+    await page.getByTestId("new-dm-search").fill(identity.username);
+    await page.getByTestId(`new-dm-result-${identity.pubkey}`).click();
+  }
+
+  await page.getByTestId("new-dm-submit").click();
+
+  await expect(page.getByTestId("channel-dm-count-Group DM (5)")).toHaveText(
+    "4",
+  );
+  await expect(page.getByTestId("chat-title")).toContainText("alice");
+  await expect(page.getByTestId("chat-title")).toContainText("bob");
+  await expect(page.getByTestId("chat-title")).toContainText("charlie");
+  await expect(page.getByTestId("chat-title")).toContainText("+1 more");
+  await expect(page.getByTestId("chat-title")).not.toContainText("outsider");
+  const chatTitle = await page.getByTestId("chat-title").innerText();
+  await expect(
+    page.getByTestId("message-input").locator("[data-placeholder]").first(),
+  ).toHaveAttribute("data-placeholder", `Message ${chatTitle}`);
+  const composerColors = await page
+    .getByTestId("message-input")
+    .evaluate((element) => {
+      const placeholderElement =
+        element.querySelector<HTMLElement>("[data-placeholder]");
+      if (!placeholderElement) {
+        return null;
+      }
+
+      return {
+        placeholderColor: window.getComputedStyle(
+          placeholderElement,
+          "::before",
+        ).color,
+        textColor: window.getComputedStyle(element).color,
+      };
+    });
+  expect(composerColors).not.toBeNull();
+  expect(composerColors?.placeholderColor).not.toBe(composerColors?.textColor);
+  await expect(page.getByTestId("chat-header-dm-avatar")).toHaveCount(0);
+  await expect(page.getByTestId("chat-header-dm-avatar-stack")).toBeVisible();
+  await expect(page.getByTestId("chat-presence-badge")).toHaveCount(0);
+  await expect(
+    page.getByTestId("chat-header-dm-avatar-stack-participant"),
+  ).toHaveCount(3);
+  await expect(page.getByTestId("chat-header-dm-avatar-stack-more")).toHaveText(
+    "+1",
+  );
+  const headerStackBox = await page
+    .getByTestId("chat-header-dm-avatar-stack")
+    .boundingBox();
+  const headerTitleBox = await page.getByTestId("chat-title").boundingBox();
+  expect(headerStackBox).not.toBeNull();
+  expect(headerTitleBox).not.toBeNull();
+  expect((headerStackBox?.x ?? 0) + (headerStackBox?.width ?? 0)).toBeLessThan(
+    headerTitleBox?.x ?? 0,
+  );
+  await expect(page.getByTestId("message-dm-intro")).toContainText("alice");
+  await expect(page.getByTestId("message-dm-intro")).toContainText("bob");
+  await expect(page.getByTestId("message-dm-intro")).toContainText("charlie");
+  await expect(page.getByTestId("message-dm-intro")).toContainText("+1 more");
+  await expect(page.getByTestId("message-dm-intro")).not.toContainText(
+    "outsider",
+  );
+  await expect(page.getByTestId("message-dm-intro-avatar-stack")).toBeVisible();
+  await expect(
+    page.getByTestId("message-dm-intro-avatar-stack-participant"),
+  ).toHaveCount(3);
+  await expect(
+    page.getByTestId("message-dm-intro-avatar-stack-more"),
+  ).toHaveText("+1");
 });
 
 test("create stream with name and description", async ({ page }) => {
@@ -275,13 +502,13 @@ test("create ephemeral stream shows sidebar and header affordances", async ({
   await page.getByTestId("create-channel-submit").click();
 
   await expect(page.getByTestId("stream-list")).toContainText(channelName);
-  await expect(page.getByTestId("chat-title")).toHaveText(channelName);
+  await expect(page.getByTestId("chat-title")).toContainText(channelName);
   await expect(
     page.getByTestId(`channel-ephemeral-${channelName}`),
   ).toBeVisible();
   await expect(page.getByTestId("chat-ephemeral-badge")).toBeVisible();
   await expect(page.getByTestId("chat-ephemeral-badge")).toHaveAttribute(
-    "title",
+    "aria-label",
     /Ephemeral channel\. Cleans up (tomorrow|in \d+ hours?)\./,
   );
 
@@ -314,7 +541,7 @@ test("ephemeral countdown refreshes when switching channels after a clock jump",
       .getByLabel("Ephemeral — auto-archives after 1 day of inactivity")
       .click();
     await page.getByTestId("create-channel-submit").click();
-    await expect(page.getByTestId("chat-title")).toHaveText(channelName);
+    await expect(page.getByTestId("chat-title")).toContainText(channelName);
   }
 
   await page.clock.setFixedTime(shiftedTime);
@@ -323,9 +550,9 @@ test("ephemeral countdown refreshes when switching channels after a clock jump",
     .toBe(shiftedTime.getTime());
 
   await page.getByTestId(`channel-${firstChannelName}`).click();
-  await expect(page.getByTestId("chat-title")).toHaveText(firstChannelName);
+  await expect(page.getByTestId("chat-title")).toContainText(firstChannelName);
   await expect(page.getByTestId("chat-ephemeral-badge")).toHaveAttribute(
-    "title",
+    "aria-label",
     /Ephemeral channel\. Cleans up in 22 hours\./,
   );
 });
@@ -339,9 +566,9 @@ test("archived channels stay out of all sidebar sections", async ({ page }) => {
     return Boolean(
       (
         window as Window & {
-          __SPROUT_E2E_INVOKE_MOCK_COMMAND__?: unknown;
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: unknown;
         }
-      ).__SPROUT_E2E_INVOKE_MOCK_COMMAND__,
+      ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__,
     );
   });
   await page.evaluate(
@@ -356,12 +583,12 @@ test("archived channels stay out of all sidebar sections", async ({ page }) => {
     }) => {
       const invoke = (
         window as Window & {
-          __SPROUT_E2E_INVOKE_MOCK_COMMAND__?: (
+          __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
             command: string,
             payload?: Record<string, unknown>,
           ) => Promise<{ id: string }>;
         }
-      ).__SPROUT_E2E_INVOKE_MOCK_COMMAND__;
+      ).__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
 
       if (!invoke) {
         throw new Error("Mock bridge is not installed.");
@@ -448,12 +675,46 @@ test("switch between channel types", async ({ page }) => {
   await expect(page.getByTestId("chat-title")).toHaveText("alice-tyler");
 });
 
-test("empty channel shows empty state", async ({ page }) => {
+test("empty channel shows intro actions", async ({ page }) => {
   await page.goto("/");
 
   await page.getByTestId("channel-random").click();
   await expect(page.getByTestId("chat-title")).toHaveText("random");
-  await expect(page.getByTestId("message-empty")).toBeVisible();
+  await expect(page.getByTestId("message-channel-intro")).toBeVisible();
+  await expect(page.getByTestId("message-channel-intro")).toContainText(
+    "This is the beginning of the regular channel.",
+  );
+  await expect(
+    page.getByTestId("channel-intro-action-create-channel"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId("channel-intro-action-create-agent"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("channel-intro-action-add-people"),
+  ).toBeVisible();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+  await expectIntroActionCardLayout(page, "channel-intro-action-create-agent");
+  await expectIntroActionsShareRow(page, [
+    "channel-intro-action-create-agent",
+    "channel-intro-action-add-people",
+  ]);
+
+  await page.getByTestId("channel-intro-action-add-people").click();
+  await expect(page.getByTestId("members-sidebar")).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByTestId("members-sidebar")).not.toBeVisible();
+
+  await page.getByTestId("channel-intro-action-create-agent").click();
+  await expect(page.getByRole("heading", { name: "Add agents" })).toBeVisible();
+
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("heading", { name: "Add agents" })).toHaveCount(
+    0,
+  );
 });
 
 test("channel with messages shows content", async ({ page }) => {
@@ -461,9 +722,25 @@ test("channel with messages shows content", async ({ page }) => {
 
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(page.getByTestId("message-channel-intro")).toBeVisible();
+  await expect(page.getByTestId("message-channel-intro")).toContainText(
+    "This is the beginning of the regular channel.",
+  );
+  await expect(
+    page.getByTestId("channel-intro-action-create-channel"),
+  ).toHaveCount(0);
+  await expect(
+    page.getByTestId("channel-intro-action-create-agent"),
+  ).toBeVisible();
+  await expect(page.getByTestId("welcome-composer-guide-banner")).toHaveCount(
+    0,
+  );
+  await expect(page.getByTestId("message-timeline-day-divider")).toBeVisible();
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Welcome to #general",
   );
+  await expectSameLeftInset(page, "message-channel-intro", "message-row");
+  await expectIntroBalancedAroundDayDivider(page, "message-channel-intro");
 });
 
 test("shows and clears activity indicators for active channel agents", async ({
@@ -476,7 +753,7 @@ test("shows and clears activity indicators for active channel agents", async ({
   await waitForMockLiveSubscription(page, "agents", KIND_TYPING_INDICATOR);
 
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "agents",
       pubkey,
     });
@@ -499,7 +776,7 @@ test("shows and clears activity indicators for active channel agents", async ({
   await expect(page.getByTestId("message-typing-indicator")).toHaveCount(0);
 
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_MESSAGE__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
       channelName: "agents",
       content: "Done.",
       pubkey,
@@ -513,7 +790,7 @@ test("shows and clears activity indicators for active channel agents", async ({
 
   await page.waitForTimeout(1_200);
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "agents",
       pubkey,
     });
@@ -535,7 +812,7 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   // Alice starts typing first
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
@@ -554,7 +831,7 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   // Bob starts typing second
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
@@ -567,7 +844,7 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   // Alice re-broadcasts — order should stay "alice and bob", not flip
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
@@ -579,7 +856,7 @@ test("typing indicator shows avatars and maintains stable name order", async ({
 
   // Bob re-broadcasts — order should still stay "alice and bob"
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_TYPING__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_TYPING__?.({
       channelName: "random",
       pubkey,
     });
@@ -602,7 +879,7 @@ test("sidebar shows unread indicator for newly active channels", async ({
   // alice — simulating a real "another user posted while I was elsewhere".
   await page.evaluate(
     ({ pubkey }) => {
-      window.__SPROUT_E2E_EMIT_MOCK_MESSAGE__?.({
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "random",
         content: "Unread update for #random",
         kind: 40002,
@@ -631,7 +908,7 @@ test("sidebar shows unread indicator for new forum posts", async ({ page }) => {
   // Emit as alice — the unread tracker ignores self-authored messages.
   await page.evaluate(
     ({ pubkey }) => {
-      window.__SPROUT_E2E_EMIT_MOCK_MESSAGE__?.({
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "watercooler",
         content: "Unread update for the forum",
         kind: 45001,
@@ -655,7 +932,7 @@ test("sidebar clears unread indicator after opening a DM", async ({ page }) => {
   await waitForMockLiveSubscription(page, "alice-tyler");
 
   await page.evaluate((pubkey) => {
-    window.__SPROUT_E2E_EMIT_MOCK_MESSAGE__?.({
+    window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
       channelName: "alice-tyler",
       content: "Unread update for the DM",
       pubkey,
@@ -666,9 +943,16 @@ test("sidebar clears unread indicator after opening a DM", async ({ page }) => {
 
   await page.getByTestId("channel-alice-tyler").click();
   await expect(page.getByTestId("chat-title")).toHaveText("alice-tyler");
+  await expect(page.getByTestId("message-dm-intro")).toBeVisible();
+  await expect(page.getByTestId("message-dm-intro")).toContainText(
+    "This is the beginning of your direct message with",
+  );
+  await expect(page.getByTestId("message-timeline-day-divider")).toBeVisible();
   await expect(page.getByTestId("message-timeline")).toContainText(
     "Unread update for the DM",
   );
+  await expectSameLeftInset(page, "message-dm-intro", "message-row");
+  await expectIntroBalancedAroundDayDivider(page, "message-dm-intro");
   await expect(page.getByTestId("channel-unread-alice-tyler")).toHaveCount(0);
 });
 
@@ -748,6 +1032,108 @@ test("manage channel updates details and context", async ({ page }) => {
   );
 });
 
+test("manage channel updates visibility and ephemeral lifecycle independently", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await openChannelManagement(page, "general");
+
+  const saveDetailsButton = page.getByTestId("channel-management-save-details");
+  const saveLifecycleButton = page.getByTestId(
+    "channel-management-save-lifecycle",
+  );
+
+  await expect(saveLifecycleButton).toBeDisabled();
+
+  await page.getByTestId("channel-management-private-toggle").click();
+  await page.getByTestId("channel-management-ephemeral-toggle").click();
+  await expect(page.getByTestId("channel-management-ttl")).toBeVisible();
+  await expect(saveLifecycleButton).toBeEnabled();
+
+  const commandCountBeforeEnable = (await readCommandPayloadLog(page)).length;
+  await saveLifecycleButton.click();
+  await expect
+    .poll(async () =>
+      (await readCommandPayloadLog(page)).slice(commandCountBeforeEnable),
+    )
+    .toContainEqual(
+      expect.objectContaining({
+        command: "update_channel",
+        payload: expect.objectContaining({
+          input: expect.objectContaining({ ttlSeconds: 86400 }),
+        }),
+      }),
+    );
+  await expect(saveLifecycleButton).toHaveText("Save visibility");
+  await expect(saveDetailsButton).toHaveText("Save details");
+
+  const channelAfterEnable = await invokeMockCommand<{
+    ttl_seconds: number | null;
+    visibility: string;
+  }>(page, "get_channel_details", {
+    channelId: "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
+  });
+  expect(channelAfterEnable).toMatchObject({
+    ttl_seconds: 86400,
+    visibility: "private",
+  });
+
+  await closeChannelManagement(page);
+  await openChannelManagement(page, "general");
+
+  await expect(
+    page.getByTestId("channel-management-private-toggle"),
+  ).toHaveAttribute("data-state", "checked");
+  await expect(
+    page.getByTestId("channel-management-ephemeral-toggle"),
+  ).toHaveAttribute("data-state", "checked");
+  await expect(page.getByTestId("channel-management-ttl")).toHaveValue("1d");
+
+  await page.getByTestId("channel-management-private-toggle").click();
+  await page.getByTestId("channel-management-ephemeral-toggle").click();
+  await expect(saveLifecycleButton).toBeEnabled();
+
+  const commandCountBeforeDisable = (await readCommandPayloadLog(page)).length;
+  await saveLifecycleButton.click();
+  await expect
+    .poll(async () =>
+      (await readCommandPayloadLog(page)).slice(commandCountBeforeDisable),
+    )
+    .toContainEqual(
+      expect.objectContaining({
+        command: "update_channel",
+        payload: expect.objectContaining({
+          input: expect.objectContaining({ ttlSeconds: null }),
+        }),
+      }),
+    );
+  await expect(saveLifecycleButton).toHaveText("Save visibility");
+  await expect(saveDetailsButton).toHaveText("Save details");
+  await expect(page.getByTestId("channel-management-ttl")).toHaveCount(0);
+
+  const channelAfterDisable = await invokeMockCommand<{
+    ttl_seconds: number | null;
+    visibility: string;
+  }>(page, "get_channel_details", {
+    channelId: "9a1657ac-f7aa-5db0-b632-d8bbeb6dfb50",
+  });
+  expect(channelAfterDisable).toMatchObject({
+    ttl_seconds: null,
+    visibility: "open",
+  });
+
+  await closeChannelManagement(page);
+  await openChannelManagement(page, "general");
+
+  await expect(
+    page.getByTestId("channel-management-private-toggle"),
+  ).toHaveAttribute("data-state", "unchecked");
+  await expect(
+    page.getByTestId("channel-management-ephemeral-toggle"),
+  ).toHaveAttribute("data-state", "unchecked");
+  await expect(page.getByTestId("channel-management-ttl")).toHaveCount(0);
+});
+
 test("manage channel keeps canvas near the top of the sheet", async ({
   page,
 }) => {
@@ -772,10 +1158,18 @@ test("manage channel keeps canvas near the top of the sheet", async ({
 test("members sidebar can invite and remove members", async ({ page }) => {
   await page.goto("/");
   await openMembersSidebar(page, "general");
-  await expect(page.getByTestId("channel-members-trigger")).toContainText("3");
+  const initialMemberCount = await readMembersTriggerCount(page);
   await expect(page.getByTestId("channel-management-add-pubkeys")).toHaveCount(
     0,
   );
+
+  await expect(page.getByText(/Members · \d+/)).toBeVisible();
+  await page.getByTestId("channel-management-search-users").fill("a");
+  await expect(page.getByText("Members", { exact: true })).toBeVisible();
+  await expect(page.getByText(/Members · \d+/)).toHaveCount(0);
+  await expect(
+    page.getByText("Not in this channel", { exact: true }),
+  ).toBeVisible();
 
   await page.getByTestId("channel-management-search-users").fill("char");
   await expect(
@@ -787,22 +1181,18 @@ test("members sidebar can invite and remove members", async ({ page }) => {
     .getByTestId(`channel-user-search-result-${TEST_IDENTITIES.charlie.pubkey}`)
     .click();
   await expect(
-    page.getByTestId(`selected-invitee-${TEST_IDENTITIES.charlie.pubkey}`),
+    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toContainText("charlie");
-
-  await page.getByTestId("channel-management-add-role").selectOption("admin");
-  await page.getByTestId("channel-management-add-members").click();
-
   await expect(
     page.getByTestId(`selected-invitee-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toHaveCount(0);
-  await expect(page.getByTestId("channel-management-search-users")).toHaveValue(
-    "",
+  await expect(page.getByTestId("channel-management-add-members")).toHaveCount(
+    0,
   );
-  await expect(
-    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.charlie.pubkey}`),
-  ).toContainText("charlie");
-  await expect(page.getByTestId("channel-members-trigger")).toContainText("4");
+  await expect(page.getByTestId("channel-management-search-users")).toHaveValue(
+    "char",
+  );
+  await expectMembersTriggerCount(page, initialMemberCount + 1);
 
   await openMemberMenu(page, TEST_IDENTITIES.charlie.pubkey);
   await page
@@ -812,33 +1202,22 @@ test("members sidebar can invite and remove members", async ({ page }) => {
   await expect(
     page.getByTestId(`sidebar-member-${TEST_IDENTITIES.charlie.pubkey}`),
   ).toHaveCount(0);
-  await expect(page.getByTestId("channel-members-trigger")).toContainText("3");
+  await expectMembersTriggerCount(page, initialMemberCount);
 });
 
-test("members sidebar keeps direct pubkey entry behind a toggle", async ({
-  page,
-}) => {
+test("members modal does not show direct pubkey entry", async ({ page }) => {
   await page.goto("/");
   await openMembersSidebar(page, "general");
 
   await expect(page.getByTestId("channel-management-add-pubkeys")).toHaveCount(
     0,
   );
-
-  await page.getByTestId("channel-management-toggle-direct-pubkeys").click();
   await expect(
-    page.getByTestId("channel-management-add-pubkeys"),
-  ).toBeVisible();
-
-  await page
-    .getByTestId("channel-management-add-pubkeys")
-    .fill(TEST_IDENTITIES.outsider.pubkey);
-  await page.getByTestId("channel-management-add-members").click();
-
+    page.getByTestId("channel-management-toggle-direct-pubkeys"),
+  ).toHaveCount(0);
   await expect(
-    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.outsider.pubkey}`),
-  ).toContainText("outsider");
-  await expect(page.getByTestId("channel-members-trigger")).toContainText("4");
+    page.getByTestId("channel-management-search-users"),
+  ).toHaveAttribute("placeholder", "Add people and agents");
 });
 
 test("open-channel members can add agents from the header", async ({
@@ -887,19 +1266,21 @@ test("private-channel members can add members and bots without admin", async ({
   await expect(
     page.getByTestId("channel-management-search-users"),
   ).toBeVisible();
+  await page.getByTestId("channel-management-search-users").fill("char");
+  await page
+    .getByTestId(`channel-user-search-result-${TEST_IDENTITIES.charlie.pubkey}`)
+    .click();
   await expect(
-    page.getByTestId("channel-management-add-members"),
-  ).toBeVisible();
+    page.getByTestId(`sidebar-member-${TEST_IDENTITIES.charlie.pubkey}`),
+  ).toContainText("charlie");
 
-  // The role dropdown hides the elevated "admin" option for non-admins — the
-  // relay rejects it anyway — while keeping the non-elevated roles a member
-  // may grant (member, guest, bot).
-  const roleSelect = page.getByTestId("channel-management-add-role");
-  await expect(roleSelect.locator("option")).toHaveText([
-    "member",
-    "guest",
-    "bot",
-  ]);
+  // The modal no longer exposes member/guest/bot role choices or a staged
+  // submit button; selected people are added immediately as members and
+  // selected agents are added as bots.
+  await expect(page.getByTestId("channel-management-add-role")).toHaveCount(0);
+  await expect(page.getByTestId("channel-management-add-members")).toHaveCount(
+    0,
+  );
 });
 
 test("removing a channel-scoped agent preserves the managed agent record", async ({

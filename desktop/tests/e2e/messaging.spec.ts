@@ -377,9 +377,10 @@ test("shows your avatar on your own message when profile avatar is set", async (
 
   await page.goto("/");
   await openSettings(page, "profile");
+  await page.getByTestId("profile-avatar-edit").click();
   await page.getByTestId("profile-avatar-url").fill(avatarUrl);
-  await page.getByTestId("profile-save").click();
-  await page.getByTestId("settings-close").click();
+  await page.getByTestId("profile-avatar-done").click();
+  await page.getByTestId("settings-back-to-app").click();
 
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
@@ -485,7 +486,7 @@ test("opens a single-level thread panel with inline expansion", async ({
           return `${Math.round(rect.width)}x${Math.round(rect.height)}`;
         }),
     )
-    .toBe("32x32");
+    .toBe("28x28");
 
   await page.mouse.move(0, 0);
   const rootSummaryWidthBeforeHover = await rootSummaryRow.evaluate((row) =>
@@ -596,7 +597,7 @@ test("opens a single-level thread panel with inline expansion", async ({
 
   await page.evaluate(
     ({ content, parentEventId, pubkey }) => {
-      window.__SPROUT_E2E_EMIT_MOCK_MESSAGE__?.({
+      window.__BUZZ_E2E_EMIT_MOCK_MESSAGE__?.({
         channelName: "general",
         content,
         parentEventId,
@@ -625,6 +626,17 @@ test("opens a single-level thread panel with inline expansion", async ({
   await expect(
     rootSummaryRow.getByTestId("message-thread-summary-participant"),
   ).toHaveCount(2);
+  await expect
+    .poll(() =>
+      rootSummaryRow
+        .getByTestId("message-thread-summary-participant")
+        .evaluateAll((participants) =>
+          participants
+            .map((participant) => getComputedStyle(participant).zIndex)
+            .join(","),
+        ),
+    )
+    .toBe("1,2");
 
   await expect
     .poll(async () => {
@@ -662,7 +674,7 @@ test("thread panel width uses session storage and reset handle", async ({
 
   await page.addInitScript((width) => {
     window.sessionStorage.setItem(
-      "sprout.desktop.thread-panel-width",
+      "buzz.desktop.thread-panel-width",
       String(width),
     );
   }, customWidthPx);
@@ -674,7 +686,9 @@ test("thread panel width uses session storage and reset handle", async ({
   const timeline = page.getByTestId("message-timeline");
   const rootMessage = timeline.getByTestId("message-row").first();
   const threadPanel = page.getByTestId("message-thread-panel");
-  const resizeHandle = threadPanel.getByTestId("message-thread-resize-handle");
+  const resizeHandle = threadPanel.getByTestId(
+    "right-auxiliary-pane-resize-handle",
+  );
 
   await rootMessage.hover();
   await rootMessage.getByRole("button", { name: "Reply" }).click();
@@ -715,6 +729,76 @@ test("thread panel width uses session storage and reset handle", async ({
       });
     })
     .toBe(defaultWidthPx);
+});
+
+test("narrow thread view collapses channel header actions into a menu", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 980, height: 720 });
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-actions-menu-trigger")).toHaveCount(0);
+
+  const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
+  const threadPanel = page.getByTestId("message-thread-panel");
+
+  await rootMessage.hover();
+  await page.getByTestId("reply-message-mock-general-alice").click();
+  await expect(threadPanel).toBeVisible();
+  await expect(threadPanel.getByTestId("message-thread-back")).toHaveCount(0);
+
+  const menuTrigger = page.getByTestId("channel-actions-menu-trigger");
+  await expect(menuTrigger).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toBeHidden();
+  await expect(page.getByTestId("channel-members-trigger")).toBeHidden();
+  await expect(page.getByTestId("channel-management-trigger")).toBeHidden();
+
+  const menuBox = await menuTrigger.boundingBox();
+  const threadPanelBox = await threadPanel.boundingBox();
+  if (!menuBox || !threadPanelBox) {
+    throw new Error("Expected header action menu and thread panel bounds");
+  }
+  const menuGapPx = threadPanelBox.x - (menuBox.x + menuBox.width);
+  expect(menuGapPx).toBeGreaterThanOrEqual(22);
+  expect(menuGapPx).toBeLessThanOrEqual(26);
+
+  await menuTrigger.click();
+
+  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-members-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-start-huddle-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-management-trigger")).toBeVisible();
+});
+
+test("single-panel thread view hides topbar search and channel actions", async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 860, height: 720 });
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(page.getByTestId("open-search")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+
+  const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
+  const threadPanel = page.getByTestId("message-thread-panel");
+
+  await rootMessage.hover();
+  await page.getByTestId("reply-message-mock-general-alice").click();
+  await expect(threadPanel).toBeVisible();
+  await expect(threadPanel.getByTestId("message-thread-back")).toBeVisible();
+  await expect(page.getByTestId("open-search")).toHaveCount(0);
+  await expect(page.getByTestId("channel-actions-menu-trigger")).toHaveCount(0);
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
+
+  await threadPanel.getByTestId("message-thread-back").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+  await expect(page.getByTestId("open-search")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
 });
 
 test("composer is focused after selecting a channel", async ({ page }) => {

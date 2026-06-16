@@ -6,10 +6,16 @@ import {
   Bot,
   FolderGit2,
   Home,
-  PenSquare,
+  MessageCirclePlus,
   Zap,
 } from "lucide-react";
+import { useReconnectRelay } from "@/shared/api/useReconnectRelay";
+import {
+  isRelayUnreachableError,
+  RELAY_UNREACHABLE_SHORT,
+} from "@/shared/lib/relayError";
 import * as React from "react";
+import { FeatureGate } from "@/shared/features";
 import { SidebarDndContext } from "@/features/sidebar/ui/SidebarDnd";
 
 import { useManagedAgentsQuery } from "@/features/agents/hooks";
@@ -34,11 +40,15 @@ import { SidebarSection } from "@/features/sidebar/ui/SidebarSection";
 import {
   ChannelGroupSection,
   CustomChannelSection,
-  SECTION_ACTION_VISIBILITY_CLASS,
 } from "@/features/sidebar/ui/CustomChannelSection";
 import { CreateChannelDialog } from "@/features/sidebar/ui/CreateChannelDialog";
 import { NewDirectMessageDialog } from "@/features/sidebar/ui/NewDirectMessageDialog";
 import { SidebarProfileCard } from "@/features/sidebar/ui/SidebarProfileCard";
+import {
+  SidebarLoadingContent,
+  useSidebarLoadingShape,
+} from "@/features/sidebar/ui/sidebarLoadingSkeleton";
+import { SECTION_ICON_BUTTON_CLASS } from "@/features/sidebar/ui/sidebarSectionStyles";
 import type {
   Channel,
   ChannelVisibility,
@@ -46,21 +56,15 @@ import type {
   Profile,
   UserStatus,
 } from "@/shared/api/types";
-import { cn } from "@/shared/lib/cn";
 import {
   Sidebar,
   SidebarContent,
   SidebarFooter,
-  SidebarGroup,
-  SidebarGroupAction,
-  SidebarGroupContent,
-  SidebarGroupLabel,
   SidebarHeader,
   SidebarMenu,
   SidebarMenuBadge,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarMenuSkeleton,
   SidebarRail,
 } from "@/shared/ui/sidebar";
 
@@ -217,10 +221,9 @@ export function AppSidebar({
   onStarChannel,
   onUnstarChannel,
 }: AppSidebarProps) {
-  // Pulse, Projects (git hosting), and Workflows are Sprout-server features
+  // Pulse, Projects (git hosting), and Workflows are Buzz-server features
   // with no generic-relay equivalent. Hide them in serverless mode.
   const serverless = useIsServerless();
-  const skeletonRows = ["first", "second", "third", "fourth", "fifth", "sixth"];
   const [isNewDmOpenInternal, setIsNewDmOpenInternal] = React.useState(false);
   const isNewDmOpen = isNewDmOpenProp ?? isNewDmOpenInternal;
   const setIsNewDmOpen = onNewDmOpenChange ?? setIsNewDmOpenInternal;
@@ -280,6 +283,8 @@ export function AppSidebar({
     assignChannel,
     unassignChannel,
   } = useChannelSections(currentPubkey);
+
+  const { isPending: isReconnectPending, reconnect } = useReconnectRelay();
 
   const [createSectionState, setCreateSectionState] = React.useState<{
     open: boolean;
@@ -371,6 +376,14 @@ export function AppSidebar({
       fallbackDisplayName,
       profileDisplayName: profile?.displayName,
     });
+  const sidebarLoadingShape = useSidebarLoadingShape({
+    activeWorkspaceId: activeWorkspace?.id,
+    currentPubkey,
+    directMessages,
+    dmChannelLabels,
+    isLoading,
+    streamChannels,
+  });
   const shouldLoadAgentCount = useDeferredLoad({
     immediate: selectedView === "agents",
     timeoutMs: 250,
@@ -448,6 +461,7 @@ export function AppSidebar({
             ) : null}
           </SidebarMenuItem>
           {!serverless && (
+          <FeatureGate feature="pulse">
             <SidebarMenuItem>
               <SidebarMenuButton
                 data-testid="open-pulse-view"
@@ -460,8 +474,10 @@ export function AppSidebar({
                 <span>Pulse</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+          </FeatureGate>
           )}
           {!serverless && (
+          <FeatureGate feature="projects">
             <SidebarMenuItem>
               <SidebarMenuButton
                 data-testid="open-projects-view"
@@ -474,6 +490,7 @@ export function AppSidebar({
                 <span>Projects</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+          </FeatureGate>
           )}
           <SidebarMenuItem>
             <SidebarMenuButton
@@ -488,14 +505,15 @@ export function AppSidebar({
             </SidebarMenuButton>
             {shouldShowAgentCount ? (
               <SidebarMenuBadge
-                className="right-2 rounded-full bg-sidebar-accent/70 px-1.5 text-[11px] text-sidebar-foreground/75 peer-data-[active=true]/menu-button:bg-sidebar-active-foreground/20 peer-data-[active=true]/menu-button:text-sidebar-active-foreground"
+                className="right-2 rounded-full bg-sidebar-accent/70 px-1.5 text-[11px] leading-none text-sidebar-foreground/75 peer-data-[active=true]/menu-button:bg-sidebar-active-foreground/20 peer-data-[active=true]/menu-button:text-sidebar-active-foreground"
                 data-testid="sidebar-agents-count"
               >
-                {totalAgentCount}
+                <span className="leading-none">{totalAgentCount}</span>
               </SidebarMenuBadge>
             ) : null}
           </SidebarMenuItem>
           {!serverless && (
+          <FeatureGate feature="workflows">
             <SidebarMenuItem>
               <SidebarMenuButton
                 data-testid="open-workflows-view"
@@ -508,6 +526,7 @@ export function AppSidebar({
                 <span>Workflows</span>
               </SidebarMenuButton>
             </SidebarMenuItem>
+          </FeatureGate>
           )}
         </SidebarMenu>
       </SidebarHeader>
@@ -524,16 +543,7 @@ export function AppSidebar({
         ) : null}
         <SidebarContent className="pb-32" ref={scrollRef}>
           {isLoading ? (
-            <SidebarGroup>
-              <SidebarGroupLabel>Channels</SidebarGroupLabel>
-              <SidebarGroupContent>
-                <SidebarMenu data-testid="sidebar-loading">
-                  {skeletonRows.map((row) => (
-                    <SidebarMenuSkeleton key={row} showIcon />
-                  ))}
-                </SidebarMenu>
-              </SidebarGroupContent>
-            </SidebarGroup>
+            <SidebarLoadingContent shape={sidebarLoadingShape} />
           ) : null}
 
           {!isLoading ? (
@@ -657,46 +667,48 @@ export function AppSidebar({
                   onUnstarChannel={onUnstarChannel}
                 />
               </SidebarDndContext>
-              <ChannelGroupSection
-                browseAriaLabel="Browse forums"
-                browseTestId="browse-forums"
-                createAriaLabel="Create a forum"
-                hasUnread={unreadChannelIds.size > 0}
-                isCollapsed={collapsedGroups.forums}
-                isActiveChannel={selectedView === "channel"}
-                items={forumChannels}
-                listTestId="forum-list"
-                onBrowse={onOpenBrowseForums}
-                onCreateClick={() => setCreateDialogKind("forum")}
-                onMarkAllRead={onMarkAllChannelsRead}
-                onMarkChannelRead={onMarkChannelRead}
-                onMarkChannelUnread={onMarkChannelUnread}
-                onSelectChannel={onSelectChannel}
-                onToggleCollapsed={() => toggleCollapsedGroup("forums")}
-                selectedChannelId={selectedChannelId}
-                title="Forums"
-                unreadChannelIds={unreadChannelIds}
-                mutedChannelIds={mutedChannelIds}
-                onMuteChannel={onMuteChannel}
-                onUnmuteChannel={onUnmuteChannel}
-              />
+              <FeatureGate feature="forum">
+                <ChannelGroupSection
+                  browseAriaLabel="Browse forums"
+                  browseTestId="browse-forums"
+                  createAriaLabel="Create a forum"
+                  hasUnread={unreadChannelIds.size > 0}
+                  isCollapsed={collapsedGroups.forums}
+                  isActiveChannel={selectedView === "channel"}
+                  items={forumChannels}
+                  listTestId="forum-list"
+                  onBrowse={onOpenBrowseForums}
+                  onCreateClick={() => setCreateDialogKind("forum")}
+                  onMarkAllRead={onMarkAllChannelsRead}
+                  onMarkChannelRead={onMarkChannelRead}
+                  onMarkChannelUnread={onMarkChannelUnread}
+                  onSelectChannel={onSelectChannel}
+                  onToggleCollapsed={() => toggleCollapsedGroup("forums")}
+                  selectedChannelId={selectedChannelId}
+                  title="Forums"
+                  unreadChannelIds={unreadChannelIds}
+                  mutedChannelIds={mutedChannelIds}
+                  onMuteChannel={onMuteChannel}
+                  onUnmuteChannel={onUnmuteChannel}
+                />
+              </FeatureGate>
               <SidebarSection
                 action={
-                  <SidebarGroupAction
-                    aria-expanded={isNewDmOpen}
-                    aria-label="Start a direct message"
-                    className={cn(
-                      "top-1/2 -translate-y-1/2 text-sidebar-foreground/50 hover:bg-sidebar-border/35 hover:text-sidebar-foreground",
-                      SECTION_ACTION_VISIBILITY_CLASS,
-                    )}
-                    data-testid="new-dm-trigger"
-                    onClick={() => {
-                      setIsNewDmOpen(true);
-                    }}
-                    type="button"
-                  >
-                    <PenSquare className="transition-transform" />
-                  </SidebarGroupAction>
+                  <div className="absolute right-1 top-1/2 z-10 flex -translate-y-1/2 items-center gap-0.5">
+                    <button
+                      aria-expanded={isNewDmOpen}
+                      aria-label="Compose new message"
+                      className={SECTION_ICON_BUTTON_CLASS}
+                      data-testid="new-dm-trigger"
+                      onClick={() => {
+                        setIsNewDmOpen(true);
+                      }}
+                      title="Compose new message"
+                      type="button"
+                    >
+                      <MessageCirclePlus className="h-4 w-4" />
+                    </button>
+                  </div>
                 }
                 dmParticipantsByChannelId={dmParticipantsByChannelId}
                 isCollapsed={collapsedGroups.directMessages}
@@ -721,9 +733,29 @@ export function AppSidebar({
           ) : null}
 
           {errorMessage ? (
-            <div className="px-3 py-2 text-sm text-destructive">
-              {errorMessage}
-            </div>
+            isRelayUnreachableError(errorMessage) ? (
+              <div
+                className="px-3 py-2 text-sm"
+                data-testid="sidebar-relay-unreachable"
+              >
+                <span className="text-muted-foreground">
+                  {RELAY_UNREACHABLE_SHORT}{" "}
+                </span>
+                <button
+                  className="text-primary hover:underline disabled:opacity-50"
+                  data-testid="sidebar-reconnect"
+                  disabled={isReconnectPending}
+                  onClick={() => void reconnect()}
+                  type="button"
+                >
+                  {isReconnectPending ? "Reconnecting…" : "Reconnect"}
+                </button>
+              </div>
+            ) : (
+              <div className="px-3 py-2 text-sm text-destructive">
+                {errorMessage}
+              </div>
+            )
           ) : null}
         </SidebarContent>
 

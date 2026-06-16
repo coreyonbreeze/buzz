@@ -5,16 +5,25 @@ import { EmojiPicker } from "@/features/custom-emoji/ui/EmojiPicker";
 import type { TimelineMessage } from "@/features/messages/types";
 import { MessageReactions } from "@/features/messages/ui/MessageReactions";
 import { useReactionHandler } from "@/features/messages/ui/useReactionHandler";
+import { recordQuickReactionEmoji } from "@/features/messages/ui/useQuickReactionEmojis";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import { resolveUserLabel } from "@/features/profile/lib/identity";
 import { UserProfilePopover } from "@/features/profile/ui/UserProfilePopover";
 import { cn } from "@/shared/lib/cn";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
+import { isPositiveEmojiParticle } from "@/shared/ui/EmojiBurstProvider";
+import {
+  MENTION_CHIP_BASE_CLASSES,
+  MENTION_CHIP_HOVER_CLASSES,
+} from "@/shared/ui/mentionChip";
 import { Popover, PopoverContent, PopoverTrigger } from "@/shared/ui/popover";
-import { Spinner } from "@/shared/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 import { MessageTimestamp } from "./MessageTimestamp";
+
+const SYSTEM_ACTION_BUTTON_CLASS = "h-6 w-6 rounded-full p-0";
+const SYSTEM_ACTION_ICON_CLASS = "!h-4 !w-4";
 
 type SystemMessagePayload = {
   type: string;
@@ -40,15 +49,6 @@ function resolveLabel(
   return resolveUserLabel({ pubkey, currentPubkey, profiles });
 }
 
-function resolvePersonaSuffix(
-  pubkey: string | undefined,
-  personaLookup: Map<string, string> | undefined,
-): string {
-  if (!pubkey || !personaLookup) return "";
-  const personaName = personaLookup.get(pubkey.toLowerCase());
-  return personaName ? ` (${personaName})` : "";
-}
-
 function resolveAvatarUrl(
   pubkey: string | undefined,
   profiles: UserProfileLookup | undefined,
@@ -57,34 +57,41 @@ function resolveAvatarUrl(
   return profiles[pubkey.toLowerCase()]?.avatarUrl ?? null;
 }
 
-function resolveLabelWithSuffix(
+function resolveDisplayLabel(
   pubkey: string | undefined,
   currentPubkey: string | undefined,
   profiles: UserProfileLookup | undefined,
-  suffix = "",
 ): string {
-  return `${resolveLabel(pubkey, currentPubkey, profiles)}${suffix}`;
+  return resolveLabel(pubkey, currentPubkey, profiles);
 }
 
 function ProfileName({
   children,
   highlight = false,
+  isAgent = false,
   pubkey,
 }: {
   children: React.ReactNode;
   highlight?: boolean;
+  isAgent?: boolean;
   pubkey: string | undefined;
 }) {
+  const isAgentMention = highlight && isAgent;
   const node = (
     <span
+      data-mention={highlight ? "" : undefined}
       className={cn(
-        "rounded-xs transition-colors hover:text-foreground",
         pubkey && "cursor-pointer",
-        highlight &&
-          "rounded-md bg-primary/15 px-1 py-0.5 font-medium text-primary hover:bg-primary/25 hover:text-primary/90",
+        highlight
+          ? cn(
+              MENTION_CHIP_BASE_CLASSES,
+              MENTION_CHIP_HOVER_CLASSES,
+              isAgentMention && "agent-mention-highlight",
+            )
+          : "rounded-xs transition-colors hover:text-foreground",
       )}
     >
-      {highlight ? "@" : null}
+      {highlight && !isAgentMention ? "@" : null}
       {children}
     </span>
   );
@@ -190,24 +197,28 @@ function describeSystemEvent(
   currentPubkey: string | undefined,
   profiles: UserProfileLookup | undefined,
   personaLookup?: Map<string, string>,
+  agentPubkeys?: ReadonlySet<string>,
 ): SystemMessageDescription | null {
-  const personaSuffix = resolvePersonaSuffix(payload.target, personaLookup);
-  const actorLabel = resolveLabelWithSuffix(
+  const isTargetAgent =
+    payload.target !== undefined &&
+    (agentPubkeys?.has(normalizePubkey(payload.target)) === true ||
+      profiles?.[normalizePubkey(payload.target)]?.isAgent === true ||
+      personaLookup?.has(normalizePubkey(payload.target)) === true);
+  const actorLabel = resolveDisplayLabel(
     payload.actor,
     currentPubkey,
     profiles,
   );
-  const targetLabel = resolveLabelWithSuffix(
+  const targetLabel = resolveDisplayLabel(
     payload.target,
     currentPubkey,
     profiles,
-    personaSuffix,
   );
   const actorName = (
     <ProfileName pubkey={payload.actor}>{actorLabel}</ProfileName>
   );
   const targetName = (
-    <ProfileName highlight pubkey={payload.target}>
+    <ProfileName highlight isAgent={isTargetAgent} pubkey={payload.target}>
       {targetLabel}
     </ProfileName>
   );
@@ -222,12 +233,7 @@ function describeSystemEvent(
       }
       return {
         title: actorName,
-        action: (
-          <>
-            added <span className="font-medium">{targetName}</span> to the
-            channel
-          </>
-        ),
+        action: <>added {targetName} to the channel</>,
       };
     }
     case "member_left":
@@ -238,12 +244,7 @@ function describeSystemEvent(
     case "member_removed":
       return {
         title: actorName,
-        action: (
-          <>
-            removed <span className="font-medium">{targetName}</span> from the
-            channel
-          </>
-        ),
+        action: <>removed {targetName} from the channel</>,
       };
     case "topic_changed":
       return {
@@ -278,12 +279,14 @@ function describeSystemEvent(
 export const SystemMessageRow = React.memo(function SystemMessageRow({
   message,
   currentPubkey,
+  agentPubkeys,
   profiles,
   personaLookup,
   onToggleReaction,
 }: {
   message: TimelineMessage;
   currentPubkey?: string;
+  agentPubkeys?: ReadonlySet<string>;
   profiles?: UserProfileLookup;
   /** Map from lowercase pubkey → persona display name for bot members. */
   personaLookup?: Map<string, string>;
@@ -293,6 +296,9 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
     remove: boolean,
   ) => Promise<void>;
 }) {
+  const [badgeBurstEmoji, setBadgeBurstEmoji] = React.useState<string | null>(
+    null,
+  );
   const [isReactionPickerOpen, setIsReactionPickerOpen] = React.useState(false);
   const {
     reactions,
@@ -314,10 +320,16 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
     currentPubkey,
     profiles,
     personaLookup,
+    agentPubkeys,
   );
   if (!description) {
     return null;
   }
+
+  const wouldAddReaction = (emoji: string) =>
+    !reactions.some(
+      (reaction) => reaction.emoji === emoji && reaction.reactedByCurrentUser,
+    );
 
   return (
     <div
@@ -351,6 +363,12 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
               canToggle={canToggleReactions}
               pending={reactionPending}
               className="mt-0.5 pt-0.5"
+              burstEmojiOnRender={badgeBurstEmoji}
+              onBurstEmojiRendered={(emoji) => {
+                setBadgeBurstEmoji((current) =>
+                  current === emoji ? null : current,
+                );
+              }}
               onSelect={(emoji) => {
                 void handleReactionSelect(emoji);
               }}
@@ -362,7 +380,7 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
             ) : null}
           </div>
         </div>
-        <div className="absolute right-2 top-1 z-10">
+        <div className="absolute right-2 top-1 z-10 sm:top-0 sm:-translate-y-1/2">
           {canToggleReactions ? (
             <div
               className={cn(
@@ -385,17 +403,12 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
                       <PopoverTrigger asChild>
                         <Button
                           aria-label="Open reactions"
-                          className="h-6 w-6 rounded-full p-0"
-                          disabled={reactionPending}
+                          className={SYSTEM_ACTION_BUTTON_CLASS}
                           size="sm"
                           type="button"
                           variant={isReactionPickerOpen ? "secondary" : "ghost"}
                         >
-                          {reactionPending ? (
-                            <Spinner className="h-3 w-3" />
-                          ) : (
-                            <SmilePlus className="h-3 w-3" />
-                          )}
+                          <SmilePlus className={SYSTEM_ACTION_ICON_CLASS} />
                         </Button>
                       </PopoverTrigger>
                     </TooltipTrigger>
@@ -416,9 +429,21 @@ export const SystemMessageRow = React.memo(function SystemMessageRow({
                     ) : null}
                     <EmojiPicker
                       onSelect={(value) => {
-                        void handleReactionSelect(value).finally(() => {
-                          setIsReactionPickerOpen(false);
-                        });
+                        if (
+                          !reactionPending &&
+                          wouldAddReaction(value) &&
+                          isPositiveEmojiParticle(value)
+                        ) {
+                          setBadgeBurstEmoji(value);
+                        }
+                        void handleReactionSelect(value)
+                          .then(() => {
+                            recordQuickReactionEmoji(value);
+                          })
+                          .catch(() => {})
+                          .finally(() => {
+                            setIsReactionPickerOpen(false);
+                          });
                       }}
                     />
                   </PopoverContent>

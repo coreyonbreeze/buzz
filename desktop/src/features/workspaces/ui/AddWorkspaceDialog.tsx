@@ -77,7 +77,7 @@ export function AddWorkspaceDialog({
         <DialogHeader>
           <DialogTitle>Add Workspace</DialogTitle>
           <DialogDescription>
-            Connect to another Sprout relay, or a generic public Nostr relay in
+            Connect to another Buzz relay, or a generic public Nostr relay in
             serverless mode. Each workspace has its own channels, messages, and
             identity.
           </DialogDescription>
@@ -94,7 +94,7 @@ export function AddWorkspaceDialog({
                 // user doesn't have to tap every chip. Only auto-fill when the
                 // field is empty or still holds the defaults, so we never stomp
                 // a custom relay list the user typed. Turning it OFF clears the
-                // default list (a single Sprout relay is expected instead).
+                // default list (a single Buzz relay is expected instead).
                 if (on) {
                   if (relayUrl.trim() === "") {
                     setRelayUrl(DEFAULT_SERVERLESS_RELAY);
@@ -110,7 +110,7 @@ export function AddWorkspaceDialog({
                 Serverless mode
               </span>
               <span className="text-xs text-muted-foreground">
-                Connect directly to a generic public Nostr relay — no Sprout
+                Connect directly to a generic public Nostr relay - no Buzz
                 server, database, or auth. Channels and DMs only; search,
                 presence, and huddles are unavailable.
               </span>
@@ -197,7 +197,7 @@ export function AddWorkspaceDialog({
               <Input
                 id="ws-token"
                 onChange={(e) => setToken(e.target.value)}
-                placeholder="sprout_..."
+                placeholder="buzz_..."
                 type="password"
                 value={token}
               />

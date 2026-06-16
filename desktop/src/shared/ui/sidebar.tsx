@@ -27,7 +27,7 @@ import {
 
 const SIDEBAR_COOKIE_NAME = "sidebar_state";
 const SIDEBAR_COOKIE_MAX_AGE = 60 * 60 * 24 * 7;
-const SIDEBAR_WIDTH_STORAGE_KEY = "sprout-sidebar-width";
+const SIDEBAR_WIDTH_STORAGE_KEY = "buzz-sidebar-width";
 const SIDEBAR_WIDTH_DEFAULT = 300;
 const SIDEBAR_WIDTH_DEFAULT_HAPTIC_THRESHOLD = 2;
 const SIDEBAR_WIDTH_DEFAULT_SNAP_DISTANCE = 8;
@@ -380,7 +380,7 @@ const Sidebar = React.forwardRef<
         >
           <div
             data-sidebar="sidebar"
-            className="flex h-full w-full flex-col bg-sidebar group-data-[variant=sidebar]:border-r group-data-[variant=sidebar]:border-sidebar-border group-data-[variant=sidebar]:pr-px group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:border group-data-[variant=floating]:border-sidebar-border group-data-[variant=floating]:shadow"
+            className="flex h-full w-full flex-col bg-sidebar group-data-[variant=sidebar]:pr-px group-data-[variant=floating]:rounded-lg group-data-[variant=floating]:border group-data-[variant=floating]:border-sidebar-border group-data-[variant=floating]:shadow"
           >
             {children}
           </div>
@@ -403,7 +403,7 @@ const SidebarTrigger = React.forwardRef<
       data-sidebar="trigger"
       variant="ghost"
       size="icon"
-      className={cn("h-7 w-7", className)}
+      className={className}
       onClick={(event) => {
         onClick?.(event);
         toggleSidebar();
@@ -577,7 +577,7 @@ const SidebarRail = React.forwardRef<
         className={cn(
           "absolute inset-y-0 z-20 hidden w-4 -translate-x-1/2 transition-all ease-linear group-data-[side=left]:-right-4 group-data-[side=right]:left-0 sm:flex",
           "cursor-col-resize",
-          "after:absolute after:inset-y-0 after:left-1/2 after:z-10 after:w-px after:-translate-x-1/2 after:bg-sidebar-border after:opacity-0 after:transition-opacity after:content-[''] hover:after:opacity-100 focus-visible:after:opacity-100 group-data-[resizing=true]:after:opacity-100",
+          "after:absolute after:inset-y-0 after:left-1/2 after:z-10 after:w-px after:-translate-x-1/2 after:bg-border/50 after:transition-colors after:content-[''] hover:after:bg-sidebar-border focus-visible:after:bg-sidebar-border group-data-[resizing=true]:after:bg-sidebar-border",
           "[[data-state=collapsed]_&]:cursor-pointer",
           "group-data-[collapsible=offcanvas]:translate-x-0 group-data-[collapsible=offcanvas]:hover:bg-sidebar",
           "[[data-side=left][data-collapsible=offcanvas]_&]:-right-2",
@@ -593,7 +593,7 @@ const SidebarRail = React.forwardRef<
 SidebarRail.displayName = "SidebarRail";
 
 const SidebarInset = React.forwardRef<
-  HTMLDivElement,
+  HTMLElement,
   React.ComponentProps<"main">
 >(({ className, ...props }, ref) => {
   return (

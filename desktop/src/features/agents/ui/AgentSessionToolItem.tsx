@@ -12,7 +12,7 @@ import { UserAvatar } from "@/shared/ui/UserAvatar";
 import type { TranscriptItem } from "./agentSessionTypes";
 import {
   formatToolTitle,
-  getSproutToolInfo,
+  getBuzzToolInfo,
   getToolStatusDisplay,
 } from "./agentSessionToolCatalog";
 import {
@@ -35,9 +35,9 @@ export function ToolItem({
   const status = getToolStatusDisplay(item.status, item.isError);
   const hasArgs = Object.keys(item.args).length > 0;
   const hasResult = item.result.trim().length > 0;
-  const canonicalToolName = item.sproutToolName ?? item.toolName;
-  const sproutTool = getSproutToolInfo(canonicalToolName);
-  const ToolIcon = sproutTool?.icon ?? Wrench;
+  const canonicalToolName = item.buzzToolName ?? item.toolName;
+  const buzzTool = getBuzzToolInfo(canonicalToolName);
+  const ToolIcon = buzzTool?.icon ?? Wrench;
   const showStatus = status.state !== "output-available";
   const toolTitle = formatToolTitle(canonicalToolName, item.title);
   const handleToggle = React.useCallback(
@@ -59,15 +59,15 @@ export function ToolItem({
             <ToolIcon
               className={cn(
                 "h-4 w-4 shrink-0",
-                sproutTool ? "text-primary" : "text-muted-foreground",
+                buzzTool ? "text-primary" : "text-muted-foreground",
               )}
             />
           ) : null}
           <span className="min-w-0 truncate text-sm font-medium">
             {toolTitle}
           </span>
-          {sproutTool ? (
-            <SproutToolInlineAction args={item.args} result={item.result} />
+          {buzzTool ? (
+            <BuzzToolInlineAction args={item.args} result={item.result} />
           ) : null}
           {showStatus ? (
             <span className="flex shrink-0 items-center gap-1 text-xs text-muted-foreground">
@@ -81,12 +81,12 @@ export function ToolItem({
             </span>
           ) : null}
           <ToolTimestamp item={item} />
-          <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
+          <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground transition-transform group-open:rotate-180" />
         </summary>
 
         <ToolDetailBlocks
           args={item.args}
-          description={sproutTool?.label}
+          description={buzzTool?.label}
           hasArgs={hasArgs}
           hasResult={hasResult}
           isError={item.isError}
@@ -208,7 +208,7 @@ function ToolTimestamp({
   );
 }
 
-function SproutToolInlineAction({
+function BuzzToolInlineAction({
   args,
   result,
 }: {
@@ -242,7 +242,7 @@ function SproutToolInlineAction({
   );
   const action = React.useMemo(
     () =>
-      getSproutToolInlineAction({
+      getBuzzToolInlineAction({
         args,
         channelId,
         channels,
@@ -272,7 +272,7 @@ function SproutToolInlineAction({
         {action.avatar}
         <span className="shrink-0">{action.label}</span>
         <span className="truncate">{action.value}</span>
-        <ArrowUpRight className="h-3 w-3 shrink-0" />
+        <ArrowUpRight className="h-4 w-4 shrink-0" />
       </button>
     );
   }
@@ -289,7 +289,7 @@ function SproutToolInlineAction({
   );
 }
 
-type SproutToolInlineActionModel = {
+type BuzzToolInlineActionModel = {
   avatar?: React.ReactNode;
   label: string;
   value: string;
@@ -297,7 +297,7 @@ type SproutToolInlineActionModel = {
   onClick?: () => void;
 };
 
-function getSproutToolInlineAction({
+function getBuzzToolInlineAction({
   args,
   channelId,
   channels,
@@ -311,7 +311,7 @@ function getSproutToolInlineAction({
   openChannel: (messageId?: string) => void;
   profiles: Record<string, UserProfileSummary> | undefined;
   resultValue: unknown;
-}): SproutToolInlineActionModel | null {
+}): BuzzToolInlineActionModel | null {
   const resultRecord = asRecord(resultValue);
   const eventId =
     getToolString(args, ["event_id", "eventId"]) ??

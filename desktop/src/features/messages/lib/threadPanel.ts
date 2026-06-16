@@ -32,6 +32,12 @@ type ThreadDescendantStats = {
   recentParticipantsNewestFirst: TimelineThreadSummaryParticipant[];
 };
 
+export type ThreadPanelIndex = {
+  directChildrenByParentId: Map<string, TimelineMessage[]>;
+  descendantStatsByMessageId: Map<string, ThreadDescendantStats>;
+  messageById: Map<string, TimelineMessage>;
+};
+
 const MAX_SUMMARY_PARTICIPANTS = 3;
 
 function normalizeHeadMessage(message: TimelineMessage): TimelineMessage {
@@ -41,14 +47,47 @@ function normalizeHeadMessage(message: TimelineMessage): TimelineMessage {
   };
 }
 
+// Thread rows feed `MessageRow` a depth-normalized copy of each reply. Building
+// that copy fresh (`{ ...message, depth }`) on every render hands `MessageRow` a
+// new object identity every time `timelineMessages` churns (typing/presence),
+// even when the reply and its depth are byte-identical — which defeats the
+// row/markdown memo and forces a ~1.4ms/row re-parse on threads where the main
+// timeline (which passes the raw stable ref) stays cheap.
+//
+// Mirror the main list's per-id context memoization (`videoReviewContextById`):
+// cache the normalized object keyed on the source reply identity + depth, so an
+// unrelated channel churn that leaves a reply (and its tree position) intact
+// reuses the exact same object reference and the memo hits.
+//
+// Keyed on the source `reply` reference via a WeakMap: a new `timelineMessages`
+// set produces new reply objects (genuine recompute), and stale entries are
+// collected automatically when the old message set is dropped.
+const normalizedInlineReplyCache = new WeakMap<
+  TimelineMessage,
+  Map<number, TimelineMessage>
+>();
+
 function normalizeInlineReplyMessage(
   message: TimelineMessage,
   depth: number,
 ): TimelineMessage {
-  return {
+  let byDepth = normalizedInlineReplyCache.get(message);
+  if (!byDepth) {
+    byDepth = new Map<number, TimelineMessage>();
+    normalizedInlineReplyCache.set(message, byDepth);
+  }
+
+  const cached = byDepth.get(depth);
+  if (cached) {
+    return cached;
+  }
+
+  const normalized: TimelineMessage = {
     ...message,
     depth,
   };
+  byDepth.set(depth, normalized);
+  return normalized;
 }
 
 function buildDirectChildrenByParentId(messages: TimelineMessage[]) {
@@ -69,8 +108,8 @@ function buildDirectChildrenByParentId(messages: TimelineMessage[]) {
 
 function buildDescendantStatsByMessageId(
   messages: TimelineMessage[],
+  messageById: Map<string, TimelineMessage>,
 ): Map<string, ThreadDescendantStats> {
-  const messageById = new Map(messages.map((message) => [message.id, message]));
   const descendantStatsByMessageId = new Map<string, ThreadDescendantStats>(
     messages.map((message) => [
       message.id,
@@ -133,6 +172,21 @@ function buildDescendantStatsByMessageId(
   }
 
   return descendantStatsByMessageId;
+}
+
+export function buildThreadPanelIndex(
+  messages: TimelineMessage[],
+): ThreadPanelIndex {
+  const messageById = new Map(messages.map((message) => [message.id, message]));
+
+  return {
+    directChildrenByParentId: buildDirectChildrenByParentId(messages),
+    descendantStatsByMessageId: buildDescendantStatsByMessageId(
+      messages,
+      messageById,
+    ),
+    messageById,
+  };
 }
 
 function buildSummaryForDirectReplies(
@@ -221,7 +275,7 @@ function buildVisibleThreadReplies(params: {
 export function buildMainTimelineEntries(
   messages: TimelineMessage[],
 ): MainTimelineEntry[] {
-  const descendantStatsByMessageId = buildDescendantStatsByMessageId(messages);
+  const { descendantStatsByMessageId } = buildThreadPanelIndex(messages);
 
   return messages
     .filter(
@@ -239,8 +293,8 @@ export function buildMainTimelineEntries(
     });
 }
 
-export function buildThreadPanelData(
-  messages: TimelineMessage[],
+export function buildThreadPanelDataFromIndex(
+  index: ThreadPanelIndex,
   openThreadHeadId: string | null,
   threadReplyTargetId: string | null,
   expandedReplyIds: ReadonlySet<string>,
@@ -254,7 +308,8 @@ export function buildThreadPanelData(
     };
   }
 
-  const messageById = new Map(messages.map((message) => [message.id, message]));
+  const { directChildrenByParentId, descendantStatsByMessageId, messageById } =
+    index;
   const threadHead = messageById.get(openThreadHeadId) ?? null;
 
   if (!threadHead) {
@@ -266,8 +321,6 @@ export function buildThreadPanelData(
     };
   }
 
-  const directChildrenByParentId = buildDirectChildrenByParentId(messages);
-  const descendantStatsByMessageId = buildDescendantStatsByMessageId(messages);
   const normalizedThreadHead = normalizeHeadMessage(threadHead);
   const visibleReplies = buildVisibleThreadReplies({
     openThreadHeadId,
@@ -288,4 +341,18 @@ export function buildThreadPanelData(
     visibleReplies,
     replyTargetMessage: replyTargetInBranch ?? normalizedThreadHead,
   };
+}
+
+export function buildThreadPanelData(
+  messages: TimelineMessage[],
+  openThreadHeadId: string | null,
+  threadReplyTargetId: string | null,
+  expandedReplyIds: ReadonlySet<string>,
+): ThreadPanelData {
+  return buildThreadPanelDataFromIndex(
+    buildThreadPanelIndex(messages),
+    openThreadHeadId,
+    threadReplyTargetId,
+    expandedReplyIds,
+  );
 }

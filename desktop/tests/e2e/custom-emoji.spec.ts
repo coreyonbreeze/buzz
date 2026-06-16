@@ -9,13 +9,13 @@ import { installMockBridge } from "../helpers/bridge";
 // still serializing to `:shortcode:` on send. The message timeline renders the
 // same shortcode as `img[data-custom-emoji]` via remarkCustomEmoji.
 //
-// The `:sprout:` shortcode lives in a member-authored kind:30030 set
-// (d=`sprout:custom-emoji`) served by the mock bridge from two distinct
+// The `:buzz:` shortcode lives in a member-authored kind:30030 set
+// (d=`buzz:custom-emoji`) served by the mock bridge from two distinct
 // pubkeys. `listCustomEmoji` reads every member's set over the relay WS and
 // unions them (deduped by shortcode+url) into the workspace palette — which is
 // live even in mock-bridge mode (the mock only intercepts Tauri commands), so
 // this spec uses the simpler mock-bridge setup like messaging.spec.ts.
-const SHORTCODE = "sprout";
+const SHORTCODE = "buzz";
 
 async function openGeneral(page: import("@playwright/test").Page) {
   await page.goto("/");
@@ -114,7 +114,7 @@ test("custom emoji round-trips through select-all + send to the timeline", async
 // `:react:` is a relay-hosted fixture emoji (URL on the relay origin matching
 // rewriteRelayUrl()'s /media/{64-hex}.{ext} pattern), and the mock bridge
 // answers get_media_proxy_port with port 54321 so the rewrite resolves to a
-// real localhost URL rather than the sprout-media:// fallback.
+// real localhost URL rather than the buzz-media:// fallback.
 
 const REACTION_SHORTCODE = "react";
 const MOCK_MEDIA_PROXY_PORT = 54321;
@@ -151,7 +151,12 @@ test("reacting with a custom emoji renders via the localhost media proxy", async
   // The reaction pill renders the custom emoji as an <img alt=":react:">. Its
   // src must be the localhost proxy URL — proving rewriteRelayUrl() ran. A raw
   // relay URL here is the bug.
-  const reactionImg = row.locator(`img[alt=':${REACTION_SHORTCODE}:']`);
+  const reactionPill = row.getByLabel(
+    `Toggle :${REACTION_SHORTCODE}: reaction`,
+  );
+  const reactionImg = reactionPill.locator(
+    `img[alt=':${REACTION_SHORTCODE}:']`,
+  );
   await expect(reactionImg).toBeVisible();
   await expect(reactionImg).toHaveAttribute(
     "src",
@@ -199,7 +204,7 @@ test("reacting with a custom emoji renders via the localhost media proxy", async
   // disappear. Guards the mock-bridge deletion path: the reaction event needs a
   // 64-hex id, because the timeline only honors deletions whose `e` tag is
   // 64-hex (getDeletionTargets). A 32-hex reaction id leaves a stale pill here.
-  await row.getByLabel(`Toggle :${REACTION_SHORTCODE}: reaction`).click();
+  await reactionPill.click();
   await expect(reactionImg).toHaveCount(0);
 });
 
@@ -258,7 +263,7 @@ test("editing a message with a custom emoji shows the image, not the shortcode (
 
   // Open it for editing. The composer loads via setContent — the path the
   // markdown parse rule fixes. The known shortcode must render as the inline
-  // node, NOT as literal `:sprout:` text.
+  // node, NOT as literal `:buzz:` text.
   await openMessageEditor(page, "edit-bug1");
   await expect(input.locator("img[data-custom-emoji]")).toHaveCount(1);
   await expect(input.locator("img[data-custom-emoji]")).toHaveAttribute(
@@ -296,7 +301,7 @@ test("adding a custom emoji while editing keeps the image after save (Bug 2)", a
 
   // After the edit round-trips through edit_message → kind:40003 (with emoji
   // tags) → applyEditTagOverlay, the timeline must render the emoji as an
-  // <img>, not a bare `:sprout:`. The pre-fix edit path shipped no emoji tags,
+  // <img>, not a bare `:buzz:`. The pre-fix edit path shipped no emoji tags,
   // so this row would show literal text and fail here.
   await expect(
     row.locator(`img[data-custom-emoji][alt=":${SHORTCODE}:"]`),
@@ -324,6 +329,8 @@ test("a system message accepts a custom-emoji reaction", async ({ page }) => {
     .first()
     .click();
 
-  const reactionImg = row.locator(`img[alt=':${REACTION_SHORTCODE}:']`);
+  const reactionImg = row
+    .getByLabel(`Toggle :${REACTION_SHORTCODE}: reaction`)
+    .locator(`img[alt=':${REACTION_SHORTCODE}:']`);
   await expect(reactionImg).toBeVisible();
 });

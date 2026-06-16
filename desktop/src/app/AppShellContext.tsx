@@ -8,6 +8,7 @@ type AppShellContextValue = {
     readAt: string | null | undefined,
   ) => void;
   markChannelUnread: (channelId: string) => void;
+  openCreateChannel: () => void;
   openChannelManagement: () => void;
   // NIP-RS read marker for a channel as a unix-seconds timestamp, or null
   // when unknown. Backed by the single AppShell-mounted ReadStateManager so
@@ -20,6 +21,8 @@ type AppShellContextValue = {
   unfollowThread: (rootId: string) => void;
   isFollowingThread: (rootId: string) => boolean;
   isNotifiedForThread: (rootId: string) => boolean;
+  setTopbarSearchHidden: (hidden: boolean) => void;
+  setTopbarSearchLoading: (loading: boolean) => void;
   threadActivityItems: ThreadActivityItem[];
 };
 
@@ -27,6 +30,7 @@ const AppShellContext = React.createContext<AppShellContextValue>({
   markAllChannelsRead: () => {},
   markChannelRead: () => {},
   markChannelUnread: () => {},
+  openCreateChannel: () => {},
   openChannelManagement: () => {},
   getChannelReadAt: () => null,
   readStateVersion: 0,
@@ -34,6 +38,8 @@ const AppShellContext = React.createContext<AppShellContextValue>({
   unfollowThread: () => {},
   isFollowingThread: () => false,
   isNotifiedForThread: () => false,
+  setTopbarSearchHidden: () => {},
+  setTopbarSearchLoading: () => {},
   threadActivityItems: [],
 });
 

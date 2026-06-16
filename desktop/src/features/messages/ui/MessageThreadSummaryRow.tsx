@@ -3,44 +3,38 @@ import type {
   TimelineThreadSummaryParticipant,
 } from "@/features/messages/lib/threadPanel";
 import type { TimelineMessage } from "@/features/messages/types";
+import { formatThreadSummaryLastReplyTime } from "@/features/messages/lib/dateFormatters";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
 
 const MESSAGE_TEXT_OFFSET_PX = 54;
 const MESSAGE_BODY_OFFSET_PX = MESSAGE_TEXT_OFFSET_PX + 4;
 const NESTED_REPLY_OFFSET_PX = 28;
 
-function formatLastReplyTime(unixSeconds: number): string {
-  const now = Date.now() / 1_000;
-  const diff = now - unixSeconds;
-
-  if (diff < 60) return "just now";
-  if (diff < 3_600) return `${Math.floor(diff / 60)}m ago`;
-  if (diff < 86_400) return `${Math.floor(diff / 3_600)}h ago`;
-  if (diff < 604_800) return `${Math.floor(diff / 86_400)}d ago`;
-
-  const date = new Date(unixSeconds * 1_000).toLocaleDateString(undefined, {
-    month: "short",
-    day: "numeric",
-  });
-  return `on ${date}`;
-}
-
 function ParticipantAvatar({
   participant,
   index,
+  participantCount,
 }: {
   participant: TimelineThreadSummaryParticipant;
   index: number;
+  participantCount: number;
 }) {
   return (
     <div
       className={index > 0 ? "-ml-2" : ""}
       data-testid="message-thread-summary-participant"
-      style={{ zIndex: 10 - index }}
+      style={{
+        zIndex: index + 1,
+        ...(index < participantCount - 1 && {
+          mask: "radial-gradient(circle 16px at calc(100% + 4px) 50%, transparent 99%, #fff 100%)",
+          WebkitMask:
+            "radial-gradient(circle 16px at calc(100% + 4px) 50%, transparent 99%, #fff 100%)",
+        }),
+      }}
     >
       <UserAvatar
         avatarUrl={participant.avatarUrl}
-        className="h-8 w-8 rounded-full border-2 border-background text-[10px]"
+        className="h-7 w-7 text-[10px]"
         displayName={participant.author}
         size="sm"
       />
@@ -52,11 +46,13 @@ export function MessageThreadSummaryRow({
   depth = 0,
   message,
   onOpenThread,
+  showDepthGuides = true,
   summary,
 }: {
   depth?: number;
   message: TimelineMessage;
   onOpenThread: (message: TimelineMessage) => void;
+  showDepthGuides?: boolean;
   summary: TimelineThreadSummary;
 }) {
   const visibleDepth = Math.min(Math.max(depth, 0), 6);
@@ -67,7 +63,7 @@ export function MessageThreadSummaryRow({
   const marginLeftPx = indentPx + MESSAGE_BODY_OFFSET_PX;
   const replyLabel = summary.replyCount === 1 ? "reply" : "replies";
   const summaryAriaLabel = summary.lastReplyAt
-    ? `View thread with ${summary.replyCount} ${replyLabel}, last reply ${formatLastReplyTime(summary.lastReplyAt)}`
+    ? `View thread with ${summary.replyCount} ${replyLabel}, last reply ${formatThreadSummaryLastReplyTime(summary.lastReplyAt)}`
     : `View thread with ${summary.replyCount} ${replyLabel}`;
   const depthGuideOffsets =
     visibleDepth === 0
@@ -82,7 +78,7 @@ export function MessageThreadSummaryRow({
 
   return (
     <div className="relative pb-1 pt-0.5">
-      {depthGuideOffsets.length > 0 ? (
+      {showDepthGuides && depthGuideOffsets.length > 0 ? (
         <div
           aria-hidden
           className="pointer-events-none absolute left-0"
@@ -103,19 +99,20 @@ export function MessageThreadSummaryRow({
 
       <button
         aria-label={summaryAriaLabel}
-        className="group relative isolate inline-flex h-8 w-fit max-w-full cursor-pointer items-center gap-1.5 rounded-full text-left text-xs font-medium text-muted-foreground transition-[color,opacity] before:pointer-events-none before:absolute before:inset-y-0 before:left-0 before:-right-2 before:-z-10 before:rounded-full before:content-[''] before:transition-[background-color,box-shadow] hover:text-foreground hover:opacity-90 hover:before:bg-background/95 hover:before:ring-1 hover:before:ring-border/70 focus-visible:outline-hidden focus-visible:before:bg-background/95 focus-visible:before:ring-1 focus-visible:before:ring-ring"
+        className="group relative isolate inline-flex h-8 w-fit max-w-full cursor-pointer items-center gap-1.5 rounded-full text-left text-xs font-medium text-muted-foreground transition-[color,opacity] before:pointer-events-none before:absolute before:-bottom-0.5 before:-left-0.5 before:-right-2 before:-top-0.5 before:-z-10 before:rounded-full before:content-[''] before:transition-[background-color,box-shadow] hover:text-foreground hover:opacity-90 hover:before:bg-background/95 hover:before:ring-1 hover:before:ring-border/70 focus-visible:outline-hidden focus-visible:before:bg-background/95 focus-visible:before:ring-1 focus-visible:before:ring-ring"
         data-thread-head-id={message.id}
         data-testid="message-thread-summary"
         onClick={() => onOpenThread(message)}
         style={{ marginLeft: `${marginLeftPx}px` }}
         type="button"
       >
-        <div className="flex shrink-0 items-center">
+        <div className="ml-0.5 flex shrink-0 items-center">
           {summary.participants.map((participant, index) => (
             <ParticipantAvatar
               index={index}
               key={participant.id}
               participant={participant}
+              participantCount={summary.participants.length}
             />
           ))}
         </div>
@@ -134,7 +131,8 @@ export function MessageThreadSummaryRow({
                     className="col-start-1 row-start-1 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0"
                     data-testid="message-thread-summary-last-reply"
                   >
-                    last reply {formatLastReplyTime(summary.lastReplyAt)}
+                    last reply{" "}
+                    {formatThreadSummaryLastReplyTime(summary.lastReplyAt)}
                   </span>
                   <span
                     className="col-start-1 row-start-1 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
