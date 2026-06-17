@@ -1,7 +1,12 @@
 import { type Virtualizer, useVirtualizer } from "@tanstack/react-virtual";
 import * as React from "react";
 
+import { BOTTOM_THRESHOLD_PX } from "@/features/messages/lib/timelineSnapshot";
+
 export type ChatVirtualizer = Virtualizer<HTMLElement, Element>;
+
+/** How long (ms) a deep-linked row stays highlighted before the glow fades. */
+const HIGHLIGHT_DURATION_MS = 2_000;
 
 /**
  * Single scroll owner for the chat surfaces (main timeline + thread pane).
@@ -30,6 +35,12 @@ export type ChatVirtualizer = Virtualizer<HTMLElement, Element>;
  *     the LIVE `getTotalSize()` on every measurement pass (via `onChange`) so
  *     it collapses to 0 the instant content exceeds the viewport — see the
  *     ordering note below.
+ *   - **The "at bottom" / new-message-count UI state** the scroll-to-latest
+ *     pill reads. The library knows the geometry (`isAtEnd`); this hook lifts
+ *     it to React state and counts messages that arrive while scrolled up.
+ *   - **Deep-link highlight + completion callback.** `scrollToItem` drives the
+ *     library jump, lights the target row for a beat, and fires
+ *     `onTargetReached` once.
  */
 
 export type ChatScrollVirtualizerOptions = {
@@ -41,13 +52,18 @@ export type ChatScrollVirtualizerOptions = {
   getItemKey: (index: number) => string;
   /** Estimated row height (px) before measurement. */
   estimateSize?: number;
+  /** Vertical gap (px) the virtualizer inserts between rows. */
+  gap?: number;
   /** Rows rendered outside the viewport on each side. */
   overscan?: number;
   /**
-   * Bottom-stick mode. The main timeline and thread pane both want to follow
-   * new messages, so both pass `"auto"`; pass `false` to disable following.
+   * Key of the latest message in the rendered snapshot. When it changes while
+   * the user is scrolled up, `newMessageCount` ticks up — drives the pill's
+   * "N new messages" label. Pass `undefined` for an empty surface.
    */
-  followOnAppend?: boolean | "auto" | "smooth" | "instant";
+  latestMessageKey?: string;
+  /** Called once when a deep-link jump lands on its target. */
+  onTargetReached?: (messageId: string) => void;
 };
 
 export type ChatScrollVirtualizer = {
@@ -58,6 +74,20 @@ export type ChatScrollVirtualizer = {
    * once content fills the viewport.
    */
   topPad: number;
+  /** True while the surface is scrolled to (or near) the bottom. */
+  isAtBottom: boolean;
+  /** Messages that arrived while scrolled up; reset on reaching the bottom. */
+  newMessageCount: number;
+  /** Message id currently highlighted by a deep-link jump, or null. */
+  highlightedMessageId: string | null;
+  /** Jump to the end (the pill action). */
+  scrollToBottom: (behavior: ScrollBehavior) => void;
+  /**
+   * Jump to a flat-item index, highlight `messageId`, and fire
+   * `onTargetReached` once the library settles. The caller resolves the index
+   * against the SAME snapshot the rows render from (the no-tearing guard).
+   */
+  scrollToItem: (index: number, messageId: string) => void;
 };
 
 export function useChatScrollVirtualizer({
@@ -65,8 +95,10 @@ export function useChatScrollVirtualizer({
   scrollRef,
   getItemKey,
   estimateSize = 80,
+  gap,
   overscan = 6,
-  followOnAppend = "auto",
+  latestMessageKey,
+  onTargetReached,
 }: ChatScrollVirtualizerOptions): ChatScrollVirtualizer {
   // Read the element lazily so the virtualizer binds once the ref attaches;
   // capturing `ref.current` at render time would freeze it at the first-render
@@ -77,17 +109,22 @@ export function useChatScrollVirtualizer({
   );
 
   const [topPad, setTopPad] = React.useState(0);
+  const [isAtBottom, setIsAtBottom] = React.useState(true);
+  const [newMessageCount, setNewMessageCount] = React.useState(0);
+  const [highlightedMessageId, setHighlightedMessageId] = React.useState<
+    string | null
+  >(null);
 
-  // Recompute the short-channel pad off the LIVE total whenever a row's
-  // measured size changes. virtual-core fires `onChange` directly from
+  // The bottom-state and pad recompute both read live geometry off the
+  // virtualizer on each `onChange`. virtual-core fires `onChange` directly from
   // `resizeItem` on any size delta (not only on a visible-range change), which
   // is exactly when `getTotalSize()` moves — so a short channel whose rows
-  // measure taller/shorter than the estimate re-pads with the settled total.
-  // Running it here, before paint and before the library re-applies its
-  // end-anchoring/follow in the same pass, orders "recompute pad -> re-pin
-  // bottom" and avoids a one-frame sliver when a short channel grows past the
-  // viewport.
-  const recomputePad = React.useCallback(
+  // measure taller/shorter than the estimate re-pads (and re-evaluates "at
+  // bottom") with the settled total. Running here, before paint and before the
+  // library re-applies its end-anchoring/follow in the same pass, orders
+  // "recompute pad -> re-pin bottom" and avoids a one-frame sliver when a short
+  // channel grows past the viewport.
+  const onChange = React.useCallback(
     (instance: ChatVirtualizer) => {
       const scrollEl = scrollRef.current;
       if (!scrollEl) {
@@ -95,6 +132,14 @@ export function useChatScrollVirtualizer({
       }
       const pad = Math.max(0, scrollEl.clientHeight - instance.getTotalSize());
       setTopPad((prev) => (prev === pad ? prev : pad));
+
+      // The app's "at bottom" rule is looser than the library's 1px default;
+      // reuse the timeline's 72px threshold so the pill matches the old feel.
+      const atBottom = instance.isAtEnd(BOTTOM_THRESHOLD_PX);
+      setIsAtBottom((prev) => (prev === atBottom ? prev : atBottom));
+      if (atBottom) {
+        setNewMessageCount((prev) => (prev === 0 ? prev : 0));
+      }
     },
     [scrollRef],
   );
@@ -105,26 +150,89 @@ export function useChatScrollVirtualizer({
     estimateSize: () => estimateSize,
     getItemKey,
     overscan,
+    gap,
     // Hold the viewport on prepend and pin to the bottom anchor for follow —
     // the two library-native behaviors that replace the manual scroll manager.
+    // Both surfaces follow new messages, so `followOnAppend` is always on; the
+    // library only re-pins when the user is already at the end.
     anchorTo: "end",
-    followOnAppend,
-    onChange: recomputePad,
+    followOnAppend: "auto",
+    onChange,
   });
 
-  // The pad also depends on the viewport height, which `onChange` does not
-  // track — a window/pane resize that changes `clientHeight` without resizing a
-  // row would leave a short channel's pad stale. Observe the container so the
-  // bottom-align holds across resizes too.
+  // The pad/bottom-state also depend on the viewport height, which `onChange`
+  // does not track — a window/pane resize that changes `clientHeight` without
+  // resizing a row would leave them stale. Observe the container so the
+  // bottom-align and pill state hold across resizes too.
   React.useEffect(() => {
     const scrollEl = scrollRef.current;
     if (!scrollEl) {
       return;
     }
-    const observer = new ResizeObserver(() => recomputePad(virtualizer));
+    const observer = new ResizeObserver(() => onChange(virtualizer));
     observer.observe(scrollEl);
     return () => observer.disconnect();
-  }, [scrollRef, recomputePad, virtualizer]);
+  }, [scrollRef, onChange, virtualizer]);
 
-  return { virtualizer, topPad };
+  // Count messages that arrive while the user is scrolled up. When at the
+  // bottom `followOnAppend` keeps us pinned and `onChange` zeroes the count, so
+  // the increment only fires for genuinely-missed messages. Skips the first
+  // observed key so opening a channel doesn't show a phantom count.
+  const previousLatestKeyRef = React.useRef<string | undefined>(undefined);
+  React.useEffect(() => {
+    const previous = previousLatestKeyRef.current;
+    previousLatestKeyRef.current = latestMessageKey;
+    if (
+      previous === undefined ||
+      latestMessageKey === undefined ||
+      latestMessageKey === previous ||
+      isAtBottom
+    ) {
+      return;
+    }
+    setNewMessageCount((prev) => prev + 1);
+  }, [latestMessageKey, isAtBottom]);
+
+  const scrollToBottom = React.useCallback(
+    (behavior: ScrollBehavior) => {
+      virtualizer.scrollToIndex(count - 1, { align: "end", behavior });
+    },
+    [virtualizer, count],
+  );
+
+  const highlightTimeoutRef = React.useRef<number | undefined>(undefined);
+  const scrollToItem = React.useCallback(
+    (index: number, messageId: string) => {
+      // align:center + the library's reconcile loop re-targets the index until
+      // the offset is stable once the (possibly never-measured) row measures —
+      // the W1 deep-link settle, library-owned.
+      virtualizer.scrollToIndex(index, { align: "center" });
+      setHighlightedMessageId(messageId);
+      setNewMessageCount(0);
+      onTargetReached?.(messageId);
+
+      window.clearTimeout(highlightTimeoutRef.current);
+      highlightTimeoutRef.current = window.setTimeout(() => {
+        setHighlightedMessageId((current) =>
+          current === messageId ? null : current,
+        );
+      }, HIGHLIGHT_DURATION_MS);
+    },
+    [virtualizer, onTargetReached],
+  );
+
+  React.useEffect(
+    () => () => window.clearTimeout(highlightTimeoutRef.current),
+    [],
+  );
+
+  return {
+    virtualizer,
+    topPad,
+    isAtBottom,
+    newMessageCount,
+    highlightedMessageId,
+    scrollToBottom,
+    scrollToItem,
+  };
 }

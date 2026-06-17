@@ -638,6 +638,7 @@ export const ChannelPane = React.memo(function ChannelPane({
           <MessageTimeline
             agentPubkeys={agentPubkeys}
             channelId={activeChannel?.id}
+            key={activeChannel?.id}
             channelIntro={channelIntro}
             directMessageIntro={directMessageIntro}
             scrollContainerRef={timelineScrollRef}
@@ -790,6 +791,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                 agentPubkeys={agentPubkeys}
                 channel={activeChannel}
                 channelId={activeChannel?.id ?? null}
+                key={threadHeadMessage.id}
                 channelName={activeChannel?.name ?? "channel"}
                 currentPubkey={currentPubkey}
                 disabled={isComposerDisabled}

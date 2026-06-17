@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   BOTTOM_THRESHOLD_PX,
   buildDayGroupBoundaries,
+  buildThreadReplyVirtualItems,
   buildTimelineVirtualItems,
   isNearBottomMetrics,
   resolveDeepLinkTarget,
@@ -393,4 +394,72 @@ test("virtual-items: item count equals entries plus one day item per calendar da
     items.map((item) => item.kind),
     ["day", "message", "message", "day", "unread", "message"],
   );
+});
+
+// --- thread reply flat-item model (thread-pane virtualization) --------------
+//
+// buildThreadReplyVirtualItems flattens reply entries + firstUnreadReplyId into
+// the ordered, keyed row list the thread pane's virtualizer measures. The
+// thread pane has no day grouping and renders the head OUTSIDE the list, so the
+// only kinds are an unread boundary and a reply (summary rides on the reply).
+
+test("thread-items: empty entries produce no items", () => {
+  assert.deepEqual(buildThreadReplyVirtualItems([]), []);
+});
+
+test("thread-items: each reply becomes one item, no day dividers", () => {
+  const items = buildThreadReplyVirtualItems([
+    entry({ id: "a", createdAt: dayAt(2026, 6, 14) }),
+    entry({ id: "b", createdAt: dayAt(2026, 6, 15) }),
+  ]);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ["reply", "reply"],
+  );
+  assert.deepEqual(
+    items.map((item) => item.key),
+    ["a", "b"],
+  );
+});
+
+test("thread-items: unread divider precedes the first unread reply when not index 0", () => {
+  const items = buildThreadReplyVirtualItems(
+    [entry({ id: "a" }), entry({ id: "b" }), entry({ id: "c" })],
+    "b",
+  );
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ["reply", "unread", "reply", "reply"],
+  );
+  assert.equal(items[1].key, "unread-b");
+});
+
+test("thread-items: unread divider suppressed when the first unread reply is index 0", () => {
+  const items = buildThreadReplyVirtualItems(
+    [entry({ id: "a" }), entry({ id: "b" })],
+    "a",
+  );
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ["reply", "reply"],
+  );
+});
+
+test("thread-items: a reply carries its inline summary, never a separate item", () => {
+  const summary = {
+    threadHeadId: "a",
+    replyCount: 2,
+    lastReplyAt: null,
+    participants: [],
+  };
+  const items = buildThreadReplyVirtualItems([entry({ id: "a" }, summary)]);
+  assert.equal(items.length, 1);
+  assert.equal(items[0].summary, summary);
+});
+
+test("thread-items: reply key prefers renderKey for optimistic-send identity", () => {
+  const items = buildThreadReplyVirtualItems([
+    entry({ id: "server-id", renderKey: "local-key" }),
+  ]);
+  assert.equal(items[0].key, "local-key");
 });

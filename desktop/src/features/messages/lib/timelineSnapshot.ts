@@ -160,7 +160,7 @@ export function selectDeferredListRenderState(
  * the virtualizer measures and positions, so every divider that the legacy
  * `TimelineMessageList` rendered as a sibling node becomes its own item here.
  *
- *   - "day"     → a day-boundary heading; renders the sticky `DayDivider`
+ *   - "day"     → a day-boundary heading; renders the inline `DayDivider`
  *   - "unread"  → the "New" read/unread boundary above the first unread message
  *   - "system"  → a system message (join/leave); renders `SystemMessageRow`
  *   - "message" → a normal message; carries the thread `summary` it renders
@@ -223,6 +223,54 @@ export function buildTimelineVirtualItems(
     } else {
       items.push({ kind: "message", key: messageKey, message, summary });
     }
+  }
+
+  return items;
+}
+
+/**
+ * One row in the flattened, virtualizer-ready thread reply list. The thread
+ * pane has a simpler shape than the main timeline — no day grouping, no system
+ * rows, and the head message renders OUTSIDE the virtualized region — so the
+ * only item kinds are an unread boundary and a reply (which carries the inline
+ * thread `summary` it renders beneath the row, never a separate item, to keep
+ * one measured unit per reply).
+ *
+ * `key` is byte-identical to the legacy reply-list keys
+ * (`message.renderKey ?? message.id`) so optimistic-send identity stays stable
+ * across the migration.
+ */
+export type ThreadReplyVirtualItem =
+  | { kind: "unread"; key: string }
+  | {
+      kind: "reply";
+      key: string;
+      message: TimelineMessage;
+      summary: TimelineThreadSummary | null;
+    };
+
+/**
+ * Flattens thread reply entries into the ordered virtual-item list the thread
+ * pane's virtualizer consumes. Mirrors the legacy reply-list render walk: an
+ * unread divider precedes the first unread reply (suppressed at index 0, where
+ * there is nothing above it to divide), and every entry becomes a `reply` item.
+ * Pure over the snapshot so the divider rule stays lib-tested without a DOM.
+ */
+export function buildThreadReplyVirtualItems(
+  entries: readonly MainTimelineEntry[],
+  firstUnreadReplyId: string | null | undefined = null,
+): ThreadReplyVirtualItem[] {
+  const items: ThreadReplyVirtualItem[] = [];
+
+  for (let i = 0; i < entries.length; i++) {
+    const { message, summary } = entries[i];
+    const replyKey = message.renderKey ?? message.id;
+
+    if (shouldRenderUnreadDivider(i, message.id, firstUnreadReplyId ?? null)) {
+      items.push({ kind: "unread", key: `unread-${replyKey}` });
+    }
+
+    items.push({ kind: "reply", key: replyKey, message, summary });
   }
 
   return items;

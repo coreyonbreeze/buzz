@@ -31,8 +31,12 @@ import { MessageThreadSummaryRow } from "./MessageThreadSummaryRow";
 import { TypingIndicatorRow } from "./TypingIndicatorRow";
 import { UnreadDivider } from "./UnreadDivider";
 import { useComposerHeightPadding } from "./useComposerHeightPadding";
-import { useTimelineScrollManager } from "./useTimelineScrollManager";
-import { selectDeferredListRenderState } from "@/features/messages/lib/timelineSnapshot";
+import { useChatScrollVirtualizer } from "./useChatScrollVirtualizer";
+import {
+  buildThreadReplyVirtualItems,
+  selectDeferredListRenderState,
+  selectLatestMessageKey,
+} from "@/features/messages/lib/timelineSnapshot";
 
 type MessageThreadPanelProps = {
   agentPubkeys?: ReadonlySet<string>;
@@ -94,6 +98,10 @@ type MessageThreadPanelProps = {
  *  reply list. Must be module-level so its identity never changes. Mirrors
  *  `EMPTY_MESSAGES` in MessageTimeline. */
 const EMPTY_THREAD_REPLIES: MainTimelineEntry[] = [];
+
+/** Vertical gap (px) the virtualizer inserts between reply rows — the spacing
+ *  the legacy reply list expressed as `space-y-2.5`. */
+const THREAD_REPLY_GAP_PX = 10;
 
 type MessageThreadPanelSkeletonProps = {
   isSinglePanelView?: boolean;
@@ -317,8 +325,6 @@ export function MessageThreadPanel({
     isSinglePanelView,
   );
 
-  const threadHeadId = threadHead?.id ?? null;
-
   const composerReplyTarget =
     replyTargetMessage && threadHead && replyTargetMessage.id !== threadHead.id
       ? {
@@ -333,13 +339,10 @@ export function MessageThreadPanel({
   // the main thread and the OS would show the busy cursor. Gate the reply render
   // behind `useDeferredValue`. `initialValue: []` keeps even the FIRST render on
   // thread-open light; the heavy list streams in on a deferred, interruptible
-  // commit. We deliberately drive BOTH the scroll manager and the rendered list
-  // off the SAME deferred value — sticky-bottom / deep-link logic reads the DOM
-  // (`scrollIntoView`), so it must stay consistent with what's actually painted.
-  // You can't scroll to a reply that hasn't committed yet. The thread pane gets
-  // this no-tearing guarantee for free by routing through the same
-  // `useTimelineScrollManager` (and its `timelineSnapshot` helpers) as the main
-  // timeline.
+  // commit. We deliberately drive BOTH the virtualizer and the rendered list
+  // off the SAME deferred value — the deep-link index resolves against this
+  // snapshot, so a jump never targets a reply the DOM has not committed yet
+  // (the no-tearing guard). You can't scroll to a reply that hasn't rendered.
   const deferredThreadReplies = React.useDeferredValue(
     threadReplies,
     EMPTY_THREAD_REPLIES,
@@ -354,31 +357,129 @@ export function MessageThreadPanel({
     threadReplies.length,
   );
 
-  const threadMessages = React.useMemo(
-    () => deferredThreadReplies.map((entry) => entry.message),
+  // Flat virtual-item list for the reply region (head renders outside it). The
+  // deep-link index map below is built off this SAME list — the no-tearing
+  // guard — so a `scrollTargetId` jump only fires once the target reply exists
+  // in the committed snapshot.
+  const replyItems = React.useMemo(
+    () =>
+      buildThreadReplyVirtualItems(deferredThreadReplies, firstUnreadReplyId),
+    [deferredThreadReplies, firstUnreadReplyId],
+  );
+  const indexByMessageId = React.useMemo(() => {
+    const map = new Map<string, number>();
+    for (let i = 0; i < replyItems.length; i++) {
+      const item = replyItems[i];
+      if (item.kind === "reply") {
+        map.set(item.message.id, i);
+      }
+    }
+    return map;
+  }, [replyItems]);
+  const latestReplyKey = React.useMemo(
+    () => selectLatestMessageKey(deferredThreadReplies.map((e) => e.message)),
     [deferredThreadReplies],
   );
+  const getReplyItemKey = React.useCallback(
+    (index: number) => replyItems[index].key,
+    [replyItems],
+  );
 
+  // Bottom-stick + deep-link only — a thread never grows at the head, so
+  // `anchorTo:"end"` makes prepend structurally absent (no flag needed). No
+  // short-channel `topPad`: replies render top-down under the head row, which
+  // is the legacy thread-pane layout.
   const {
-    bottomAnchorRef,
-    contentRef,
+    virtualizer,
     isAtBottom,
     newMessageCount,
+    highlightedMessageId,
     scrollToBottom,
-    syncScrollState,
-  } = useTimelineScrollManager({
-    channelId: threadHeadId,
-    // Wait for deferred replies to commit before scroll-init (else rows mount un-scrolled).
-    isLoading: repliesRenderState === "pending",
-    messages: threadMessages,
+    scrollToItem,
+  } = useChatScrollVirtualizer({
+    count: replyItems.length,
+    scrollRef: threadBodyRef,
+    getItemKey: getReplyItemKey,
+    gap: THREAD_REPLY_GAP_PX,
+    latestMessageKey: latestReplyKey,
     onTargetReached: onScrollTargetResolved,
-    scrollContainerRef: threadBodyRef,
-    targetMessageId: scrollTargetId,
   });
+
+  // Deep-link to `scrollTargetId` once it resolves against the rendered
+  // snapshot. The library's reconcile loop settles the offset once the target
+  // reply measures — the same W1 deep-link settle the main timeline uses, with
+  // prepend off.
+  const lastJumpedTargetRef = React.useRef<string | null>(null);
+  React.useEffect(() => {
+    if (!scrollTargetId) {
+      lastJumpedTargetRef.current = null;
+      return;
+    }
+    if (scrollTargetId === lastJumpedTargetRef.current) {
+      return;
+    }
+    const index = indexByMessageId.get(scrollTargetId);
+    if (index === undefined) {
+      return;
+    }
+    lastJumpedTargetRef.current = scrollTargetId;
+    scrollToItem(index, scrollTargetId);
+  }, [scrollTargetId, indexByMessageId, scrollToItem]);
 
   if (!threadHead) {
     return null;
   }
+
+  const renderReplyItem = (
+    item: (typeof replyItems)[number],
+  ): React.ReactNode => {
+    if (item.kind === "unread") {
+      return <UnreadDivider />;
+    }
+    const { message, summary } = item;
+    return (
+      <div
+        className={cn(
+          "flex flex-col gap-1",
+          summary &&
+            "group/message mx-1 rounded-2xl px-0 py-1 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
+          message.id === highlightedMessageId &&
+            "before:absolute before:-inset-y-1 before:inset-x-0 before:animate-[route-target-highlight-fade_2s_ease-out_forwards] before:bg-primary/10 before:content-[''] motion-reduce:before:animate-none",
+        )}
+      >
+        <MessageRow
+          agentPubkeys={agentPubkeys}
+          channelId={channelId}
+          hoverBackground={!summary}
+          layoutVariant="thread-reply"
+          message={message}
+          onDelete={
+            onDelete && canManageMessage(message, currentPubkey)
+              ? onDelete
+              : undefined
+          }
+          onEdit={
+            onEdit && canManageMessage(message, currentPubkey)
+              ? onEdit
+              : undefined
+          }
+          onMarkUnread={onMarkUnread}
+          onReply={onSelectReplyTarget}
+          onToggleReaction={onToggleReaction}
+          profiles={profiles}
+        />
+        {summary ? (
+          <MessageThreadSummaryRow
+            depth={message.depth}
+            message={message}
+            onOpenThread={onExpandReplies}
+            summary={summary}
+            unreadCount={threadReplyUnreadCounts?.get(message.id)}
+          />
+        ) : null}
+      </div>
+    );
+  };
 
   const threadScrollRegion = (
     <div
@@ -388,124 +489,88 @@ export function MessageThreadPanel({
         !isSplitLayout && !isFloatingOverlay && "pt-[4.75rem]",
       )}
       data-testid="message-thread-body"
-      onScroll={syncScrollState}
       ref={threadBodyRef}
     >
-      <div ref={contentRef}>
-        <div className="px-3 pb-1 pt-0" data-testid="message-thread-head">
-          <div className="rounded-2xl">
-            <MessageRow
-              actionBarPlacement="inside"
-              agentPubkeys={agentPubkeys}
-              channelId={channelId}
-              isFollowingThread={isFollowingThread}
-              layoutVariant="thread-reply"
-              message={threadHead}
-              onDelete={
-                onDelete && canManageMessage(threadHead, currentPubkey)
-                  ? onDelete
-                  : undefined
-              }
-              onEdit={
-                onEdit && canManageMessage(threadHead, currentPubkey)
-                  ? onEdit
-                  : undefined
-              }
-              onFollowThread={
-                onFollowThread ? (_msg) => onFollowThread() : undefined
-              }
-              onMarkUnread={onMarkUnread}
-              onToggleReaction={onToggleReaction}
-              onUnfollowThread={
-                onUnfollowThread ? (_msg) => onUnfollowThread() : undefined
-              }
-              profiles={profiles}
-              videoReviewContext={threadHeadVideoReviewContext}
-            />
-          </div>
+      <div className="px-3 pb-1 pt-0" data-testid="message-thread-head">
+        <div className="rounded-2xl">
+          <MessageRow
+            actionBarPlacement="inside"
+            agentPubkeys={agentPubkeys}
+            channelId={channelId}
+            isFollowingThread={isFollowingThread}
+            layoutVariant="thread-reply"
+            message={threadHead}
+            onDelete={
+              onDelete && canManageMessage(threadHead, currentPubkey)
+                ? onDelete
+                : undefined
+            }
+            onEdit={
+              onEdit && canManageMessage(threadHead, currentPubkey)
+                ? onEdit
+                : undefined
+            }
+            onFollowThread={
+              onFollowThread ? (_msg) => onFollowThread() : undefined
+            }
+            onMarkUnread={onMarkUnread}
+            onToggleReaction={onToggleReaction}
+            onUnfollowThread={
+              onUnfollowThread ? (_msg) => onUnfollowThread() : undefined
+            }
+            profiles={profiles}
+            videoReviewContext={threadHeadVideoReviewContext}
+          />
         </div>
+      </div>
 
-        <div className="px-3 pb-3 pt-1" data-testid="message-thread-replies">
-          {repliesRenderState === "list" ? (
-            <div
-              className={cn(
-                "space-y-2.5",
-                // While a deferred render is in flight the painted reply list
-                // lags the latest `threadReplies`. Dim it slightly so the
-                // streaming-in reads as intentional instead of frozen — mirrors
-                // the main timeline.
-                isRepliesPending && "opacity-60 transition-opacity",
-              )}
-              data-render-pending={isRepliesPending ? "true" : undefined}
-            >
-              {deferredThreadReplies.map((entry, index) => {
-                const showUnreadDivider =
-                  index > 0 && entry.message.id === firstUnreadReplyId;
-                return (
-                  <div
-                    className={cn(
-                      "flex flex-col gap-1",
-                      entry.summary &&
-                        "group/message mx-1 rounded-2xl px-0 py-1 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
-                    )}
-                    key={entry.message.renderKey ?? entry.message.id}
-                  >
-                    {showUnreadDivider ? <UnreadDivider /> : null}
-                    <MessageRow
-                      agentPubkeys={agentPubkeys}
-                      channelId={channelId}
-                      hoverBackground={!entry.summary}
-                      layoutVariant="thread-reply"
-                      message={entry.message}
-                      onDelete={
-                        onDelete &&
-                        canManageMessage(entry.message, currentPubkey)
-                          ? onDelete
-                          : undefined
-                      }
-                      onEdit={
-                        onEdit && canManageMessage(entry.message, currentPubkey)
-                          ? onEdit
-                          : undefined
-                      }
-                      onMarkUnread={onMarkUnread}
-                      onReply={onSelectReplyTarget}
-                      onToggleReaction={onToggleReaction}
-                      profiles={profiles}
-                    />
-                    {entry.summary ? (
-                      <MessageThreadSummaryRow
-                        depth={entry.message.depth}
-                        message={entry.message}
-                        onOpenThread={onExpandReplies}
-                        summary={entry.summary}
-                        unreadCount={threadReplyUnreadCounts?.get(
-                          entry.message.id,
-                        )}
-                      />
-                    ) : null}
-                  </div>
-                );
-              })}
-            </div>
-          ) : repliesRenderState === "empty" ? (
-            // Only show the empty state when the thread is GENUINELY empty.
-            // Keying off `deferredThreadReplies` would flash "No replies" for a
-            // frame while a non-empty list streams in on the deferred commit.
-            <div className="rounded-2xl border border-dashed border-border/70 bg-card/40 px-4 py-6 text-center">
-              <p className="text-sm font-medium text-foreground/80">
-                No replies in this branch yet
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Reply in the thread to continue this branch.
-              </p>
-            </div>
-          ) : // "pending": deferred list is empty but the live list has content —
-          // rows are streaming in on the deferred commit. Paint nothing rather
-          // than flashing the empty state.
-          null}
-          <div aria-hidden className="h-px" ref={bottomAnchorRef} />
-        </div>
+      <div className="px-3 pb-3 pt-1" data-testid="message-thread-replies">
+        {repliesRenderState === "list" ? (
+          <div
+            className={cn(
+              "relative w-full",
+              // While a deferred render is in flight the painted reply list
+              // lags the latest `threadReplies`. Dim it slightly so the
+              // streaming-in reads as intentional instead of frozen — mirrors
+              // the main timeline.
+              isRepliesPending && "opacity-60 transition-opacity",
+            )}
+            data-render-pending={isRepliesPending ? "true" : undefined}
+            style={{ height: `${virtualizer.getTotalSize()}px` }}
+          >
+            {virtualizer.getVirtualItems().map((virtualRow) => (
+              <div
+                data-index={virtualRow.index}
+                key={virtualRow.key}
+                ref={virtualizer.measureElement}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${virtualRow.start}px)`,
+                }}
+              >
+                {renderReplyItem(replyItems[virtualRow.index])}
+              </div>
+            ))}
+          </div>
+        ) : repliesRenderState === "empty" ? (
+          // Only show the empty state when the thread is GENUINELY empty.
+          // Keying off `deferredThreadReplies` would flash "No replies" for a
+          // frame while a non-empty list streams in on the deferred commit.
+          <div className="rounded-2xl border border-dashed border-border/70 bg-card/40 px-4 py-6 text-center">
+            <p className="text-sm font-medium text-foreground/80">
+              No replies in this branch yet
+            </p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Reply in the thread to continue this branch.
+            </p>
+          </div>
+        ) : // "pending": deferred list is empty but the live list has content —
+        // rows are streaming in on the deferred commit. Paint nothing rather
+        // than flashing the empty state.
+        null}
       </div>
     </div>
   );
