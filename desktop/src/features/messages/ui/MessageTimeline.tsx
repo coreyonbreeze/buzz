@@ -447,17 +447,7 @@ export const MessageTimeline = React.memo(function MessageTimeline({
               ) : null}
 
               {showVirtualList ? (
-                <div
-                  className={cn(
-                    "flex flex-col",
-                    // While a deferred render is in flight the painted
-                    // list lags the latest `messages`. Dim it slightly so the
-                    // streaming-in feels intentional instead of frozen.
-                    isRenderPending && "opacity-60 transition-opacity",
-                  )}
-                  data-render-pending={isRenderPending ? "true" : undefined}
-                  ref={listOuterRef}
-                >
+                <div className="flex flex-col" ref={listOuterRef}>
                   <VirtualizedTimelineList
                     entries={entries}
                     renderEntry={renderEntry}
