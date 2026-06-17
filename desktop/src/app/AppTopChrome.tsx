@@ -26,22 +26,6 @@ type AppTopChromeProps = {
   searchLoading?: boolean;
 };
 
-function GlobalTopDivider() {
-  const sidebar = useOptionalSidebar();
-  const state = sidebar?.state ?? "collapsed";
-
-  return (
-    <div
-      aria-hidden="true"
-      className="pointer-events-none fixed top-10 z-40 h-px bg-border/35"
-      style={{
-        left: state === "expanded" ? "var(--sidebar-width)" : 0,
-        right: 0,
-      }}
-    />
-  );
-}
-
 function CenterColumnTopbarSearch({
   channels,
   currentPubkey,
@@ -141,7 +125,6 @@ export function AppTopChrome({
         className="fixed inset-x-0 top-0 z-20 h-10 cursor-default select-none"
         data-tauri-drag-region
       />
-      <GlobalTopDivider />
       <div className="fixed left-[80px] top-[6px] z-45 flex items-center gap-0.5">
         <TopChromeSidebarTrigger />
         <Button

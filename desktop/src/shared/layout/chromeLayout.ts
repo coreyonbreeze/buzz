@@ -38,10 +38,11 @@ export const insetHeaderOverlay = {
    * Single full-width backdrop strip drawn behind transparent inset headers.
    * Rendered once per view so the blur samples continuously across column
    * boundaries instead of clipping at each pane's backdrop-filter box.
-   * Carries the search-strip hairline (`before:`) and the bottom border.
+   * Keeps the inset header visually continuous without drawing horizontal
+   * dividers across the header area.
    */
   backdrop:
-    "pointer-events-none absolute inset-x-0 top-0 z-30 h-(--buzz-inset-header-height,5rem) border-b border-border/35 bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55 before:pointer-events-none before:absolute before:inset-x-0 before:top-(--buzz-top-chrome-height,2.5rem) before:h-px before:bg-border/35 before:content-['']",
+    "pointer-events-none absolute inset-x-0 top-0 z-30 h-(--buzz-inset-header-height,5rem) bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
 } as const;
 
 /** Tailwind class fragments for layout under the global top chrome. */
@@ -67,8 +68,6 @@ export const topChromeInset = {
 export const topChromeBackdrop = {
   /** Height matching the global top chrome search/drag strip. */
   height: "h-(--buzz-top-chrome-height,2.5rem)",
-  /** `after:` pseudo-element offset aligned to the bottom of top chrome. */
-  dividerTop: "after:top-(--buzz-top-chrome-height,2.5rem)",
 } as const;
 
 /** Tailwind class fragments for measured channel header chrome. */

@@ -150,7 +150,7 @@ export function ChatHeader({
     <div
       ref={chromeWrapperRef}
       className={cn(
-        "pointer-events-none relative z-30 bg-background/80 backdrop-blur-md after:absolute after:inset-x-0 after:bottom-0 after:h-px after:bg-border/35 after:content-[''] supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
+        "pointer-events-none relative z-30 bg-background/80 backdrop-blur-md supports-backdrop-filter:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-backdrop-filter:bg-background/55",
         topChromeInset.padding,
         channelChrome.negativeMargin,
       )}
