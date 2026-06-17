@@ -3,6 +3,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useQueryClient } from "@tanstack/react-query";
 import { Outlet, useLocation } from "@tanstack/react-router";
 
+import {
+  deriveShellRoute,
+  isWindowDragHandleEvent,
+  toSearchHit,
+} from "@/app/AppShell.helpers";
 import { AppShellProvider } from "@/app/AppShellContext";
 import {
   AppShellOverlays,
@@ -57,8 +62,10 @@ import { useProfileQuery } from "@/features/profile/hooks";
 import {
   DEFAULT_SETTINGS_SECTION,
   type SettingsSection,
+  isSettingsSection,
 } from "@/features/settings/ui/SettingsPanels";
 import { HuddleBar, HuddleProvider } from "@/features/huddle";
+import { RemindMeLaterProvider } from "@/features/reminders/ui/RemindMeLaterProvider";
 import { AppSidebar } from "@/features/sidebar/ui/AppSidebar";
 import { useChannelMutes } from "@/features/sidebar/lib/useChannelMutes";
 import { useChannelStars } from "@/features/sidebar/lib/useChannelStars";
@@ -79,109 +86,16 @@ import { useMessageDeepLinks } from "@/shared/useMessageDeepLinks";
 import { ConnectionBanner } from "@/shared/ui/ConnectionBanner";
 import { SidebarInset, SidebarProvider } from "@/shared/ui/sidebar";
 
-type AppView =
-  | "home"
-  | "channel"
-  | "agents"
-  | "workflows"
-  | "pulse"
-  | "projects";
-
 const LazySettingsScreen = React.lazy(async () => {
   const module = await import("@/features/settings/ui/SettingsScreen");
   return { default: module.SettingsScreen };
 });
-
-const WINDOW_DRAG_HANDLE_HEIGHT = 44;
-const WINDOW_DRAG_INTERACTIVE_SELECTOR =
-  'button, a, input, textarea, select, [role="button"], [contenteditable="true"]';
-
-function isWindowDragHandleEvent(event: MouseEvent | PointerEvent) {
-  if (event.clientY > WINDOW_DRAG_HANDLE_HEIGHT) {
-    return false;
-  }
-
-  const target = event.target;
-  return !(
-    target instanceof Element &&
-    target.closest(WINDOW_DRAG_INTERACTIVE_SELECTOR)
-  );
-}
-
-function toSearchHit(target: DesktopNotificationTarget): SearchHit | null {
-  if (!target.eventId) {
-    return null;
-  }
-
-  return {
-    eventId: target.eventId,
-    content: target.content ?? "",
-    kind: target.kind ?? 9,
-    pubkey: target.pubkey ?? "",
-    channelId: target.channelId,
-    channelName: target.channelName ?? null,
-    createdAt: target.createdAt ?? Math.floor(Date.now() / 1_000),
-    score: 0,
-    threadRootId: target.threadRootId ?? null,
-  };
-}
-
-function deriveShellRoute(pathname: string): {
-  selectedChannelId: string | null;
-  selectedView: AppView;
-} {
-  if (pathname.startsWith("/channels/")) {
-    const [, , rawChannelId] = pathname.split("/");
-    return {
-      selectedChannelId: rawChannelId ? decodeURIComponent(rawChannelId) : null,
-      selectedView: "channel",
-    };
-  }
-
-  if (pathname === "/agents") {
-    return {
-      selectedChannelId: null,
-      selectedView: "agents",
-    };
-  }
-
-  if (pathname === "/workflows" || pathname.startsWith("/workflows/")) {
-    return {
-      selectedChannelId: null,
-      selectedView: "workflows",
-    };
-  }
-
-  if (pathname === "/projects" || pathname.startsWith("/projects/")) {
-    return {
-      selectedChannelId: null,
-      selectedView: "projects",
-    };
-  }
-
-  if (pathname === "/pulse") {
-    return {
-      selectedChannelId: null,
-      selectedView: "pulse",
-    };
-  }
-
-  return {
-    selectedChannelId: null,
-    selectedView: "home",
-  };
-}
 
 export function AppShell() {
   useWebviewZoomShortcuts();
 
   const workspacesHook = useWorkspaces();
   const [isAddWorkspaceOpen, setIsAddWorkspaceOpen] = React.useState(false);
-
-  const [settingsOpen, setSettingsOpen] = React.useState(false);
-  const [settingsSection, setSettingsSection] = React.useState<SettingsSection>(
-    DEFAULT_SETTINGS_SECTION,
-  );
 
   const [isChannelManagementOpen, setIsChannelManagementOpen] =
     React.useState(false);
@@ -201,8 +115,11 @@ export function AppShell() {
     goChannel,
     goHome,
     goProjects,
+    goReminders,
     goPulse,
+    goSettings,
     goWorkflows,
+    closeSettings,
     openSearchHit,
   } = useAppNavigation();
   const { canGoBack, canGoForward, goBack, goForward } =
@@ -211,6 +128,17 @@ export function AppShell() {
     () => deriveShellRoute(location.pathname),
     [location.pathname],
   );
+  // Settings lives in the history stack: /settings?section=… opens it, back
+  // (or "Back to app") returns to the previous entry — panels and all — and
+  // reloads restore the open section from the URL.
+  const settingsOpen = location.pathname === "/settings";
+  const locationSearchSection = (location.search as { section?: unknown })
+    .section;
+  const settingsSection: SettingsSection = isSettingsSection(
+    locationSearchSection,
+  )
+    ? locationSearchSection
+    : DEFAULT_SETTINGS_SECTION;
 
   const startupReady = useDeferredStartup();
 
@@ -373,30 +301,39 @@ export function AppShell() {
     highPriorityUnreadChannelIds,
     getEffectiveTimestamp: getChannelReadAt,
     readStateVersion,
+    setContextParentResolver,
     participatedRootIds,
     authoredRootIds,
     threadActivityItems,
     mutedRootIds,
     muteThread,
     unmuteThread,
-  } = useUnreadChannels(
-    sidebarChannels,
-    activeChannel,
-    // Wait for ChannelScreen to report the latest loaded message before
-    // advancing unread state for the active channel.
-    null,
-    {
-      pubkey: identityQuery.data?.pubkey,
-      relayClient,
-      currentPubkey: identityQuery.data?.pubkey,
-      mutedChannelIds,
-      notifyForActiveChannel: notificationSettings.settings.notifyWhileViewing,
-      onChannelMessage: handleChannelNotification,
-      onDmMessage: handleDmNotification,
-      onLiveMention: refetchHomeFeedOnLiveMention,
-      onThreadReplyDesktopNotification: handleThreadReplyDesktopNotification,
-      followedRootIds,
+  } = useUnreadChannels(sidebarChannels, activeChannel, {
+    pubkey: identityQuery.data?.pubkey,
+    relayClient,
+    currentPubkey: identityQuery.data?.pubkey,
+    mutedChannelIds,
+    notifyForActiveChannel: notificationSettings.settings.notifyWhileViewing,
+    onChannelMessage: handleChannelNotification,
+    onDmMessage: handleDmNotification,
+    onLiveMention: refetchHomeFeedOnLiveMention,
+    onThreadReplyDesktopNotification: handleThreadReplyDesktopNotification,
+    followedRootIds,
+  });
+
+  const getThreadReadAt = React.useCallback(
+    (rootId: string) => getChannelReadAt(`thread:${rootId}`),
+    [getChannelReadAt],
+  );
+
+  const markThreadRead = React.useCallback(
+    (rootId: string, timestamp: number) => {
+      markChannelRead(
+        `thread:${rootId}`,
+        new Date(timestamp * 1_000).toISOString(),
+      );
     },
+    [markChannelRead],
   );
 
   // Badge count is computed here (rather than inside useHomeFeedNotifications)
@@ -410,7 +347,7 @@ export function AppShell() {
       identityQuery.data?.pubkey,
       notificationSettings.settings,
       notificationSettings.setDesktopEnabled,
-      selectedView === "home",
+      selectedView === "home" && !settingsOpen,
       getChannelReadAt,
       readStateVersion,
       highPriorityUnreadChannelIds,
@@ -494,15 +431,23 @@ export function AppShell() {
   const handleOpenSettings = React.useCallback(
     (section: SettingsSection = DEFAULT_SETTINGS_SECTION) => {
       setIsChannelManagementOpen(false);
-      setSettingsSection(section);
-      setSettingsOpen(true);
+      void goSettings(section);
     },
-    [],
+    [goSettings],
   );
 
   const handleCloseSettings = React.useCallback(() => {
-    setSettingsOpen(false);
-  }, []);
+    closeSettings();
+  }, [closeSettings]);
+
+  // Section switches rewrite the settings entry rather than stacking one
+  // history entry per section, so back always exits settings in one step.
+  const handleSettingsSectionChange = React.useCallback(
+    (section: SettingsSection) => {
+      void goSettings(section, { replace: true });
+    },
+    [goSettings],
+  );
 
   const handleOpenSearchResult = React.useCallback(
     (hit: SearchHit) => {
@@ -743,7 +688,10 @@ export function AppShell() {
               setIsChannelManagementOpen(true);
             },
             getChannelReadAt,
+            getThreadReadAt,
+            markThreadRead,
             readStateVersion,
+            setContextParentResolver,
             followThread: handleFollowThread,
             unfollowThread: handleUnfollowThread,
             isFollowingThread,
@@ -754,236 +702,250 @@ export function AppShell() {
           }}
         >
           <HuddleProvider>
-            <div
-              className="buzz-huddle-shell relative h-dvh overflow-hidden overscroll-none"
-              data-huddle-open={isHuddleDrawerOpen}
-            >
+            <RemindMeLaterProvider>
               <div
-                className={cn(
-                  "buzz-huddle-app-surface z-10 flex min-h-0 flex-col overflow-hidden bg-background",
-                  isHuddleDrawerOpen && "buzz-huddle-app-surface-open",
-                )}
+                className="buzz-huddle-shell relative h-dvh overflow-hidden overscroll-none"
+                data-huddle-open={isHuddleDrawerOpen}
               >
-                <SidebarProvider className="min-h-0 flex-1 overflow-hidden">
-                  {!settingsOpen ? (
-                    <AppTopChrome
-                      canGoBack={canGoBack}
-                      canGoForward={canGoForward}
+                <div
+                  className={cn(
+                    "buzz-huddle-app-surface z-10 flex min-h-0 flex-col overflow-hidden bg-background",
+                    isHuddleDrawerOpen && "buzz-huddle-app-surface-open",
+                  )}
+                >
+                  <SidebarProvider className="min-h-0 flex-1 overflow-hidden">
+                    {!settingsOpen ? (
+                      <AppTopChrome
+                        canGoBack={canGoBack}
+                        canGoForward={canGoForward}
+                        channels={channels}
+                        currentPubkey={identityQuery.data?.pubkey}
+                        onGoBack={goBack}
+                        onGoForward={goForward}
+                        onOpenChannel={(channelId) => {
+                          void goChannel(channelId);
+                        }}
+                        onOpenResult={handleOpenSearchResult}
+                        searchHidden={topbarSearchHidden}
+                        searchLoading={topbarSearchLoading}
+                        searchFocusRequest={searchFocusRequest}
+                      />
+                    ) : null}
+                    {settingsOpen ? (
+                      <React.Suspense fallback={null}>
+                        <LazySettingsScreen
+                          currentPubkey={identityQuery.data?.pubkey}
+                          fallbackDisplayName={identityQuery.data?.displayName}
+                          isUpdatingDesktopNotifications={
+                            notificationSettings.isUpdatingDesktopEnabled
+                          }
+                          notificationErrorMessage={
+                            notificationSettings.errorMessage
+                          }
+                          notificationPermission={
+                            notificationSettings.permission
+                          }
+                          notificationSettings={notificationSettings.settings}
+                          onClose={handleCloseSettings}
+                          onSectionChange={handleSettingsSectionChange}
+                          onSetDesktopNotificationsEnabled={
+                            notificationSettings.setDesktopEnabled
+                          }
+                          onSetHomeBadgeEnabled={
+                            notificationSettings.setHomeBadgeEnabled
+                          }
+                          onSetSlotAlertsEnabled={
+                            notificationSettings.setSlotAlertsEnabled
+                          }
+                          onSetNotifyWhileViewing={
+                            notificationSettings.setNotifyWhileViewing
+                          }
+                          onSetAllSlotAlertsEnabled={
+                            notificationSettings.setAllSlotAlertsEnabled
+                          }
+                          onSetSoundForSlot={
+                            notificationSettings.setSoundForSlot
+                          }
+                          section={settingsSection}
+                        />
+                      </React.Suspense>
+                    ) : (
+                      <>
+                        <AppSidebar
+                          activeWorkspace={workspacesHook.activeWorkspace}
+                          channels={sidebarChannels}
+                          currentPubkey={identityQuery.data?.pubkey}
+                          errorMessage={
+                            channelsQuery.error instanceof Error
+                              ? channelsQuery.error.message
+                              : undefined
+                          }
+                          fallbackDisplayName={identityQuery.data?.displayName}
+                          homeBadgeCount={homeBadgeCount}
+                          isAddWorkspaceOpen={isAddWorkspaceOpen}
+                          isCreatingChannel={createChannelMutation.isPending}
+                          isCreatingForum={createForumMutation.isPending}
+                          isLoading={channelsQuery.isLoading}
+                          isOpeningDm={openDmMutation.isPending}
+                          isNewDmOpen={isNewDmOpen}
+                          isCreateChannelOpen={isCreateChannelOpen}
+                          isPresencePending={presenceSession.isPending}
+                          onAddWorkspace={(workspace) => {
+                            const id = workspacesHook.addWorkspace(workspace);
+                            workspacesHook.switchWorkspace(id);
+                          }}
+                          onAddWorkspaceOpenChange={setIsAddWorkspaceOpen}
+                          onNewDmOpenChange={setIsNewDmOpen}
+                          onCreateChannelOpenChange={setIsCreateChannelOpen}
+                          onOpenAddWorkspace={() => setIsAddWorkspaceOpen(true)}
+                          onUpdateWorkspace={workspacesHook.updateWorkspace}
+                          onRemoveWorkspace={workspacesHook.removeWorkspace}
+                          onSwitchWorkspace={workspacesHook.switchWorkspace}
+                          selfPresenceStatus={presenceSession.currentStatus}
+                          workspaces={workspacesHook.workspaces}
+                          onCreateChannel={async ({
+                            description,
+                            name,
+                            visibility,
+                            ttlSeconds,
+                            templateId,
+                          }) => {
+                            const createdChannel =
+                              await createChannelMutation.mutateAsync({
+                                name,
+                                description,
+                                channelType: "stream",
+                                visibility,
+                                ttlSeconds,
+                              });
+
+                            await applyCanvas(
+                              templateId,
+                              createdChannel.id,
+                              name,
+                            );
+                            await goChannel(createdChannel.id);
+                            void applyAgents(templateId, createdChannel.id);
+                          }}
+                          onCreateForum={async ({
+                            description,
+                            name,
+                            visibility,
+                            ttlSeconds,
+                            templateId,
+                          }) => {
+                            const createdForum =
+                              await createForumMutation.mutateAsync({
+                                name,
+                                description,
+                                channelType: "forum",
+                                visibility,
+                                ttlSeconds,
+                              });
+
+                            await applyCanvas(
+                              templateId,
+                              createdForum.id,
+                              name,
+                            );
+                            await goChannel(createdForum.id);
+                            void applyAgents(templateId, createdForum.id);
+                          }}
+                          onHideDm={handleHideDm}
+                          onMarkAllChannelsRead={markAllChannelsRead}
+                          onMarkChannelRead={markChannelRead}
+                          onMarkChannelUnread={markChannelUnread}
+                          onOpenBrowseChannels={handleOpenBrowseChannels}
+                          onOpenBrowseForums={handleOpenBrowseForums}
+                          onOpenDm={async ({ pubkeys }) => {
+                            const directMessage =
+                              await openDmMutation.mutateAsync({
+                                pubkeys,
+                              });
+                            await goChannel(directMessage.id);
+                          }}
+                          onSelectAgents={() => void goAgents()}
+                          onSelectChannel={(channelId) =>
+                            void goChannel(channelId)
+                          }
+                          onSelectHome={() => void goHome()}
+                          onSelectProjects={() => void goProjects()}
+                          onSelectPulse={() => void goPulse()}
+                          onSelectReminders={() => void goReminders()}
+                          onSelectSettings={handleOpenSettings}
+                          onSelectWorkflows={() => void goWorkflows()}
+                          onSetPresenceStatus={(status) =>
+                            presenceSession.setStatus(status)
+                          }
+                          onSetUserStatus={(text, emoji) =>
+                            setUserStatusMutation.mutate({ text, emoji })
+                          }
+                          onClearUserStatus={() =>
+                            setUserStatusMutation.mutate({
+                              text: "",
+                              emoji: "",
+                            })
+                          }
+                          profile={profileQuery.data}
+                          selfUserStatus={
+                            deferredPubkey
+                              ? (selfStatusQuery.data?.[
+                                  deferredPubkey.toLowerCase()
+                                ] ?? undefined)
+                              : undefined
+                          }
+                          selectedChannelId={selectedChannelId}
+                          selectedView={selectedView}
+                          unreadChannelIds={unreadChannelIds}
+                          mutedChannelIds={mutedChannelIds}
+                          onMuteChannel={muteChannel}
+                          onUnmuteChannel={unmuteChannel}
+                          starredChannelIds={starredChannelIds}
+                          onStarChannel={starChannel}
+                          onUnstarChannel={unstarChannel}
+                        />
+
+                        <MainInsetProvider mainInsetRef={mainInsetRef}>
+                          <SidebarInset
+                            ref={mainInsetRef}
+                            className="min-h-0 min-w-0 overflow-hidden"
+                            style={chromeCssVarDefaults}
+                          >
+                            <ConnectionBanner />
+                            <Outlet />
+                          </SidebarInset>
+                        </MainInsetProvider>
+                      </>
+                    )}
+
+                    <AppShellOverlays
+                      activeChannel={activeChannel}
+                      browseDialogType={browseDialogType}
                       channels={channels}
                       currentPubkey={identityQuery.data?.pubkey}
-                      onGoBack={goBack}
-                      onGoForward={goForward}
-                      onOpenChannel={(channelId) => {
+                      isChannelManagementOpen={isChannelManagementOpen}
+                      onBrowseChannelJoin={handleBrowseChannelJoin}
+                      onBrowseDialogOpenChange={handleBrowseDialogOpenChange}
+                      onChannelManagementOpenChange={setIsChannelManagementOpen}
+                      onDeleteActiveChannel={() => {
+                        setIsChannelManagementOpen(false);
+                        void goHome({ replace: true });
+                      }}
+                      onSelectChannel={(channelId) => {
                         void goChannel(channelId);
                       }}
-                      onOpenResult={handleOpenSearchResult}
-                      searchHidden={topbarSearchHidden}
-                      searchLoading={topbarSearchLoading}
-                      searchFocusRequest={searchFocusRequest}
                     />
-                  ) : null}
-                  {settingsOpen ? (
-                    <React.Suspense fallback={null}>
-                      <LazySettingsScreen
-                        currentPubkey={identityQuery.data?.pubkey}
-                        fallbackDisplayName={identityQuery.data?.displayName}
-                        isUpdatingDesktopNotifications={
-                          notificationSettings.isUpdatingDesktopEnabled
-                        }
-                        notificationErrorMessage={
-                          notificationSettings.errorMessage
-                        }
-                        notificationPermission={notificationSettings.permission}
-                        notificationSettings={notificationSettings.settings}
-                        onClose={handleCloseSettings}
-                        onSectionChange={setSettingsSection}
-                        onSetDesktopNotificationsEnabled={
-                          notificationSettings.setDesktopEnabled
-                        }
-                        onSetHomeBadgeEnabled={
-                          notificationSettings.setHomeBadgeEnabled
-                        }
-                        onSetSlotAlertsEnabled={
-                          notificationSettings.setSlotAlertsEnabled
-                        }
-                        onSetNotifyWhileViewing={
-                          notificationSettings.setNotifyWhileViewing
-                        }
-                        onSetAllSlotAlertsEnabled={
-                          notificationSettings.setAllSlotAlertsEnabled
-                        }
-                        onSetSoundForSlot={notificationSettings.setSoundForSlot}
-                        section={settingsSection}
-                      />
-                    </React.Suspense>
-                  ) : (
-                    <>
-                      <AppSidebar
-                        activeWorkspace={workspacesHook.activeWorkspace}
-                        channels={sidebarChannels}
-                        currentPubkey={identityQuery.data?.pubkey}
-                        errorMessage={
-                          channelsQuery.error instanceof Error
-                            ? channelsQuery.error.message
-                            : undefined
-                        }
-                        fallbackDisplayName={identityQuery.data?.displayName}
-                        homeBadgeCount={homeBadgeCount}
-                        isAddWorkspaceOpen={isAddWorkspaceOpen}
-                        isCreatingChannel={createChannelMutation.isPending}
-                        isCreatingForum={createForumMutation.isPending}
-                        isLoading={channelsQuery.isLoading}
-                        isOpeningDm={openDmMutation.isPending}
-                        isNewDmOpen={isNewDmOpen}
-                        isCreateChannelOpen={isCreateChannelOpen}
-                        isPresencePending={presenceSession.isPending}
-                        onAddWorkspace={(workspace) => {
-                          const id = workspacesHook.addWorkspace(workspace);
-                          workspacesHook.switchWorkspace(id);
-                        }}
-                        onAddWorkspaceOpenChange={setIsAddWorkspaceOpen}
-                        onNewDmOpenChange={setIsNewDmOpen}
-                        onCreateChannelOpenChange={setIsCreateChannelOpen}
-                        onOpenAddWorkspace={() => setIsAddWorkspaceOpen(true)}
-                        onUpdateWorkspace={workspacesHook.updateWorkspace}
-                        onRemoveWorkspace={workspacesHook.removeWorkspace}
-                        onSwitchWorkspace={workspacesHook.switchWorkspace}
-                        selfPresenceStatus={presenceSession.currentStatus}
-                        workspaces={workspacesHook.workspaces}
-                        onCreateChannel={async ({
-                          description,
-                          name,
-                          visibility,
-                          ttlSeconds,
-                          templateId,
-                        }) => {
-                          const createdChannel =
-                            await createChannelMutation.mutateAsync({
-                              name,
-                              description,
-                              channelType: "stream",
-                              visibility,
-                              ttlSeconds,
-                            });
+                  </SidebarProvider>
+                </div>
 
-                          await applyCanvas(
-                            templateId,
-                            createdChannel.id,
-                            name,
-                          );
-                          await goChannel(createdChannel.id);
-                          void applyAgents(templateId, createdChannel.id);
-                        }}
-                        onCreateForum={async ({
-                          description,
-                          name,
-                          visibility,
-                          ttlSeconds,
-                          templateId,
-                        }) => {
-                          const createdForum =
-                            await createForumMutation.mutateAsync({
-                              name,
-                              description,
-                              channelType: "forum",
-                              visibility,
-                              ttlSeconds,
-                            });
-
-                          await applyCanvas(templateId, createdForum.id, name);
-                          await goChannel(createdForum.id);
-                          void applyAgents(templateId, createdForum.id);
-                        }}
-                        onHideDm={handleHideDm}
-                        onMarkAllChannelsRead={markAllChannelsRead}
-                        onMarkChannelRead={markChannelRead}
-                        onMarkChannelUnread={markChannelUnread}
-                        onOpenBrowseChannels={handleOpenBrowseChannels}
-                        onOpenBrowseForums={handleOpenBrowseForums}
-                        onOpenDm={async ({ pubkeys }) => {
-                          const directMessage =
-                            await openDmMutation.mutateAsync({
-                              pubkeys,
-                            });
-                          await goChannel(directMessage.id);
-                        }}
-                        onSelectAgents={() => void goAgents()}
-                        onSelectChannel={(channelId) =>
-                          void goChannel(channelId)
-                        }
-                        onSelectHome={() => void goHome()}
-                        onSelectProjects={() => void goProjects()}
-                        onSelectPulse={() => void goPulse()}
-                        onSelectSettings={handleOpenSettings}
-                        onSelectWorkflows={() => void goWorkflows()}
-                        onSetPresenceStatus={(status) =>
-                          presenceSession.setStatus(status)
-                        }
-                        onSetUserStatus={(text, emoji) =>
-                          setUserStatusMutation.mutate({ text, emoji })
-                        }
-                        onClearUserStatus={() =>
-                          setUserStatusMutation.mutate({ text: "", emoji: "" })
-                        }
-                        profile={profileQuery.data}
-                        selfUserStatus={
-                          deferredPubkey
-                            ? (selfStatusQuery.data?.[
-                                deferredPubkey.toLowerCase()
-                              ] ?? undefined)
-                            : undefined
-                        }
-                        selectedChannelId={selectedChannelId}
-                        selectedView={selectedView}
-                        unreadChannelIds={unreadChannelIds}
-                        mutedChannelIds={mutedChannelIds}
-                        onMuteChannel={muteChannel}
-                        onUnmuteChannel={unmuteChannel}
-                        starredChannelIds={starredChannelIds}
-                        onStarChannel={starChannel}
-                        onUnstarChannel={unstarChannel}
-                      />
-
-                      <MainInsetProvider mainInsetRef={mainInsetRef}>
-                        <SidebarInset
-                          ref={mainInsetRef}
-                          className="min-h-0 min-w-0 overflow-hidden"
-                          style={chromeCssVarDefaults}
-                        >
-                          <ConnectionBanner />
-                          <Outlet />
-                        </SidebarInset>
-                      </MainInsetProvider>
-                    </>
-                  )}
-
-                  <AppShellOverlays
-                    activeChannel={activeChannel}
-                    browseDialogType={browseDialogType}
-                    channels={channels}
-                    currentPubkey={identityQuery.data?.pubkey}
-                    isChannelManagementOpen={isChannelManagementOpen}
-                    onBrowseChannelJoin={handleBrowseChannelJoin}
-                    onBrowseDialogOpenChange={handleBrowseDialogOpenChange}
-                    onChannelManagementOpenChange={setIsChannelManagementOpen}
-                    onDeleteActiveChannel={() => {
-                      setIsChannelManagementOpen(false);
-                      void goHome({ replace: true });
-                    }}
-                    onSelectChannel={(channelId) => {
-                      void goChannel(channelId);
-                    }}
+                <div className="absolute inset-x-0 bottom-0 z-0 h-(--buzz-huddle-drawer-height)">
+                  <HuddleBar
+                    className="h-full"
+                    onVisibilityChange={setIsHuddleDrawerOpen}
                   />
-                </SidebarProvider>
+                </div>
               </div>
-
-              <div className="absolute inset-x-0 bottom-0 z-0 h-(--buzz-huddle-drawer-height)">
-                <HuddleBar
-                  className="h-full"
-                  onVisibilityChange={setIsHuddleDrawerOpen}
-                />
-              </div>
-            </div>
+            </RemindMeLaterProvider>
           </HuddleProvider>
         </AppShellProvider>
       </ChannelNavigationProvider>

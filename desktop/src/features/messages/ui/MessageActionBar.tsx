@@ -1,6 +1,7 @@
 import {
   BellOff,
   BellRing,
+  Clock,
   Copy,
   CornerUpLeft,
   EllipsisVertical,
@@ -77,6 +78,7 @@ function MoreActionsMenu({
   onFollowThread,
   onMarkUnread,
   onOpenChange,
+  onRemindLater,
   onUnfollowThread,
   open,
   isFollowingThread,
@@ -90,6 +92,7 @@ function MoreActionsMenu({
   onFollowThread?: (message: TimelineMessage) => void;
   onMarkUnread?: (message: TimelineMessage) => void;
   onOpenChange: (open: boolean) => void;
+  onRemindLater?: (message: TimelineMessage) => void;
   onUnfollowThread?: (message: TimelineMessage) => void;
   open: boolean;
   isFollowingThread?: boolean;
@@ -192,6 +195,17 @@ function MoreActionsMenu({
             </DropdownMenuItem>
           ) : null}
 
+          {onRemindLater ? (
+            <DropdownMenuItem
+              onClick={() => {
+                onRemindLater(message);
+              }}
+            >
+              <Clock className="h-4 w-4" />
+              Remind me later
+            </DropdownMenuItem>
+          ) : null}
+
           {hasCopyActions && channelId ? (
             <DropdownMenuItem
               data-testid={`copy-message-link-${message.id}`}
@@ -268,12 +282,10 @@ function MoreActionsMenu({
 // ---------------------------------------------------------------------------
 
 function QuickReactionButton({
-  active,
   customEmojiUrl,
   emoji,
   onSelect,
 }: {
-  active: boolean;
   customEmojiUrl?: string;
   emoji: string;
   onSelect: (emoji: string) => void;
@@ -286,13 +298,7 @@ function QuickReactionButton({
       <TooltipTrigger asChild>
         <button
           aria-label={`React with ${displayName}`}
-          aria-pressed={active}
-          className={cn(
-            "flex h-8 w-8 items-center justify-center rounded-full text-base leading-none transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring",
-            active
-              ? "bg-secondary text-secondary-foreground"
-              : "text-muted-foreground hover:bg-muted hover:text-foreground",
-          )}
+          className="flex h-8 w-8 items-center justify-center rounded-full text-base leading-none text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
           onClick={() => onSelect(emoji)}
           title={displayName}
           type="button"
@@ -329,6 +335,7 @@ export function MessageActionBar({
   onMarkUnread,
   onReactionBadgeBurstRequest,
   onReactionSelect,
+  onRemindLater,
   onReply,
   onUnfollowThread,
   reactionErrorMessage = null,
@@ -345,6 +352,7 @@ export function MessageActionBar({
   onMarkUnread?: (message: TimelineMessage) => void;
   onReactionBadgeBurstRequest?: (emoji: string) => void;
   onReactionSelect?: (emoji: string) => Promise<void>;
+  onRemindLater?: (message: TimelineMessage) => void;
   onReply?: (message: TimelineMessage) => void;
   onUnfollowThread?: (message: TimelineMessage) => void;
   reactionErrorMessage?: string | null;
@@ -376,16 +384,9 @@ export function MessageActionBar({
     Boolean(onMarkUnread) ||
     Boolean(onFollowThread) ||
     Boolean(onUnfollowThread) ||
+    Boolean(onRemindLater) ||
     !message.pending;
 
-  const selectedReactionCount = reactions.filter(
-    (reaction) => reaction.reactedByCurrentUser,
-  ).length;
-  const selectedReactionEmojis = new Set(
-    reactions
-      .filter((reaction) => reaction.reactedByCurrentUser)
-      .map((reaction) => reaction.emoji),
-  );
   const wouldAddReaction = React.useCallback(
     (emoji: string) =>
       !reactions.some(
@@ -441,7 +442,6 @@ export function MessageActionBar({
               <div className="hidden items-center gap-0.5 sm:flex">
                 {quickReactionItems.map(({ customEmojiUrl, emoji }) => (
                   <QuickReactionButton
-                    active={selectedReactionEmojis.has(emoji)}
                     customEmojiUrl={customEmojiUrl}
                     emoji={emoji}
                     key={emoji}
@@ -467,11 +467,7 @@ export function MessageActionBar({
                       data-testid={`react-message-${message.id}`}
                       size="sm"
                       type="button"
-                      variant={
-                        isReactionPickerOpen || selectedReactionCount > 0
-                          ? "secondary"
-                          : "ghost"
-                      }
+                      variant={isReactionPickerOpen ? "secondary" : "ghost"}
                     >
                       <SmilePlus className={ACTION_ICON_CLASS} />
                     </Button>
@@ -534,6 +530,7 @@ export function MessageActionBar({
               onFollowThread={onFollowThread}
               onMarkUnread={onMarkUnread}
               onOpenChange={setIsDropdownOpen}
+              onRemindLater={onRemindLater}
               onUnfollowThread={onUnfollowThread}
               open={isDropdownOpen}
               isFollowingThread={isFollowingThread}

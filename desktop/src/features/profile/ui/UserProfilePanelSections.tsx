@@ -38,6 +38,7 @@ import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import { BotIdenticon } from "@/features/messages/ui/BotIdenticon";
 import type { ManagedAgent, RelayAgent } from "@/shared/api/types";
+import { useFeatureEnabled } from "@/shared/features";
 import { cn } from "@/shared/lib/cn";
 import { useNow } from "@/shared/lib/useNow";
 import { Badge } from "@/shared/ui/badge";
@@ -174,12 +175,12 @@ export function ProfileSummaryView({
 
       {activeTurns.length > 0 ? (
         <div className="flex flex-wrap justify-center gap-1.5">
-          {activeTurns.map(({ channelId, observedAt }) => (
+          {activeTurns.map(({ channelId, anchorAt }) => (
             <ProfileWorkingBadge
               key={channelId}
               channelId={channelId}
               name={channelIdToName[channelId] ?? channelId}
-              observedAt={observedAt}
+              anchorAt={anchorAt}
               onNavigate={goChannel}
             />
           ))}
@@ -239,12 +240,12 @@ export function ProfileSummaryView({
 function ProfileWorkingBadge({
   channelId,
   name,
-  observedAt,
+  anchorAt,
   onNavigate,
 }: {
   channelId: string;
   name: string;
-  observedAt: number;
+  anchorAt: number;
   onNavigate: (channelId: string) => void;
 }) {
   const now = useNow(1000);
@@ -255,7 +256,7 @@ function ProfileWorkingBadge({
       variant="default"
       onClick={() => onNavigate(channelId)}
     >
-      Working in #{name} · {formatElapsed(now - observedAt)}
+      Working in #{name} · {formatElapsed(now - anchorAt)}
     </Badge>
   );
 }
@@ -431,38 +432,29 @@ function ProfilePrimaryActions({
   pubkey: string;
   unfollowMutation: ReturnType<typeof useUnfollowMutation>;
 }) {
+  const showFollowAction = useFeatureEnabled("pulse");
+  const followToggleMutation = isFollowing ? unfollowMutation : followMutation;
+
+  const handleFollowClick = () => {
+    followToggleMutation.mutate(pubkey, {
+      onError: (error) =>
+        toast.error(
+          `${isFollowing ? "Unfollow" : "Follow"} failed: ${error.message}`,
+        ),
+    });
+  };
+
   return (
     <div className="flex items-start justify-center gap-8">
-      {isFollowing ? (
+      {showFollowAction ? (
         <ProfileQuickAction
-          active
-          disabled={unfollowMutation.isPending}
-          icon={UserMinus}
-          label="Unfollow"
-          onClick={() =>
-            unfollowMutation.mutate(pubkey, {
-              onError: (error) =>
-                toast.error(
-                  `Unfollow failed: ${error instanceof Error ? error.message : String(error)}`,
-                ),
-            })
-          }
+          active={isFollowing}
+          disabled={followToggleMutation.isPending}
+          icon={isFollowing ? UserMinus : UserPlus}
+          label={isFollowing ? "Unfollow" : "Follow"}
+          onClick={handleFollowClick}
         />
-      ) : (
-        <ProfileQuickAction
-          disabled={followMutation.isPending}
-          icon={UserPlus}
-          label="Follow"
-          onClick={() =>
-            followMutation.mutate(pubkey, {
-              onError: (error) =>
-                toast.error(
-                  `Follow failed: ${error instanceof Error ? error.message : String(error)}`,
-                ),
-            })
-          }
-        />
-      )}
+      ) : null}
       {onMessage ? (
         <ProfileQuickAction
           icon={MessageSquare}

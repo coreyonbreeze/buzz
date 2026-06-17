@@ -4,6 +4,7 @@ import { useAgentOwnershipQuery } from "@/features/agents/hooks/useCanViewAgentA
 import type { TimelineMessage } from "@/features/messages/types";
 import type { Channel, ChannelMember } from "@/shared/api/types";
 import { normalizePubkey } from "@/shared/lib/pubkey";
+import type { PanelValueSetter } from "./useChannelPanelHistoryState";
 
 import {
   type ChannelAgentSessionAgent,
@@ -22,9 +23,12 @@ type UseChannelAgentSessionsOptions = {
   activeChannel: Channel | null;
   activeChannelId: string | null;
   agentCandidates: ChannelAgentSessionAgent[];
+  agentsLoaded: boolean;
   channelMembers?: ChannelMember[];
   handleOpenThread: (message: TimelineMessage) => void;
+  openAgentSessionPubkey: string | null;
   setExpandedThreadReplyIds: (value: Set<string>) => void;
+  setOpenAgentSessionPubkey: PanelValueSetter;
   setOpenThreadHeadId: (value: string | null) => void;
   setProfilePanelPubkey: (value: string | null) => void;
   setThreadReplyTargetId: (value: string | null) => void;
@@ -35,18 +39,17 @@ export function useChannelAgentSessions({
   activeChannel,
   activeChannelId,
   agentCandidates,
+  agentsLoaded,
   channelMembers,
   handleOpenThread,
+  openAgentSessionPubkey,
   setExpandedThreadReplyIds,
+  setOpenAgentSessionPubkey,
   setOpenThreadHeadId,
   setProfilePanelPubkey,
   setThreadReplyTargetId,
   setThreadScrollTargetId,
 }: UseChannelAgentSessionsOptions) {
-  const [openAgentSessionPubkey, setOpenAgentSessionPubkey] = React.useState<
-    string | null
-  >(null);
-
   const channelAgentSessionAgents = React.useMemo(
     () =>
       getChannelAgentSessionAgents({
@@ -72,7 +75,7 @@ export function useChannelAgentSessions({
 
   const closeAgentSession = React.useCallback(() => {
     setOpenAgentSessionPubkey(null);
-  }, []);
+  }, [setOpenAgentSessionPubkey]);
 
   const openAgentSession = React.useCallback(
     (pubkey: string) => {
@@ -85,6 +88,7 @@ export function useChannelAgentSessions({
     },
     [
       setExpandedThreadReplyIds,
+      setOpenAgentSessionPubkey,
       setOpenThreadHeadId,
       setProfilePanelPubkey,
       setThreadReplyTargetId,
@@ -92,9 +96,12 @@ export function useChannelAgentSessions({
     ],
   );
 
-  const selectAgentSession = React.useCallback((pubkey: string) => {
-    setOpenAgentSessionPubkey(pubkey);
-  }, []);
+  const selectAgentSession = React.useCallback(
+    (pubkey: string) => {
+      setOpenAgentSessionPubkey(pubkey);
+    },
+    [setOpenAgentSessionPubkey],
+  );
 
   const openThreadAndCloseAgentSession = React.useCallback(
     (message: TimelineMessage) => {
@@ -102,7 +109,7 @@ export function useChannelAgentSessions({
       setProfilePanelPubkey(null);
       handleOpenThread(message);
     },
-    [handleOpenThread, setProfilePanelPubkey],
+    [handleOpenThread, setOpenAgentSessionPubkey, setProfilePanelPubkey],
   );
 
   React.useEffect(() => {
@@ -119,18 +126,29 @@ export function useChannelAgentSessions({
       return;
     }
 
+    // Wait until the agent/channel/member queries have settled before treating
+    // an out-of-channel open session as stale — a reload restoring the
+    // agentSession URL param shows an empty list mid-fetch.
+    if (!agentsLoaded) {
+      return;
+    }
+
     if (ownershipQuery.isLoading || ownershipQuery.data === undefined) {
       return;
     }
 
+    // Owners keep the panel open even when the agent is out of the channel
+    // list; non-owners get the stale param auto-closed.
     if (!ownershipQuery.data.isOwner) {
-      setOpenAgentSessionPubkey(null);
+      setOpenAgentSessionPubkey(null, { replace: true });
     }
   }, [
+    agentsLoaded,
     channelAgentSessionAgents,
     openAgentSessionPubkey,
     ownershipQuery.data,
     ownershipQuery.isLoading,
+    setOpenAgentSessionPubkey,
   ]);
 
   return {

@@ -6,6 +6,7 @@ import { X } from "lucide-react";
 
 import { cn } from "@/shared/lib/cn";
 import { useTheme } from "@/shared/theme/ThemeProvider";
+import { MODAL_BACKDROP_BLUR_CLASS } from "@/shared/ui/modalBackdrop";
 
 const Dialog = DialogPrimitive.Root;
 const DialogTrigger = DialogPrimitive.Trigger;
@@ -22,6 +23,7 @@ const DialogOverlay = React.forwardRef<
     <DialogPrimitive.Overlay
       className={cn(
         "fixed inset-0 z-50 transition-none duration-200 ease-out data-[state=closed]:duration-150 data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 motion-reduce:animate-none",
+        MODAL_BACKDROP_BLUR_CLASS,
         isDark ? "bg-black/60" : "bg-black/10",
         className,
       )}
@@ -77,6 +79,20 @@ const DialogHeader = ({
 );
 DialogHeader.displayName = "DialogHeader";
 
+const DialogFooter = ({
+  className,
+  ...props
+}: React.HTMLAttributes<HTMLDivElement>) => (
+  <div
+    className={cn(
+      "flex flex-col-reverse gap-2 sm:flex-row sm:justify-end",
+      className,
+    )}
+    {...props}
+  />
+);
+DialogFooter.displayName = "DialogFooter";
+
 const DialogTitle = React.forwardRef<
   React.ElementRef<typeof DialogPrimitive.Title>,
   React.ComponentPropsWithoutRef<typeof DialogPrimitive.Title>
@@ -106,6 +122,7 @@ export {
   DialogClose,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogPortal,
   DialogTitle,

@@ -23,6 +23,46 @@ test("send a message and see it in timeline", async ({ page }) => {
   );
 });
 
+test("long autolink wraps without widening the timeline", async ({ page }) => {
+  await page.setViewportSize({ width: 800, height: 600 });
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  const longUrl = `https://blocked.teams.cloudflare.com/?${"dependencyconfusionnpm".repeat(18)}`;
+  const message = `Step "adapter" failed: npm error invalid json response body at <${longUrl}> reason: Unexpected token '<'`;
+
+  await page.getByTestId("message-input").fill(message);
+  await page.getByTestId("send-message").click();
+
+  const timeline = page.getByTestId("message-timeline");
+  await expect(timeline).toContainText('Step "adapter" failed');
+  await expect
+    .poll(() =>
+      timeline.evaluate((element) => element.scrollWidth - element.clientWidth),
+    )
+    .toBeLessThanOrEqual(1);
+
+  const row = page.getByTestId("message-row").last();
+  await row.hover();
+
+  const actionBar = page.locator('[data-testid^="message-action-bar-"]').last();
+  await expect(actionBar).toHaveCSS("opacity", "1");
+  await expect
+    .poll(async () => {
+      const [barBox, timelineBox] = await Promise.all([
+        actionBar.boundingBox(),
+        timeline.boundingBox(),
+      ]);
+      if (!barBox || !timelineBox) {
+        return Number.POSITIVE_INFINITY;
+      }
+      return barBox.x + barBox.width - (timelineBox.x + timelineBox.width);
+    })
+    .toBeLessThanOrEqual(0);
+});
+
 test("send multiple messages in sequence", async ({ page }) => {
   const ts = Date.now();
   const messages = [
@@ -404,7 +444,7 @@ test("opens a single-level thread panel with inline expansion", async ({
   const siblingReply = `Sibling threaded reply ${timestamp}`;
   const nestedReply = `Nested threaded reply ${timestamp}`;
   const nestedReplyFromBob = `Nested reply from Bob ${timestamp}`;
-  const nestedReplyVisibleTopMaxPx = 280;
+  const nestedReplyVisibleTopMaxPx = 300;
   const fillerReplies = Array.from(
     { length: 14 },
     (_, index) => `Thread filler reply ${index} ${timestamp}`,
@@ -739,7 +779,7 @@ test("narrow thread view collapses channel header actions into a menu", async ({
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
-  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
   await expect(page.getByTestId("channel-actions-menu-trigger")).toHaveCount(0);
 
   const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
@@ -752,7 +792,7 @@ test("narrow thread view collapses channel header actions into a menu", async ({
 
   const menuTrigger = page.getByTestId("channel-actions-menu-trigger");
   await expect(menuTrigger).toBeVisible();
-  await expect(page.getByTestId("channel-add-bot-trigger")).toBeHidden();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
   await expect(page.getByTestId("channel-members-trigger")).toBeHidden();
   await expect(page.getByTestId("channel-management-trigger")).toBeHidden();
 
@@ -762,12 +802,12 @@ test("narrow thread view collapses channel header actions into a menu", async ({
     throw new Error("Expected header action menu and thread panel bounds");
   }
   const menuGapPx = threadPanelBox.x - (menuBox.x + menuBox.width);
-  expect(menuGapPx).toBeGreaterThanOrEqual(22);
-  expect(menuGapPx).toBeLessThanOrEqual(26);
+  expect(menuGapPx).toBeGreaterThanOrEqual(18);
+  expect(menuGapPx).toBeLessThanOrEqual(22);
 
   await menuTrigger.click();
 
-  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
   await expect(page.getByTestId("channel-members-trigger")).toBeVisible();
   await expect(page.getByTestId("channel-start-huddle-trigger")).toBeVisible();
   await expect(page.getByTestId("channel-management-trigger")).toBeVisible();
@@ -782,7 +822,7 @@ test("single-panel thread view hides topbar search and channel actions", async (
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await expect(page.getByTestId("open-search")).toBeVisible();
-  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
 
   const rootMessage = page.locator('[data-message-id="mock-general-alice"]');
   const threadPanel = page.getByTestId("message-thread-panel");
@@ -798,7 +838,7 @@ test("single-panel thread view hides topbar search and channel actions", async (
   await threadPanel.getByTestId("message-thread-back").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
   await expect(page.getByTestId("open-search")).toBeVisible();
-  await expect(page.getByTestId("channel-add-bot-trigger")).toBeVisible();
+  await expect(page.getByTestId("channel-add-bot-trigger")).toHaveCount(0);
 });
 
 test("composer is focused after selecting a channel", async ({ page }) => {

@@ -14,6 +14,7 @@ import { useUserStatusQuery } from "@/features/user-status/hooks";
 import { useChannelsQuery } from "@/features/channels/hooks";
 import { StatusEmoji } from "@/features/user-status/ui/StatusEmoji";
 import { PresenceBadge } from "@/features/presence/ui/PresenceBadge";
+import { parseAnimatedAvatarUrl } from "@/shared/lib/animatedAvatar";
 import { rewriteRelayUrl } from "@/shared/lib/mediaUrl";
 import { useAgentSession } from "@/shared/context/AgentSessionContext";
 import { useProfilePanel } from "@/shared/context/ProfilePanelContext";
@@ -192,7 +193,12 @@ export function UserProfilePopover({
                 alt={profile.displayName ?? "User avatar"}
                 className="h-10 w-10 shrink-0 rounded-lg object-cover shadow-xs"
                 referrerPolicy="no-referrer"
-                src={rewriteRelayUrl(profile.avatarUrl)}
+                // The popover only shows while hovering, so animated avatars
+                // play their animation here instead of the static poster frame.
+                src={rewriteRelayUrl(
+                  parseAnimatedAvatarUrl(profile.avatarUrl)?.animationUrl ??
+                    profile.avatarUrl,
+                )}
               />
             ) : (
               <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-lg bg-secondary text-xs font-semibold text-secondary-foreground shadow-xs">
@@ -221,7 +227,7 @@ export function UserProfilePopover({
                 </p>
               ) : null}
               {profile?.displayName ? (
-                <p className="truncate font-mono text-[10px] text-muted-foreground/50">
+                <p className="truncate font-mono text-2xs text-muted-foreground/50">
                   {truncatePubkey(pubkey)}
                 </p>
               ) : null}
@@ -263,11 +269,11 @@ export function UserProfilePopover({
 
           {activeTurns.length > 0 ? (
             <div className="flex flex-wrap gap-1.5">
-              {activeTurns.map(({ channelId, observedAt }) => (
+              {activeTurns.map(({ channelId, anchorAt }) => (
                 <PopoverWorkingBadge
                   key={channelId}
                   name={channelIdToName[channelId] ?? channelId}
-                  observedAt={observedAt}
+                  anchorAt={anchorAt}
                 />
               ))}
             </div>
@@ -301,16 +307,16 @@ export function UserProfilePopover({
 
 function PopoverWorkingBadge({
   name,
-  observedAt,
+  anchorAt,
 }: {
   name: string;
-  observedAt: number;
+  anchorAt: number;
 }) {
   const now = useNow(1000);
 
   return (
     <span className="inline-flex items-center rounded-full bg-primary/10 px-2 py-0.5 text-xs font-medium text-primary motion-safe:animate-pulse">
-      Working in #{name} · {formatElapsed(now - observedAt)}
+      Working in #{name} · {formatElapsed(now - anchorAt)}
     </span>
   );
 }

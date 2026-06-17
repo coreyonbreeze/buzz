@@ -90,6 +90,17 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goReminders = React.useCallback(
+    (behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/reminders",
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
   const goProject = React.useCallback(
     (projectId: string, behavior?: NavigationBehavior) =>
       commitNavigation(
@@ -185,6 +196,27 @@ export function useAppNavigation() {
     [commitNavigation],
   );
 
+  const goSettings = React.useCallback(
+    (section?: string, behavior?: NavigationBehavior) =>
+      commitNavigation(
+        {
+          to: "/settings",
+          search: section ? { section } : {},
+        },
+        behavior,
+      ),
+    [commitNavigation],
+  );
+
+  const closeSettings = React.useCallback(() => {
+    if (canGoBack) {
+      router.history.back();
+      return;
+    }
+
+    void goHome({ replace: true });
+  }, [canGoBack, goHome, router.history]);
+
   const closeWorkflowDetail = React.useCallback(() => {
     if (canGoBack) {
       router.history.back();
@@ -231,6 +263,7 @@ export function useAppNavigation() {
 
   return {
     closeForumPost,
+    closeSettings,
     closeWorkflowDetail,
     goAgents,
     goChannel,
@@ -239,6 +272,8 @@ export function useAppNavigation() {
     goProject,
     goProjects,
     goPulse,
+    goReminders,
+    goSettings,
     goWorkflow,
     goWorkflows,
     openSearchHit,
