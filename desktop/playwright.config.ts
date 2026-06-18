@@ -50,6 +50,7 @@ export default defineConfig({
         "**/reminders-screenshots.spec.ts",
         "**/virtualization-screenshots.spec.ts",
         "**/timeline-scroll-anchor.spec.ts",
+        "**/timeline-scroll-anchor-screenshots.spec.ts",
       ],
       use: {
         ...devices["Desktop Chrome"],

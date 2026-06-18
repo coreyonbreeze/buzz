@@ -2322,11 +2322,11 @@ function emitMockHistory(
     const until = filter.until;
     events = events.filter((event) => event.created_at <= until);
   }
-  // `since` is inclusive and bounds the window from below. The live channel
-  // subscription sends `since: now` (relayClientSession `subscribeToChannelLive`)
-  // precisely so the relay returns zero historical backlog — without honoring it
-  // the mock would dump the whole store on channel open, making load-older a
-  // re-emit of already-present rows instead of a true older-page gap-fill.
+  // `since` is inclusive and bounds the window from below. The timeline's live
+  // subscription (relayClientSession `subscribeToChannel` -> `buildChannelFilter`,
+  // `limit: 50`) sets neither `since` nor `until`; this branch exists for fidelity
+  // with `since`-bearing subscriptions like huddle TTS (`subscribeToChannelLive`,
+  // `since: now`), so the mock never dumps the whole store on those subscriptions.
   if (filter?.since !== undefined) {
     const since = filter.since;
     events = events.filter((event) => event.created_at >= since);
