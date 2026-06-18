@@ -312,7 +312,9 @@ test.describe("list virtualization screenshots", () => {
       //   (b) the first-visible row sits where it did before the prepend.
       const after = await sampleAnchor(timeline);
       expect(after.scrollHeight).toBeGreaterThan(before.scrollHeight + 800);
-      expect(Math.abs(after.viewportPos - before.viewportPos)).toBeLessThan(120);
+      expect(Math.abs(after.viewportPos - before.viewportPos)).toBeLessThan(
+        120,
+      );
 
       // Reconcile terminates: two equal scrollTop reads 600ms apart prove the
       // rAF loop stopped. Under the double-writer bug the library re-scheduled
@@ -324,7 +326,9 @@ test.describe("list virtualization screenshots", () => {
       expect(Math.abs(settled1 - settled2)).toBeLessThan(2);
 
       if (run === 0) {
-        await page.screenshot({ path: `${SHOTS}/07-load-older-anchor-hold.png` });
+        await page.screenshot({
+          path: `${SHOTS}/07-load-older-anchor-hold.png`,
+        });
       }
     }
   });
