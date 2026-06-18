@@ -438,7 +438,7 @@ export function MessageThreadPanel({
                 return (
                   <div
                     className={cn(
-                      "flex flex-col gap-1",
+                      "content-visibility-auto flex flex-col gap-1",
                       entry.summary &&
                         "group/message mx-1 rounded-2xl px-0 py-1 transition-colors hover:bg-muted/50 focus-within:bg-muted/50",
                     )}

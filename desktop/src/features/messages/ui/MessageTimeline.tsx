@@ -9,12 +9,14 @@ import { getDmParticipantPreview } from "@/features/channels/lib/dmParticipantDi
 import type { TimelineMessage } from "@/features/messages/types";
 import type { UserProfileLookup } from "@/features/profile/lib/identity";
 import type { ChannelType } from "@/shared/api/types";
+import type { TimelineItemsResult } from "@/features/messages/lib/timelineItems";
 import { cn } from "@/shared/lib/cn";
 import { channelChrome } from "@/shared/layout/chromeLayout";
 import { Spinner } from "@/shared/ui/spinner";
 import { TooltipProvider } from "@/shared/ui/tooltip";
 import { UnreadPill, unreadCountLabel } from "@/shared/ui/UnreadPill";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import type { ListVirtualizer } from "@/shared/ui/VirtualizedList";
 import { TimelineSkeleton, useTimelineSkeletonRows } from "./TimelineSkeleton";
 import { TimelineMessageList } from "./TimelineMessageList";
 import { useAnchoredScroll } from "./useAnchoredScroll";
@@ -163,6 +165,34 @@ const MessageTimelineBase = React.forwardRef<
   const contentRef = React.useRef<HTMLDivElement>(null);
   const topSentinelRef = React.useRef<HTMLDivElement>(null);
 
+  // The virtualizer instance and the flattened item stream are owned by the
+  // child TimelineMessageList (which mounts the VirtualizedList) and reported
+  // up here so the scroll manager can resolve scroll targets by index. The
+  // virtualizer reaches us via a ref (its identity is stable across renders,
+  // but it arrives after first paint); the item stream + id->index map arrive
+  // as state so a rebuild re-runs the scroll manager's index-model paths.
+  const virtualizerRef = React.useRef<ListVirtualizer | null>(null);
+  const handleVirtualizer = React.useCallback((instance: ListVirtualizer) => {
+    virtualizerRef.current = instance;
+  }, []);
+  const getVirtualizer = React.useCallback(() => virtualizerRef.current, []);
+  const [timelineItems, setTimelineItems] =
+    React.useState<TimelineItemsResult | null>(null);
+  const handleItems = React.useCallback((result: TimelineItemsResult) => {
+    setTimelineItems(result);
+  }, []);
+  const virtualizerOption = React.useMemo(
+    () =>
+      timelineItems
+        ? {
+            getVirtualizer,
+            indexByMessageId: timelineItems.indexByMessageId,
+            itemCount: timelineItems.items.length,
+          }
+        : null,
+    [getVirtualizer, timelineItems],
+  );
+
   // Gate the heavy timeline render (each row runs a synchronous
   // react-markdown parse) behind React concurrency. `useDeferredValue` lets the
   // commit that rebuilds the message list yield to higher-priority work, so the
@@ -222,6 +252,7 @@ const MessageTimelineBase = React.forwardRef<
     scrollContainerRef,
     sentinelRef: topSentinelRef,
     targetMessageId,
+    virtualizer: virtualizerOption,
   });
 
   React.useImperativeHandle(
@@ -266,8 +297,9 @@ const MessageTimelineBase = React.forwardRef<
   }, [firstUnreadMessageId, scrollToMessage]);
 
   // Scroll to the active search match when it changes. `scrollToMessage`
-  // updates the scroll anchor, so the post-commit restore won't yank the
-  // view back off the match.
+  // updates the scroll anchor (so the post-commit restore won't yank the view
+  // back off the match) and, when virtualized, resolves the target through the
+  // index model — the row may be windowed out of the DOM.
   const prevSearchActiveRef = React.useRef<string | null>(null);
   React.useEffect(() => {
     if (showTimelineSkeleton) return;
@@ -281,6 +313,16 @@ const MessageTimelineBase = React.forwardRef<
     prevSearchActiveRef.current = searchActiveMessageId;
     scrollToMessage(searchActiveMessageId, { behavior: "smooth" });
   }, [scrollToMessage, searchActiveMessageId, showTimelineSkeleton]);
+
+  useLoadOlderOnScroll({
+    fetchOlder,
+    hasOlderMessages,
+    isLoading: showTimelineSkeleton,
+    restoreScrollPosition,
+    scrollContainerRef,
+    sentinelRef: topSentinelRef,
+    virtualizer: virtualizerOption,
+  });
 
   const timelineSkeletonRows = useTimelineSkeletonRows({
     channelId,
@@ -501,6 +543,9 @@ const MessageTimelineBase = React.forwardRef<
                     searchQuery={searchQuery}
                     threadUnreadCounts={threadUnreadCounts}
                     unfollowThreadById={unfollowThreadById}
+                    scrollContainerRef={scrollContainerRef}
+                    onItems={handleItems}
+                    onVirtualizer={handleVirtualizer}
                   />
                 </div>
               ) : null}
