@@ -34,6 +34,13 @@ type UseAnchoredScrollOptions = {
    *  debouncing, and post-prepend scroll restoration via the anchor. */
   fetchOlder?: () => Promise<void>;
   hasOlderMessages?: boolean;
+  /** True while an older-history fetch is in flight. The fetch spinner renders
+   *  above the anchor, so toggling it shifts every row below it. The spinner
+   *  toggles on its own commit (no message change), so without this signal the
+   *  restoration effect — keyed on `messages` — wouldn't re-run to correct the
+   *  shift, leaving a visible one-frame jump. Threading it through makes the
+   *  anchor the single owner of every layout change above the reader's eye. */
+  isFetchingOlder?: boolean;
   /** When set, scroll to and highlight this message on mount and on change. */
   targetMessageId?: string | null;
   onTargetReached?: (messageId: string) => void;
@@ -142,6 +149,7 @@ export function useAnchoredScroll({
   messages,
   fetchOlder,
   hasOlderMessages = false,
+  isFetchingOlder = false,
   targetMessageId = null,
   onTargetReached,
 }: UseAnchoredScrollOptions): UseAnchoredScrollResult {
@@ -272,6 +280,7 @@ export function useAnchoredScroll({
   // before the render. This is the single mechanism for keeping scroll
   // stable across prepends, appends, image loads, embed expansions, etc.
   // ---------------------------------------------------------------------------
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `isFetchingOlder` is an intentional re-run trigger, not a read — the fetch spinner renders above the anchor on its own commit (with `messages` unchanged), so we re-run restoration on its toggle to correct the spinner-induced shift via the existing anchor.
   React.useLayoutEffect(() => {
     const container = scrollContainerRef.current;
     if (!container) return;
@@ -388,6 +397,7 @@ export function useAnchoredScroll({
     prevLastMessageIdRef.current = lastMessage?.id;
     prevMessageCountRef.current = messages.length;
   }, [
+    isFetchingOlder,
     isLoading,
     messages,
     onTargetReached,

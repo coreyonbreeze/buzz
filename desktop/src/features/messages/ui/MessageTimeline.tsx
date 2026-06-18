@@ -215,6 +215,7 @@ const MessageTimelineBase = React.forwardRef<
     contentRef,
     fetchOlder,
     hasOlderMessages,
+    isFetchingOlder,
     isLoading: showTimelineSkeleton,
     messages: deferredMessages,
     onTargetReached,
