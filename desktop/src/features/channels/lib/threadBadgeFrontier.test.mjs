@@ -4,6 +4,7 @@ import test from "node:test";
 import { nextThreadBadgeFrontier } from "./threadBadgeFrontier.ts";
 import { seedThreadBadgeFrontiers } from "./threadBadgeFrontier.ts";
 import { buildDirectRepliesByParentId } from "./subtreeCreatedAt.ts";
+import { computeThreadBadgeCounts } from "./threadBadgeCounts.ts";
 
 const msg = (id, parentId) => ({ id, parentId });
 const seedAll = () => true;
@@ -95,4 +96,86 @@ test("seedThreadBadgeFrontiers_reseed_advancesMonotonically", () => {
   // A stale lower marker never lowers an already-advanced snapshot.
   seed(frontiers, messages, seedAll, () => 100);
   assert.equal(frontiers.get("root"), 250);
+});
+
+// --- LP4 Case 3 demonstration: seed-vs-mark-read race poisons the frontier ---
+//
+// seedThreadBadgeFrontiers seeds each root via getReadAt(root), which resolves
+// to the EFFECTIVE thread marker = max(thread_own_marker, channel_marker).
+// On channel open, markChannelRead advances the channel marker to the newest
+// top-level message. If that fold lands before (or in) the render where a root
+// is first seeded, the seed adopts a frontier PAST the unread reply, and
+// computeThreadBadgeCounts then reads zero unread — the badge vanishes
+// everywhere. What the seed READS (folded vs. pre-mark-read marker) is the sole
+// determinant; the seed/compute mechanics are otherwise identical.
+//
+// These tests drive seed -> compute end-to-end and pass against TODAY's code.
+// The first DOCUMENTS THE DEFECT (folded marker -> no badge); the second is the
+// pre-mark-read control (own marker -> badge survives).
+
+// Richer message shape than the file-level `msg`: computeThreadBadgeCounts reads
+// createdAt and pubkey, which the frontier-only helper omits.
+const reply = (id, parentId, createdAt) => ({
+  id,
+  parentId,
+  createdAt,
+  pubkey: "author",
+});
+
+test("seedThreadBadgeFrontiers_channelMarkerFoldedIntoSeed_badgeVanishes_DEFECT", () => {
+  // Thread "root" has one unread reply at createdAt 200. The thread's OWN read
+  // marker is 100 (reply is genuinely unread). But channel-open mark-read has
+  // already advanced the channel marker to 250, so the EFFECTIVE marker
+  // getReadAt returns is max(100, 250) = 250.
+  const messages = [reply("root", null, 50), reply("r1", "root", 200)];
+  const directReplies = buildDirectRepliesByParentId(messages);
+  const foldedEffectiveMarker = Math.max(100, 250); // thread_own vs channel
+
+  const frontiers = new Map();
+  seedThreadBadgeFrontiers(
+    frontiers,
+    messages,
+    directReplies,
+    seedAll,
+    () => foldedEffectiveMarker,
+  );
+  // DEFECT: frontier seeded to 250, past the unread reply at 200.
+  assert.equal(frontiers.get("root"), 250);
+
+  const result = computeThreadBadgeCounts(
+    messages,
+    directReplies,
+    frontiers,
+    seedAll,
+  );
+  // DEFECT: badge vanishes — no count anywhere despite a genuinely unread reply.
+  assert.equal(result.has("root"), false);
+});
+
+test("seedThreadBadgeFrontiers_preMarkReadMarkerSeeded_badgeSurvives_DESIRED", () => {
+  // Identical thread, but the seed reads the PRE-mark-read marker: the thread's
+  // own marker (100), captured before the channel-open fold advanced it to 250.
+  const messages = [reply("root", null, 50), reply("r1", "root", 200)];
+  const directReplies = buildDirectRepliesByParentId(messages);
+  const preMarkReadMarker = 100; // thread_own only, channel fold not applied
+
+  const frontiers = new Map();
+  seedThreadBadgeFrontiers(
+    frontiers,
+    messages,
+    directReplies,
+    seedAll,
+    () => preMarkReadMarker,
+  );
+  // Frontier seeded to 100, behind the unread reply at 200.
+  assert.equal(frontiers.get("root"), 100);
+
+  const result = computeThreadBadgeCounts(
+    messages,
+    directReplies,
+    frontiers,
+    seedAll,
+  );
+  // DESIRED: badge survives — the reply at 200 is correctly counted unread.
+  assert.equal(result.get("root"), 1);
 });
