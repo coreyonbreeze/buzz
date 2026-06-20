@@ -61,3 +61,15 @@ jobs:
           gh workflow run release.yml \
             -f version="$VERSION" \
             -f ref="v$VERSION"
+
+      - name: Trigger Docker image build
+        # docker.yml's on:push:tags trigger never fires for this tag because
+        # the tag was pushed with GITHUB_TOKEN (recursion guard). Dispatch it
+        # explicitly with version+ref, same as the release build above.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ env.version }}
+        run: |
+          gh workflow run docker.yml \
+            -f version="$VERSION" \
+            -f ref="v$VERSION"

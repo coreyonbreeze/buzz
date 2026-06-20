@@ -12,7 +12,18 @@ name: Docker image
 #   - push to main         → :main + :sha-<7>
 #   - push tags v*.*.*     → :latest + :{version} + :{major}.{minor} + :{major}
 #   - pull_request         → build only (no push), cache stays warm
-#   - workflow_dispatch    → manual canary
+#   - workflow_dispatch    → manual canary, or release-tag dispatch with
+#                            version+ref inputs (auto-tag rescues the dead
+#                            push:tags trigger this way — see below)
+#
+# Why workflow_dispatch carries version/ref inputs:
+#   auto-tag-on-release-pr-merge.yml pushes the release tag with the default
+#   GITHUB_TOKEN, which GitHub deliberately does NOT let fire on:push triggers
+#   (recursion guard). So the push:tags trigger above never runs for releases.
+#   auto-tag instead dispatches this workflow with the version + tag ref, the
+#   same rescue release.yml already uses. On dispatch github.ref is `main`, so
+#   the tag ref must be plumbed through explicitly: checkout pins to inputs.ref,
+#   and the semver tags take inputs.version via metadata-action `value=`.
 
 on:
   push:
@@ -33,6 +44,14 @@ on:
       - "pnpm-workspace.yaml"
       - "patches/**"
   workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver version e.g. 0.3.26 (no v prefix) — for tag-release dispatch"
+        required: false
+      ref:
+        description: "Tag/branch/SHA to build, e.g. v0.3.26"
+        required: false
+        default: main
 
 # One image build per ref; cancel superseded PR builds, but never cancel
 # tag/main builds (publishing must not be aborted mid-flight).
@@ -77,6 +96,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
         with:
+          # On workflow_dispatch (release-tag rescue) build the tagged commit,
+          # not main. Empty string = default ref for push/PR events.
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.ref || '' }}
           persist-credentials: false
 
       - name: Set up Docker Buildx
@@ -108,9 +130,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=semver,pattern={{major}},value=${{ inputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
           labels: |
             org.opencontainers.image.title=Buzz
@@ -189,9 +211,9 @@ jobs:
           tags: |
             type=ref,event=branch
             type=sha,prefix=sha-,format=short
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
+            type=semver,pattern={{version}},value=${{ inputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.version }}
+            type=semver,pattern={{major}},value=${{ inputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Create and push manifest list
