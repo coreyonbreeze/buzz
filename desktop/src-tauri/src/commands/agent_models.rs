@@ -6,12 +6,12 @@ use tauri::{AppHandle, State};
 use crate::{
     app_state::AppState,
     managed_agents::{
-        AgentModelInfo, AgentModelsResponse, ManagedAgentRecord, UpdateManagedAgentRequest,
-        UpdateManagedAgentResponse, build_managed_agent_summary, default_agent_workdir,
-        find_managed_agent_mut, known_acp_runtime, load_managed_agents, load_personas,
-        managed_agent_avatar_url, missing_command_message, normalize_agent_args, resolve_command,
+        build_managed_agent_summary, default_agent_workdir, find_managed_agent_mut,
+        known_acp_runtime, load_managed_agents, load_personas, managed_agent_avatar_url,
+        missing_command_message, normalize_agent_args, resolve_command,
         resolve_effective_prompt_model_provider, save_managed_agents, sync_managed_agent_processes,
-        try_regenerate_nest,
+        try_regenerate_nest, AgentModelInfo, AgentModelsResponse, ManagedAgentRecord,
+        UpdateManagedAgentRequest, UpdateManagedAgentResponse,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
