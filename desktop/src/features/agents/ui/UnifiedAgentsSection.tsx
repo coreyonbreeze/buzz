@@ -14,7 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
-import { Skeleton } from "@/shared/ui/skeleton";
+import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 
@@ -408,19 +408,18 @@ function NewAgentCard({
 function LoadingSkeleton() {
   return (
     <div className={AGENT_CARD_GRID_CLASS}>
-      {["a", "b", "c"].map((k) => (
-        <div
-          className="flex aspect-[5/7] w-full max-w-[240px] flex-col items-center justify-center rounded-lg border border-border/70 bg-card p-5"
-          key={k}
-        >
-          <div className="relative">
-            <Skeleton className="h-32 w-32 rounded-full" />
-            <Skeleton className="-translate-x-1/2 absolute bottom-0 left-1/2 h-8 w-24 rounded-full" />
-          </div>
-          <Skeleton className="mt-10 h-4 w-40 max-w-full" />
-          <Skeleton className="mt-2 h-4 w-32 max-w-full" />
-        </div>
-      ))}
+      <IdentityCardSkeleton
+        footerSubtitleWidthClass="w-14"
+        footerTitleWidthClass="w-24"
+      />
+      <IdentityCardSkeleton
+        footerSubtitleWidthClass="w-20"
+        footerTitleWidthClass="w-32"
+      />
+      <IdentityCardSkeleton
+        footerSubtitleWidthClass="w-16"
+        footerTitleWidthClass="w-28"
+      />
     </div>
   );
 }

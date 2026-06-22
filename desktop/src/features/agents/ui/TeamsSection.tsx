@@ -19,8 +19,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/shared/ui/dropdown-menu";
-import { Card } from "@/shared/ui/card";
-import { Skeleton } from "@/shared/ui/skeleton";
+import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { TeamIdentityCard } from "./TeamIdentityCard";
 
@@ -102,20 +101,27 @@ export function TeamsSection({
 
       {isLoading ? (
         <div className={TEAM_CARD_GRID_CLASS}>
-          {["first", "second", "third"].map((key) => (
-            <Card className="aspect-[4/5] overflow-hidden p-0" key={key}>
-              <div className="relative h-full bg-muted/50">
-                <Skeleton className="absolute top-4 right-4 h-6 w-6 rounded-full" />
-                <Skeleton className="absolute top-[28%] left-[22%] h-16 w-16 rounded-full" />
-                <Skeleton className="absolute top-[22%] right-[20%] h-20 w-20 rounded-full" />
-                <Skeleton className="absolute top-[42%] left-[32%] h-24 w-24 rounded-full" />
-                <div className="absolute right-3 bottom-3 left-3 flex flex-col gap-1">
-                  <Skeleton className="h-5 w-28" />
-                  <Skeleton className="h-4 w-16" />
-                </div>
-              </div>
-            </Card>
-          ))}
+          <IdentityCardSkeleton
+            footerSubtitleWidthClass="w-14"
+            footerTitleWidthClass="w-24"
+            kind="stack"
+            showAction
+            stackCount={1}
+          />
+          <IdentityCardSkeleton
+            footerSubtitleWidthClass="w-24"
+            footerTitleWidthClass="w-32"
+            kind="stack"
+            showAction
+            stackCount={3}
+          />
+          <IdentityCardSkeleton
+            footerSubtitleWidthClass="w-20"
+            footerTitleWidthClass="w-28"
+            kind="stack"
+            showAction
+            stackCount={5}
+          />
         </div>
       ) : null}
 
