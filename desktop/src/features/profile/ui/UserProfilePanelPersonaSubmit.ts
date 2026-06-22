@@ -27,6 +27,42 @@ type SubmitProfilePersonaDialogOptions = {
   updatePersona: (input: UpdatePersonaInput) => Promise<AgentPersona>;
 };
 
+type ValidateLinkedAgentRuntimeEditOptions = {
+  input: UpdatePersonaInput;
+  managedAgent: ManagedAgent | undefined;
+  previousPersona?: AgentPersona;
+  runtimes?: readonly AcpRuntimeCatalogEntry[];
+};
+
+function normalizeRuntimePreference(value: string | null | undefined): string {
+  return value?.trim() ?? "";
+}
+
+export function validateLinkedAgentRuntimeEdit({
+  input,
+  managedAgent,
+  previousPersona,
+  runtimes,
+}: ValidateLinkedAgentRuntimeEditOptions): string | null {
+  if (!managedAgent || !previousPersona) {
+    return null;
+  }
+
+  const previousRuntime = normalizeRuntimePreference(previousPersona.runtime);
+  const nextRuntime = normalizeRuntimePreference(input.runtime);
+  if (previousRuntime === nextRuntime) {
+    return null;
+  }
+
+  const runtime = runtimes?.find((candidate) => candidate.id === nextRuntime);
+  if (runtime?.availability === "available" && runtime.command) {
+    return null;
+  }
+
+  const runtimeLabel = runtime?.label ?? "This provider";
+  return `${runtimeLabel} is not available. Install it before saving this linked agent.`;
+}
+
 export async function submitProfilePersonaDialog({
   createManagedAgentForPersona,
   createPersona,
@@ -40,6 +76,17 @@ export async function submitProfilePersonaDialog({
 }: SubmitProfilePersonaDialogOptions) {
   try {
     if ("id" in input) {
+      const runtimeEditError = validateLinkedAgentRuntimeEdit({
+        input,
+        managedAgent,
+        previousPersona,
+        runtimes,
+      });
+      if (runtimeEditError) {
+        toast.error(runtimeEditError);
+        return;
+      }
+
       const persona = await updatePersona(input);
       const agentUpdate = managedAgent
         ? personaManagedAgentUpdate(managedAgent, persona, {

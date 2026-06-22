@@ -437,6 +437,7 @@ type RawPersona = {
   name_pool?: string[];
   is_builtin: boolean;
   is_active: boolean;
+  source_team?: string | null;
   env_vars?: Record<string, string>;
   created_at: string;
   updated_at: string;
@@ -4785,6 +4786,7 @@ async function handleCreatePersona(args: {
     name_pool: [...(args.input.namePool ?? [])],
     is_builtin: false,
     is_active: true,
+    source_team: null,
     env_vars: { ...(args.input.envVars ?? {}) },
     created_at: now,
     updated_at: now,
@@ -4839,6 +4841,11 @@ async function handleDeletePersona(args: { id: string }): Promise<void> {
   }
   if (persona.is_builtin) {
     throw new Error("Built-in personas cannot be deleted.");
+  }
+  if (persona.source_team) {
+    throw new Error(
+      `${persona.display_name} belongs to a team. Delete the team to remove all team personas together.`,
+    );
   }
   if (mockTeams.some((team) => team.persona_ids.includes(args.id))) {
     throw new Error(

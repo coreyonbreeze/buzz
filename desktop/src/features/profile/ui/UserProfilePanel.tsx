@@ -583,6 +583,12 @@ export function UserProfilePanel({
 
   const handleConfirmDeletePersona = React.useCallback(
     async (personaToConfirm: AgentPersona) => {
+      if (personaToConfirm.sourceTeam) {
+        toast.error("This agent is managed by a team.");
+        setPersonaToDelete(null);
+        return;
+      }
+
       try {
         const deletedInstances =
           await deleteManagedAgentsForPersona(personaToConfirm);
