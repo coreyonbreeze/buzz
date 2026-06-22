@@ -135,6 +135,29 @@ export function buildPersonaDraftProfile(persona: AgentPersona): Profile {
   };
 }
 
+export function resolveProfileAvatarUrl(
+  ...candidates: Array<string | null | undefined>
+): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
+}
+
+export function withProfileAvatarFallback(
+  profile: Profile | undefined,
+  ...fallbackAvatarUrls: Array<string | null | undefined>
+): Profile | undefined {
+  const avatarUrl = resolveProfileAvatarUrl(
+    profile?.avatarUrl,
+    ...fallbackAvatarUrls,
+  );
+  return profile && avatarUrl !== profile.avatarUrl
+    ? { ...profile, avatarUrl }
+    : profile;
+}
+
 export function resolveProfileDisplayName({
   persona,
   profile,

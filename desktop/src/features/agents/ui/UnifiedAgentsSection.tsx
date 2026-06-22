@@ -252,7 +252,11 @@ function AgentPersonaCard({
   const modelLabel = formatAgentModelLabel(agent?.model ?? persona.model);
   const profileQuery = useUserProfileQuery(agent?.pubkey);
   const avatarUrl = agent
-    ? (profileQuery.data?.avatarUrl ?? agent.avatarUrl ?? persona.avatarUrl)
+    ? firstAvatarUrl(
+        profileQuery.data?.avatarUrl,
+        agent.avatarUrl,
+        persona.avatarUrl,
+      )
     : persona.avatarUrl;
 
   return (
@@ -286,7 +290,7 @@ function StandaloneAgentCard({
   return (
     <AgentIdentityCard
       ariaLabel={`${title} agent profile`}
-      avatarUrl={profileQuery.data?.avatarUrl ?? agent.avatarUrl}
+      avatarUrl={firstAvatarUrl(profileQuery.data?.avatarUrl, agent.avatarUrl)}
       dataTestId={`managed-agent-${agent.pubkey}`}
       label={title}
       modelLabel={formatAgentModelLabel(agent.model)}
@@ -298,6 +302,16 @@ function StandaloneAgentCard({
 function formatAgentModelLabel(model: string | null | undefined) {
   const trimmed = model?.trim();
   return trimmed && trimmed.length > 0 ? trimmed : "Auto";
+}
+
+function firstAvatarUrl(
+  ...candidates: Array<string | null | undefined>
+): string | null {
+  for (const candidate of candidates) {
+    const trimmed = candidate?.trim();
+    if (trimmed) return trimmed;
+  }
+  return null;
 }
 
 function SectionHeader({

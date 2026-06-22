@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { Link, Users } from "lucide-react";
 
+import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type { AgentPersona } from "@/shared/api/types";
 import { Card } from "@/shared/ui/card";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
@@ -127,36 +128,79 @@ function TeamAvatarCluster({
         role="img"
       >
         {items.map((item, index) => (
-          <div
-            data-team-cluster-item="avatar"
+          <TeamClusterItem
+            index={index}
+            isMasked={index < items.length - 1}
+            item={item}
             key={item.kind === "persona" ? item.persona.id : "overflow"}
-            style={{
-              height: size,
-              marginLeft: index > 0 ? -overlap : 0,
-              width: size,
-              zIndex: index + 1,
-              ...(index < items.length - 1
-                ? {
-                    WebkitMask: `radial-gradient(circle ${maskRadius}px at calc(100% + ${maskOffset}px) 50%, transparent 99%, #fff 100%)`,
-                    mask: `radial-gradient(circle ${maskRadius}px at calc(100% + ${maskOffset}px) 50%, transparent 99%, #fff 100%)`,
-                  }
-                : null),
-            }}
-          >
-            {item.kind === "persona" ? (
-              <IdentityInitialsAvatar
-                colorIndex={index}
-                label={item.persona.displayName}
-                size={size}
-              />
-            ) : (
-              <span className="flex h-full w-full items-center justify-center rounded-full border-[3px] border-background bg-card text-base font-semibold text-muted-foreground shadow-sm">
-                +{item.count}
-              </span>
-            )}
-          </div>
+            maskOffset={maskOffset}
+            maskRadius={maskRadius}
+            overlap={overlap}
+            size={size}
+          />
         ))}
       </div>
+    </div>
+  );
+}
+
+function TeamClusterItem({
+  index,
+  isMasked,
+  item,
+  maskOffset,
+  maskRadius,
+  overlap,
+  size,
+}: {
+  index: number;
+  isMasked: boolean;
+  item: ClusterItem;
+  maskOffset: number;
+  maskRadius: number;
+  overlap: number;
+  size: number;
+}) {
+  const avatarUrl =
+    item.kind === "persona" ? (item.persona.avatarUrl?.trim() ?? null) : null;
+
+  return (
+    <div
+      data-team-cluster-item="avatar"
+      style={{
+        height: size,
+        marginLeft: index > 0 ? -overlap : 0,
+        width: size,
+        zIndex: index + 1,
+        ...(isMasked
+          ? {
+              WebkitMask: `radial-gradient(circle ${maskRadius}px at calc(100% + ${maskOffset}px) 50%, transparent 99%, #fff 100%)`,
+              mask: `radial-gradient(circle ${maskRadius}px at calc(100% + ${maskOffset}px) 50%, transparent 99%, #fff 100%)`,
+            }
+          : null),
+      }}
+    >
+      {item.kind === "persona" ? (
+        avatarUrl ? (
+          <ProfileAvatar
+            avatarUrl={avatarUrl}
+            className="h-full w-full border-[3px] border-background bg-muted shadow-sm"
+            iconClassName="h-8 w-8"
+            label={item.persona.displayName}
+            testId={`team-member-avatar-${item.persona.id}`}
+          />
+        ) : (
+          <IdentityInitialsAvatar
+            colorIndex={index}
+            label={item.persona.displayName}
+            size={size}
+          />
+        )
+      ) : (
+        <span className="flex h-full w-full items-center justify-center rounded-full border-[3px] border-background bg-card text-base font-semibold text-muted-foreground shadow-sm">
+          +{item.count}
+        </span>
+      )}
     </div>
   );
 }

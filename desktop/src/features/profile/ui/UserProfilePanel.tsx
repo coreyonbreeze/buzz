@@ -77,6 +77,7 @@ import {
   resolveProfileDisplayName,
   type UserProfilePanelProps,
   useRetainedPersona,
+  withProfileAvatarFallback,
 } from "@/features/profile/ui/UserProfilePanelUtils";
 import { useUserStatusQuery } from "@/features/user-status/hooks";
 import { useAgentSession } from "@/shared/context/AgentSessionContext";
@@ -224,16 +225,15 @@ export function UserProfilePanel({
   const unfollowMutation = useUnfollowMutation(currentPubkey);
   const { onOpenAgentSession } = useAgentSession();
   const { goChannel } = useAppNavigation();
-
   const profile = React.useMemo(() => {
     const baseProfile =
       profileQuery.data ??
       (resolvedPersona ? buildPersonaDraftProfile(resolvedPersona) : undefined);
-    const fallbackAvatarUrl =
-      managedAgent?.avatarUrl ?? resolvedPersona?.avatarUrl ?? null;
-    return baseProfile && !baseProfile.avatarUrl && fallbackAvatarUrl
-      ? { ...baseProfile, avatarUrl: fallbackAvatarUrl }
-      : baseProfile;
+    return withProfileAvatarFallback(
+      baseProfile,
+      managedAgent?.avatarUrl,
+      resolvedPersona?.avatarUrl,
+    );
   }, [managedAgent?.avatarUrl, profileQuery.data, resolvedPersona]);
   const presenceStatus = pubkeyLower
     ? presenceQuery.data?.[pubkeyLower]
