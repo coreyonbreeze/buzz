@@ -14,19 +14,30 @@ pub async fn cmd_create_repo(
     clone_urls: &[String],
     web_url: Option<&str>,
     relays: &[String],
+    project_channel: Option<&str>,
+    status: Option<&str>,
+    default_branch: Option<&str>,
+    contributors: &[String],
 ) -> Result<(), CliError> {
     validate_repo_id(repo_id)?;
 
     let clone_refs: Vec<&str> = clone_urls.iter().map(|s| s.as_str()).collect();
     let relay_refs: Vec<&str> = relays.iter().map(|s| s.as_str()).collect();
+    let contributor_refs: Vec<&str> = contributors.iter().map(|s| s.as_str()).collect();
 
-    let builder = buzz_sdk::build_repo_announcement(
+    let builder = buzz_sdk::build_repo_announcement_with_project_meta(
         repo_id,
         name,
         description,
         &clone_refs,
         web_url,
         &relay_refs,
+        buzz_sdk::RepoProjectMeta {
+            project_channel_id: project_channel,
+            status,
+            default_branch,
+            contributors: contributor_refs,
+        },
     )
     .map_err(|e| CliError::Other(format!("build_repo_announcement failed: {e}")))?;
 
@@ -110,6 +121,10 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
             clone_urls,
             web,
             relays,
+            project_channel,
+            status,
+            default_branch,
+            contributors,
         } => {
             cmd_create_repo(
                 client,
@@ -119,6 +134,10 @@ pub async fn dispatch(cmd: crate::ReposCmd, client: &BuzzClient) -> Result<(), C
                 &clone_urls,
                 web.as_deref(),
                 &relays,
+                project_channel.as_deref(),
+                Some(&status),
+                Some(&default_branch),
+                &contributors,
             )
             .await
         }

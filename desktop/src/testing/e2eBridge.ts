@@ -15,6 +15,10 @@ import {
 import {
   KIND_DM_VISIBILITY,
   KIND_EVENT_REMINDER,
+  KIND_GIT_ISSUE,
+  KIND_GIT_STATUS_MERGED,
+  KIND_REPO_ANNOUNCEMENT,
+  KIND_REPO_STATE,
   KIND_STREAM_MESSAGE_EDIT,
   KIND_SYSTEM_MESSAGE,
   KIND_USER_STATUS,
@@ -465,6 +469,7 @@ type MockSubscription = {
 };
 
 type MockFilter = {
+  "#a"?: string[];
   "#d"?: string[];
   "#e"?: string[];
   "#h"?: string[];
@@ -703,6 +708,10 @@ const OUTSIDER_PUBKEY =
 const PROFILE_ONLY_AGENT_PUBKEY =
   "8f83d6b7f3d74f7d933ae3a54dd8c6cc85c7f98e531c16e5a827b953441a8d67";
 const MOCK_IDENTITY_PUBKEY = DEFAULT_MOCK_IDENTITY.pubkey;
+const MOCK_PROJECT_REPO_ID = "sprout-invaders";
+const MOCK_PROJECT_REPO_ADDRESS = `30617:${MOCK_IDENTITY_PUBKEY}:${MOCK_PROJECT_REPO_ID}`;
+const MOCK_PROJECT_CHANNEL_ID = "3c2d9f0a-1b44-5e77-9a21-6f8b0c4d2e91";
+const MOCK_PROJECT_ISSUE_ID = "f00dbabe".repeat(8);
 
 const mockDisplayNames = new Map<string, string>([
   [MOCK_IDENTITY_PUBKEY, DEFAULT_MOCK_IDENTITY.display_name],
@@ -2855,6 +2864,103 @@ function createMockEvent(
     content,
     sig: "mocksig".repeat(20).slice(0, 128),
   };
+}
+
+function createMockProjectEvents(): RelayEvent[] {
+  const createdAt = Math.floor(Date.now() / 1000) - 24 * 60 * 60;
+  return [
+    createMockEvent(
+      KIND_REPO_ANNOUNCEMENT,
+      "A Buzz-hosted Git project for testing project workflows, code discussion, and agent progress.",
+      [
+        ["d", MOCK_PROJECT_REPO_ID],
+        ["name", "Sprout Invaders"],
+        [
+          "description",
+          "A Buzz-hosted Git project for testing project workflows, code discussion, and agent progress.",
+        ],
+        [
+          "clone",
+          `${DEFAULT_RELAY_HTTP_URL}/git/${MOCK_IDENTITY_PUBKEY}/${MOCK_PROJECT_REPO_ID}`,
+        ],
+        ["h", MOCK_PROJECT_CHANNEL_ID],
+        ["status", "active"],
+        ["default-branch", "main"],
+        ["p", ALICE_PUBKEY],
+        ["p", BOB_PUBKEY],
+      ],
+      MOCK_IDENTITY_PUBKEY,
+      createdAt,
+      "1000000000000000000000000000000000000000000000000000000000000001",
+    ),
+    createMockEvent(
+      KIND_REPO_STATE,
+      "",
+      [
+        ["d", MOCK_PROJECT_REPO_ID],
+        ["HEAD", "ref: refs/heads/main"],
+        ["refs/heads/main", "1111111111111111111111111111111111111111"],
+        [
+          "refs/heads/agent/ui-project-hub",
+          "2222222222222222222222222222222222222222",
+        ],
+        ["refs/tags/v0.1.0", "3333333333333333333333333333333333333333"],
+      ],
+      MOCK_IDENTITY_PUBKEY,
+      createdAt + 60,
+      "1000000000000000000000000000000000000000000000000000000000000002",
+    ),
+    createMockEvent(
+      KIND_GIT_ISSUE,
+      "Give the project hub enough structure for humans and agents to coordinate code work.",
+      [
+        ["a", MOCK_PROJECT_REPO_ADDRESS],
+        ["p", MOCK_IDENTITY_PUBKEY],
+        ["subject", "Design the project work hub"],
+        ["t", "Feature"],
+        ["t", "Frontend"],
+      ],
+      ALICE_PUBKEY,
+      createdAt + 120,
+      MOCK_PROJECT_ISSUE_ID,
+    ),
+    createMockEvent(
+      KIND_GIT_STATUS_MERGED,
+      "Initial hub structure is ready for review.",
+      [
+        ["e", MOCK_PROJECT_ISSUE_ID, "", "root"],
+        ["a", MOCK_PROJECT_REPO_ADDRESS],
+        ["p", ALICE_PUBKEY],
+      ],
+      BOB_PUBKEY,
+      createdAt + 180,
+      "1000000000000000000000000000000000000000000000000000000000000003",
+    ),
+  ];
+}
+
+function filterMockProjectEvents(filter: MockFilter): RelayEvent[] {
+  const authors = filter.authors?.map((author) => author.toLowerCase());
+  const dTags = filter["#d"];
+  const aTags = filter["#a"];
+
+  return createMockProjectEvents().filter((event) => {
+    if (filter.kinds && !filter.kinds.includes(event.kind)) return false;
+    if (authors && !authors.includes(event.pubkey.toLowerCase())) return false;
+    if (
+      dTags &&
+      !event.tags.some((tag) => tag[0] === "d" && dTags.includes(tag[1]))
+    ) {
+      return false;
+    }
+    if (
+      aTags &&
+      !event.tags.some((tag) => tag[0] === "a" && aTags.includes(tag[1]))
+    ) {
+      return false;
+    }
+    return true;
+  });
 }
 
 async function signWithIdentity(
@@ -5957,6 +6063,23 @@ function sendToMockSocket(args: {
       const authors = filter.authors?.map((a) => a.toLowerCase());
       for (const event of mockReminderEvents) {
         if (authors && !authors.includes(event.pubkey.toLowerCase())) continue;
+        sendWsText(socket.handler, ["EVENT", subId, event]);
+      }
+      sendWsText(socket.handler, ["EOSE", subId]);
+      return;
+    }
+
+    if (
+      filter.kinds?.some((kind) =>
+        [
+          KIND_REPO_ANNOUNCEMENT,
+          KIND_REPO_STATE,
+          KIND_GIT_ISSUE,
+          KIND_GIT_STATUS_MERGED,
+        ].includes(kind),
+      )
+    ) {
+      for (const event of filterMockProjectEvents(filter)) {
         sendWsText(socket.handler, ["EVENT", subId, event]);
       }
       sendWsText(socket.handler, ["EOSE", subId]);

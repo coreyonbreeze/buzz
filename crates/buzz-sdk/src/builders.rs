@@ -238,6 +238,70 @@ pub fn build_message(
     Ok(EventBuilder::new(Kind::Custom(9), content).tags(tags))
 }
 
+/// Project context tags for agent and human project discussion messages.
+#[derive(Default)]
+pub struct ProjectMessageMeta<'a> {
+    /// Optional NIP-34 repo address (`30617:<owner>:<repo-id>`).
+    pub repo_address: Option<&'a str>,
+    /// Optional issue/event id this message discusses.
+    pub issue_id: Option<&'a str>,
+    /// Optional working branch name.
+    pub branch: Option<&'a str>,
+    /// Optional NIP-34 patch event id.
+    pub patch_id: Option<&'a str>,
+}
+
+/// Build a channel message with Buzz project context tags.
+pub fn build_project_message(
+    channel_id: Uuid,
+    content: &str,
+    thread_ref: Option<&ThreadRef>,
+    mentions: &[&str],
+    broadcast: bool,
+    media_tags: &[Vec<String>],
+    project_meta: ProjectMessageMeta<'_>,
+) -> Result<EventBuilder, SdkError> {
+    check_content(content, 64 * 1024)?;
+    let mut tags = vec![tag(&["h", &channel_id.to_string()])?];
+    if let Some(tr) = thread_ref {
+        thread_tags(tr, &mut tags)?;
+    }
+    mention_tags(mentions, &mut tags)?;
+    if broadcast {
+        tags.push(tag(&["broadcast", "1"])?);
+    }
+    if let Some(repo_address) = project_meta.repo_address {
+        let parts: Vec<&str> = repo_address.split(':').collect();
+        if parts.len() != 3 || parts[0] != "30617" {
+            return Err(SdkError::InvalidInput(
+                "repo_address must be 30617:<owner>:<repo-id>".into(),
+            ));
+        }
+        check_pubkey_hex(parts[1], "repo_address owner")?;
+        check_repo_id(parts[2])?;
+        tags.push(tag(&["a", repo_address])?);
+    }
+    if let Some(issue_id) = project_meta.issue_id {
+        let issue_id = check_hex_exact(issue_id, 64, "issue_id")?;
+        tags.push(tag(&["e", &issue_id, "", "root"])?);
+    }
+    if let Some(branch) = project_meta.branch {
+        if branch.is_empty() || branch.len() > 128 {
+            return Err(SdkError::InvalidInput(format!(
+                "branch must be 1-128 characters (got {})",
+                branch.len()
+            )));
+        }
+        tags.push(tag(&["branch", branch])?);
+    }
+    if let Some(patch_id) = project_meta.patch_id {
+        let patch_id = check_hex_exact(patch_id, 64, "patch_id")?;
+        tags.push(tag(&["patch", &patch_id])?);
+    }
+    imeta_tags(media_tags, &mut tags)?;
+    Ok(EventBuilder::new(Kind::Custom(9), content).tags(tags))
+}
+
 // ── Builder: build_agent_observer_frame ─────────────────────────────────────
 
 /// Build an encrypted agent observer frame (kind 24200).
@@ -332,6 +396,19 @@ pub fn build_diff_message(
     if let Some(ref pc) = diff_meta.parent_commit {
         check_hex_len(pc, 7, "parent_commit")?;
     }
+    if let Some(ref repo_address) = diff_meta.repo_address {
+        let parts: Vec<&str> = repo_address.split(':').collect();
+        if parts.len() != 3 || parts[0] != "30617" {
+            return Err(SdkError::InvalidDiffMeta(
+                "repo_address must be 30617:<owner>:<repo-id>".into(),
+            ));
+        }
+        check_pubkey_hex(parts[1], "repo_address owner")?;
+        check_repo_id(parts[2])?;
+    }
+    if let Some(ref issue_id) = diff_meta.issue_id {
+        check_hex_exact(issue_id, 64, "issue_id")?;
+    }
     match &diff_meta.branch {
         Some((src, tgt)) if src.is_empty() || tgt.is_empty() => {
             return Err(SdkError::InvalidDiffMeta(
@@ -358,6 +435,12 @@ pub fn build_diff_message(
     }
     if let Some(ref pc) = diff_meta.parent_commit {
         tags.push(tag(&["parent-commit", pc])?);
+    }
+    if let Some(ref repo_address) = diff_meta.repo_address {
+        tags.push(tag(&["a", repo_address])?);
+    }
+    if let Some(ref issue_id) = diff_meta.issue_id {
+        tags.push(tag(&["e", issue_id, "", "root"])?);
     }
     if let Some((ref src, ref tgt)) = diff_meta.branch {
         tags.push(tag(&["branch", src, tgt])?);
@@ -854,6 +937,40 @@ pub fn build_repo_announcement(
     web_url: Option<&str>,
     relays: &[&str],
 ) -> Result<EventBuilder, SdkError> {
+    build_repo_announcement_with_project_meta(
+        repo_id,
+        name,
+        description,
+        clone_urls,
+        web_url,
+        relays,
+        RepoProjectMeta::default(),
+    )
+}
+
+/// Buzz project metadata carried on a NIP-34 repo announcement.
+#[derive(Default)]
+pub struct RepoProjectMeta<'a> {
+    /// Linked NIP-29 project discussion channel id (`h` tag).
+    pub project_channel_id: Option<&'a str>,
+    /// Project lifecycle status, e.g. `active`, `paused`, or `done`.
+    pub status: Option<&'a str>,
+    /// Human-facing default branch name.
+    pub default_branch: Option<&'a str>,
+    /// Contributor pubkeys to include as `p` tags.
+    pub contributors: Vec<&'a str>,
+}
+
+/// Build a git repository announcement with Buzz project metadata.
+pub fn build_repo_announcement_with_project_meta(
+    repo_id: &str,
+    name: Option<&str>,
+    description: Option<&str>,
+    clone_urls: &[&str],
+    web_url: Option<&str>,
+    relays: &[&str],
+    project_meta: RepoProjectMeta<'_>,
+) -> Result<EventBuilder, SdkError> {
     // Validate repo_id
     check_repo_id(repo_id)?;
 
@@ -933,6 +1050,32 @@ pub fn build_repo_announcement(
             )));
         }
     }
+    if let Some(channel_id) = project_meta.project_channel_id {
+        if uuid::Uuid::parse_str(channel_id).is_err() {
+            return Err(SdkError::InvalidInput(format!(
+                "project_channel_id must be a UUID (got {channel_id:?})"
+            )));
+        }
+    }
+    if let Some(status) = project_meta.status {
+        if status.is_empty() || status.len() > 32 {
+            return Err(SdkError::InvalidInput(format!(
+                "status must be 1-32 characters (got {})",
+                status.len()
+            )));
+        }
+    }
+    if let Some(default_branch) = project_meta.default_branch {
+        if default_branch.is_empty() || default_branch.len() > 128 {
+            return Err(SdkError::InvalidInput(format!(
+                "default_branch must be 1-128 characters (got {})",
+                default_branch.len()
+            )));
+        }
+    }
+    for contributor in &project_meta.contributors {
+        check_pubkey_hex(contributor, "contributor")?;
+    }
 
     // Build tags
     let mut tags = vec![tag(&["d", repo_id])?];
@@ -954,6 +1097,18 @@ pub fn build_repo_announcement(
         let mut relay_tag = vec!["relays"];
         relay_tag.extend_from_slice(relays);
         tags.push(tag(&relay_tag)?);
+    }
+    if let Some(channel_id) = project_meta.project_channel_id {
+        tags.push(tag(&["h", channel_id])?);
+    }
+    if let Some(status) = project_meta.status {
+        tags.push(tag(&["status", status])?);
+    }
+    if let Some(default_branch) = project_meta.default_branch {
+        tags.push(tag(&["default-branch", default_branch])?);
+    }
+    for contributor in project_meta.contributors {
+        tags.push(tag(&["p", contributor])?);
     }
 
     Ok(EventBuilder::new(Kind::Custom(KIND_GIT_REPO_ANNOUNCEMENT as u16), "").tags(tags))
@@ -1633,6 +1788,37 @@ mod tests {
         assert!(build_message(cid, &max, None, &[], false, &[]).is_ok());
     }
 
+    #[test]
+    fn project_message_tags_project_context() {
+        let cid = uuid();
+        let owner = "a".repeat(64);
+        let issue = "b".repeat(64);
+        let patch = "c".repeat(64);
+        let ev = sign(
+            build_project_message(
+                cid,
+                "agent started work",
+                None,
+                &[],
+                false,
+                &[],
+                ProjectMessageMeta {
+                    repo_address: Some(&format!("30617:{owner}:repo")),
+                    issue_id: Some(&issue),
+                    branch: Some("agent/fix-issue"),
+                    patch_id: Some(&patch),
+                },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), 9);
+        assert!(has_tag(&ev, "a", &format!("30617:{owner}:repo")));
+        assert!(has_tag(&ev, "e", &issue));
+        assert!(has_tag(&ev, "branch", "agent/fix-issue"));
+        assert!(has_tag(&ev, "patch", &patch));
+    }
+
     // ── build_forum_post ─────────────────────────────────────────────────────
 
     #[test]
@@ -1676,6 +1862,8 @@ mod tests {
             commit_sha: "abc1234".into(),
             file_path: Some("src/main.rs".into()),
             parent_commit: None,
+            repo_address: None,
+            issue_id: None,
             branch: None,
             pr_number: None,
             language: Some("rust".into()),
@@ -1768,6 +1956,8 @@ mod tests {
             commit_sha: "abc1234def".into(),
             file_path: Some("src/lib.rs".into()),
             parent_commit: Some("1234567".into()),
+            repo_address: Some(format!("30617:{}:repo", "a".repeat(64))),
+            issue_id: Some("b".repeat(64)),
             branch: Some(("feature".into(), "main".into())),
             pr_number: Some(42),
             language: Some("rust".into()),
@@ -1778,6 +1968,8 @@ mod tests {
         let ev = sign(build_diff_message(cid, "diff", &meta, None).unwrap());
         assert!(has_tag(&ev, "file", "src/lib.rs"));
         assert!(has_tag(&ev, "parent-commit", "1234567"));
+        assert!(has_tag(&ev, "a", &format!("30617:{}:repo", "a".repeat(64))));
+        assert!(has_tag(&ev, "e", &"b".repeat(64)));
         assert!(has_tag(&ev, "pr", "42"));
         assert!(has_tag(&ev, "truncated", "true"));
         assert!(has_tag(&ev, "alt", "patch for bug fix"));
@@ -2424,6 +2616,34 @@ mod tests {
             .tags
             .iter()
             .any(|t| t.as_slice().first().map(|v| v.as_str()) == Some("clone")));
+    }
+
+    #[test]
+    fn repo_announcement_with_project_metadata() {
+        let contributor = "d".repeat(64);
+        let ev = sign(
+            build_repo_announcement_with_project_meta(
+                "project-repo",
+                Some("Project Repo"),
+                Some("Tracks a Buzz project"),
+                &["https://relay.example.com/git/owner/project-repo"],
+                None,
+                &[],
+                RepoProjectMeta {
+                    project_channel_id: Some("8e2b99ba-8a1c-4a3a-9714-b4b824d93810"),
+                    status: Some("active"),
+                    default_branch: Some("main"),
+                    contributors: vec![&contributor],
+                },
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(ev.kind.as_u16(), 30617);
+        assert!(has_tag(&ev, "h", "8e2b99ba-8a1c-4a3a-9714-b4b824d93810"));
+        assert!(has_tag(&ev, "status", "active"));
+        assert!(has_tag(&ev, "default-branch", "main"));
+        assert!(has_tag(&ev, "p", &contributor));
     }
 
     #[test]

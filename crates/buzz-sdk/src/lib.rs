@@ -44,6 +44,10 @@ pub struct DiffMeta {
     pub file_path: Option<String>,
     /// Optional parent commit SHA — minimum 7 hex chars if present.
     pub parent_commit: Option<String>,
+    /// Optional NIP-34 repo address (`30617:<owner>:<repo-id>`) for project linking.
+    pub repo_address: Option<String>,
+    /// Optional issue/event id this diff discusses.
+    pub issue_id: Option<String>,
     /// Optional branch pair `(source, target)` — both or neither.
     pub branch: Option<(String, String)>,
     /// Optional pull request number — must be positive.

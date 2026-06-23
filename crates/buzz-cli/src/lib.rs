@@ -253,6 +253,21 @@ pub enum MessagesCmd {
         /// Attach file(s) — uploads and includes as imeta tags
         #[arg(long = "file")]
         files: Vec<String>,
+        /// Repo owner pubkey for project context — requires --repo-id
+        #[arg(long, requires = "repo_id")]
+        repo_owner: Option<String>,
+        /// Repo identifier for project context — requires --repo-owner
+        #[arg(long, requires = "repo_owner")]
+        repo_id: Option<String>,
+        /// Issue event id this update discusses
+        #[arg(long)]
+        issue: Option<String>,
+        /// Branch this update discusses
+        #[arg(long)]
+        branch: Option<String>,
+        /// Patch event id this update discusses
+        #[arg(long)]
+        patch: Option<String>,
     },
     /// Send a code diff / patch to a channel
     SendDiff {
@@ -274,6 +289,15 @@ pub enum MessagesCmd {
         /// Parent commit SHA for three-way diff context
         #[arg(long)]
         parent_commit: Option<String>,
+        /// Repo owner pubkey for project linking — requires --repo-id
+        #[arg(long, requires = "repo_id")]
+        repo_owner: Option<String>,
+        /// Repo identifier for project linking — requires --repo-owner
+        #[arg(long, requires = "repo_owner")]
+        repo_id: Option<String>,
+        /// Issue event id this diff discusses
+        #[arg(long)]
+        issue: Option<String>,
         /// Source branch name
         #[arg(long)]
         source_branch: Option<String>,
@@ -1014,6 +1038,18 @@ pub enum ReposCmd {
         /// Preferred Nostr relay(s) for repo discovery — can be specified multiple times
         #[arg(long = "nostr-relay")]
         relays: Vec<String>,
+        /// Linked project discussion channel UUID (`h` tag)
+        #[arg(long)]
+        project_channel: Option<String>,
+        /// Project lifecycle status
+        #[arg(long, default_value = "active")]
+        status: String,
+        /// Default branch to show in project views
+        #[arg(long, default_value = "main")]
+        default_branch: String,
+        /// Contributor pubkey — can be specified multiple times
+        #[arg(long = "contributor")]
+        contributors: Vec<String>,
     },
     /// Get a repository announcement
     Get {

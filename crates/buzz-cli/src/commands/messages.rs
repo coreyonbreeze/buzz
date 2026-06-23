@@ -375,6 +375,11 @@ pub struct SendMessageParams {
     pub reply_to: Option<String>,
     pub broadcast: bool,
     pub files: Vec<String>,
+    pub repo_owner: Option<String>,
+    pub repo_id: Option<String>,
+    pub issue_id: Option<String>,
+    pub branch: Option<String>,
+    pub patch_id: Option<String>,
 }
 
 pub async fn cmd_send_message(
@@ -389,6 +394,15 @@ pub async fn cmd_send_message(
     validate_content_size(&p.content)?;
     if let Some(ref r) = p.reply_to {
         validate_hex64(r)?;
+    }
+    if let Some(ref owner) = p.repo_owner {
+        validate_hex64(owner)?;
+    }
+    if let Some(ref issue_id) = p.issue_id {
+        validate_hex64(issue_id)?;
+    }
+    if let Some(ref patch_id) = p.patch_id {
+        validate_hex64(patch_id)?;
     }
     let channel_uuid = parse_uuid(&p.channel_id)?;
 
@@ -433,6 +447,14 @@ pub async fn cmd_send_message(
     merge_mentions(&mut auto_resolved, &uri_pubkeys, MENTION_CAP);
 
     let mention_refs: Vec<&str> = auto_resolved.iter().map(|s| s.as_str()).collect();
+    let repo_address = match (&p.repo_owner, &p.repo_id) {
+        (Some(owner), Some(repo_id)) => Some(format!("30617:{owner}:{repo_id}")),
+        _ => None,
+    };
+    let has_project_context = repo_address.is_some()
+        || p.issue_id.is_some()
+        || p.branch.is_some()
+        || p.patch_id.is_some();
 
     let builder = match p.kind {
         Some(45001) => {
@@ -452,15 +474,35 @@ pub async fn cmd_send_message(
             )
             .map_err(|e| CliError::Other(format!("build_forum_comment failed: {e}")))?
         }
-        None | Some(9) => buzz_sdk::build_message(
-            channel_uuid,
-            &final_content,
-            thread_ref.as_ref(),
-            &mention_refs,
-            p.broadcast,
-            &media_tags,
-        )
-        .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?,
+        None | Some(9) => {
+            if has_project_context {
+                buzz_sdk::build_project_message(
+                    channel_uuid,
+                    &final_content,
+                    thread_ref.as_ref(),
+                    &mention_refs,
+                    p.broadcast,
+                    &media_tags,
+                    buzz_sdk::ProjectMessageMeta {
+                        repo_address: repo_address.as_deref(),
+                        issue_id: p.issue_id.as_deref(),
+                        branch: p.branch.as_deref(),
+                        patch_id: p.patch_id.as_deref(),
+                    },
+                )
+                .map_err(|e| CliError::Other(format!("build_project_message failed: {e}")))?
+            } else {
+                buzz_sdk::build_message(
+                    channel_uuid,
+                    &final_content,
+                    thread_ref.as_ref(),
+                    &mention_refs,
+                    p.broadcast,
+                    &media_tags,
+                )
+                .map_err(|e| CliError::Other(format!("build_message failed: {e}")))?
+            }
+        }
         Some(k) => {
             return Err(CliError::Usage(format!(
                 "--kind {k} is not supported (use 9, 45001, or 45003)"
@@ -482,6 +524,9 @@ pub struct SendDiffParams {
     pub commit_sha: String,
     pub file_path: Option<String>,
     pub parent_commit_sha: Option<String>,
+    pub repo_owner: Option<String>,
+    pub repo_id: Option<String>,
+    pub issue_id: Option<String>,
     pub source_branch: Option<String>,
     pub target_branch: Option<String>,
     pub pr_number: Option<u32>,
@@ -493,6 +538,12 @@ pub struct SendDiffParams {
 pub async fn cmd_send_diff_message(client: &BuzzClient, p: SendDiffParams) -> Result<(), CliError> {
     if let Some(r) = &p.reply_to {
         validate_hex64(r)?;
+    }
+    if let Some(issue_id) = &p.issue_id {
+        validate_hex64(issue_id)?;
+    }
+    if let Some(owner) = &p.repo_owner {
+        validate_hex64(owner)?;
     }
 
     // Branch pairing: both or neither
@@ -538,12 +589,18 @@ pub async fn cmd_send_diff_message(client: &BuzzClient, p: SendDiffParams) -> Re
         (Some(src), Some(tgt)) => Some((src.clone(), tgt.clone())),
         _ => None,
     };
+    let repo_address = match (&p.repo_owner, &p.repo_id) {
+        (Some(owner), Some(repo_id)) => Some(format!("30617:{owner}:{repo_id}")),
+        _ => None,
+    };
 
     let diff_meta = DiffMeta {
         repo_url: p.repo_url.clone(),
         commit_sha: p.commit_sha.clone(),
         file_path: p.file_path.clone(),
         parent_commit: p.parent_commit_sha.clone(),
+        repo_address,
+        issue_id: p.issue_id.clone(),
         branch,
         pr_number: p.pr_number,
         language,
@@ -652,6 +709,11 @@ pub async fn dispatch(
             reply_to,
             broadcast,
             files,
+            repo_owner,
+            repo_id,
+            issue,
+            branch,
+            patch,
         } => {
             cmd_send_message(
                 client,
@@ -662,6 +724,11 @@ pub async fn dispatch(
                     reply_to,
                     broadcast,
                     files,
+                    repo_owner,
+                    repo_id,
+                    issue_id: issue,
+                    branch,
+                    patch_id: patch,
                 },
             )
             .await
@@ -673,6 +740,9 @@ pub async fn dispatch(
             commit,
             file,
             parent_commit,
+            repo_owner,
+            repo_id,
+            issue,
             source_branch,
             target_branch,
             pr,
@@ -689,6 +759,9 @@ pub async fn dispatch(
                     commit_sha: commit,
                     file_path: file,
                     parent_commit_sha: parent_commit,
+                    repo_owner,
+                    repo_id,
+                    issue_id: issue,
                     source_branch,
                     target_branch,
                     pr_number: pr,
