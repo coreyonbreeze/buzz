@@ -19,6 +19,7 @@ import { useBackForwardControls } from "@/app/navigation/useBackForwardControls"
 import { useLiveHomeFeedActions } from "@/app/useLiveHomeFeedActions";
 import { useMarkAsReadShortcuts } from "@/app/useMarkAsReadShortcuts";
 import { useSettingsShortcuts } from "@/app/useSettingsShortcuts";
+import { useAgentWindowAttachRequests } from "@/app/useAgentWindowAttachRequests";
 import { useThreadActivityFeedItems } from "@/app/useThreadActivityFeedItems";
 import { useWebviewZoomShortcuts } from "@/app/useWebviewZoomShortcuts";
 import {
@@ -535,9 +536,8 @@ export function AppShell() {
     },
   );
 
-  // Prevent webview file:/// navigation on file drop outside the composer.
-  // Scoped to file drags only (text drag-and-drop into inputs still works).
-  // Composer's onDrop fires first (React synthetic before window bubble).
+  useAgentWindowAttachRequests(goChannel);
+
   React.useEffect(() => {
     function preventNavigation(e: DragEvent) {
       if (e.dataTransfer?.types.includes("Files")) {

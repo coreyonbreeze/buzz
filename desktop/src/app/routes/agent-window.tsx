@@ -1,4 +1,4 @@
-import { createFileRoute } from "@tanstack/react-router";
+import { useRouterState } from "@tanstack/react-router";
 
 import { AgentWindowScreen } from "@/features/agents/ui/AgentWindowScreen";
 import type { ChannelType } from "@/shared/api/types";
@@ -32,14 +32,12 @@ function validateAgentWindowSearch(
   };
 }
 
-export const Route = createFileRoute("/agent-window")({
-  validateSearch: validateAgentWindowSearch,
-  component: AgentWindowRouteComponent,
-});
-
-function AgentWindowRouteComponent() {
+export function AgentWindowRouteComponent() {
+  const search = useRouterState({
+    select: (state) => state.location.search as Record<string, unknown>,
+  });
   const { channelId, pubkey, name, channelName, channelType } =
-    Route.useSearch();
+    validateAgentWindowSearch(search);
 
   if (!channelId || !pubkey) {
     return (

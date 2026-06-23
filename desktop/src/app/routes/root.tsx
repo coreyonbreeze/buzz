@@ -1,10 +1,7 @@
-import {
-  Outlet,
-  createRootRoute,
-  useRouterState,
-} from "@tanstack/react-router";
+import { createRootRoute, useRouterState } from "@tanstack/react-router";
 
 import { AppShell } from "@/app/AppShell";
+import { AgentWindowRouteComponent } from "@/app/routes/agent-window";
 
 /**
  * Popped-out agent conversation windows load the same frontend at
@@ -20,7 +17,7 @@ function RootComponent() {
   if (pathname.startsWith("/agent-window")) {
     return (
       <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
-        <Outlet />
+        <AgentWindowRouteComponent />
       </div>
     );
   }

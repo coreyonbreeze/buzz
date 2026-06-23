@@ -1,5 +1,9 @@
 import * as React from "react";
-import { CircleDot, Octagon } from "lucide-react";
+import { isTauri } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { Window } from "@tauri-apps/api/window";
+import { CircleDot, Octagon, PanelRightOpen } from "lucide-react";
 import { toast } from "sonner";
 
 import {
@@ -11,7 +15,12 @@ import {
   useActiveAgentTurnsBridge,
 } from "@/features/agents/activeAgentTurnsStore";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
-import { agentConversationSeedStorageKey } from "@/features/agents/lib/openAgentConversationWindow";
+import {
+  AGENT_WINDOW_ATTACH_EVENT,
+  AGENT_WINDOW_ATTACH_STORAGE_KEY,
+  agentConversationSeedStorageKey,
+  type AgentWindowAttachRequest,
+} from "@/features/agents/lib/openAgentConversationWindow";
 import {
   seedAgentObserverEvents,
   useManagedAgentObserverBridge,
@@ -241,6 +250,37 @@ export function AgentWindowScreen({
     }
   }
 
+  async function handleAttachToMainWindow() {
+    if (!isTauri()) {
+      window.location.hash = `/channels/${encodeURIComponent(
+        channelId,
+      )}?agentSession=${encodeURIComponent(agentPubkey)}`;
+      return;
+    }
+
+    try {
+      const payload: AgentWindowAttachRequest = { agentPubkey, channelId };
+      window.localStorage.setItem(
+        AGENT_WINDOW_ATTACH_STORAGE_KEY,
+        JSON.stringify({ ...payload, writtenAt: Date.now() }),
+      );
+      await emit(AGENT_WINDOW_ATTACH_EVENT, payload);
+
+      const mainWindow = await Window.getByLabel("main");
+      await mainWindow?.unminimize().catch(() => {});
+      await mainWindow?.show().catch(() => {});
+      await mainWindow?.setFocus().catch(() => {});
+
+      await getCurrentWebviewWindow().close();
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Failed to attach this activity to the main window.",
+      );
+    }
+  }
+
   const isLive = isManagedAgentActive(sessionAgent);
 
   return (
@@ -297,6 +337,25 @@ export function AgentWindowScreen({
             </TooltipContent>
           </Tooltip>
         ) : null}
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button
+              aria-label="Attach activity to main window"
+              data-testid="agent-window-attach"
+              onClick={() => {
+                void handleAttachToMainWindow();
+              }}
+              size="icon"
+              type="button"
+              variant="ghost"
+            >
+              <PanelRightOpen className="h-4 w-4" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent side="bottom" className="text-xs">
+            Attach activity to the main window.
+          </TooltipContent>
+        </Tooltip>
       </header>
 
       <div

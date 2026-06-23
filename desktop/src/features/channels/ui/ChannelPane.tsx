@@ -924,6 +924,14 @@ export const ChannelPane = React.memo(function ChannelPane({
                       onOpenProfilePanel(selectedAgent.pubkey)
                     }
                     onClose={onCloseAgentSession}
+                    onOpenWindow={
+                      onOpenAgentWindow
+                        ? () => {
+                            onOpenAgentWindow(selectedAgent.pubkey);
+                            onCloseAgentSession();
+                          }
+                        : undefined
+                    }
                     widthPx={threadPanelWidthPx}
                   />
                 );

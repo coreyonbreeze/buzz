@@ -14,6 +14,14 @@ export type OpenAgentConversationWindowInput = {
   observerEvents?: readonly ObserverEvent[];
 };
 
+export const AGENT_WINDOW_ATTACH_EVENT = "agent-window-attach-request";
+export const AGENT_WINDOW_ATTACH_STORAGE_KEY = "buzz:agent-window-attach";
+
+export type AgentWindowAttachRequest = {
+  agentPubkey: string;
+  channelId: string;
+};
+
 const DEFAULT_WIDTH = 460;
 const DEFAULT_HEIGHT = 680;
 const MIN_WIDTH = 380;

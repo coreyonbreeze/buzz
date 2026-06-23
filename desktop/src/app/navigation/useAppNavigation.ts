@@ -133,6 +133,7 @@ export function useAppNavigation() {
     (
       channelId: string,
       options?: {
+        agentSession?: string;
         messageId?: string;
         replace?: boolean;
         threadRootId?: string | null;
@@ -146,10 +147,15 @@ export function useAppNavigation() {
           },
           search: options?.messageId
             ? {
+                agentSession: options.agentSession,
                 messageId: options.messageId,
                 threadRootId: options.threadRootId ?? undefined,
               }
-            : {},
+            : options?.agentSession
+              ? {
+                  agentSession: options.agentSession,
+                }
+              : {},
         },
         {
           replace: options?.replace,
