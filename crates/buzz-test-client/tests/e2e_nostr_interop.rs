@@ -991,12 +991,24 @@ async fn test_nip10_thread_reply_not_in_top_level() {
     );
 }
 
-/// Send a kind:1059 gift wrap AND a kind:9 message with the same unique content.
-/// Query Typesense directly to prove the gift wrap was NOT indexed while the
-/// kind:9 message WAS. This bypasses all relay-level filtering (channel_id, #p)
-/// and tests the actual indexing skip in dispatch_persistent_event.
+/// Send a kind:1059 gift wrap AND a kind:9 message with the same unique content,
+/// then issue a NIP-50 search and prove the gift wrap is NOT returned while the
+/// kind:9 message IS.
 ///
-/// Requires TYPESENSE_URL and TYPESENSE_API_KEY env vars (defaults to dev values).
+/// This is the **backend-agnostic** form of the "gift wraps are not searchable"
+/// guarantee. The old form queried Typesense directly to prove kind:1059 was
+/// never *indexed* — meaningful only when Typesense is the backend. With the
+/// Postgres backend every event lives in the `events` table (there is no
+/// separate index to skip), so the protection is no longer "don't index it"
+/// but "the relay's search REQ path never surfaces it." That path is identical
+/// across all three backends: the auth/#p gates in `handle_req` run *before*
+/// the backend call, and `handle_search_req` re-applies `filters_match` to every
+/// hit before delivery. A kind:9 search filter therefore never returns a
+/// kind:1059 row regardless of backend — which is exactly what we assert here.
+///
+/// Runs against whatever backend the relay under test is configured with
+/// (`BUZZ_SEARCH_BACKEND`), so the same test guards typesense, postgres, and
+/// (vacuously) disabled.
 #[tokio::test]
 #[ignore]
 async fn test_nip17_gift_wrap_not_searchable() {
@@ -1011,7 +1023,8 @@ async fn test_nip17_gift_wrap_not_searchable() {
 
     let unique_token = format!("giftwrap-nosearch-{}", uuid::Uuid::new_v4().simple());
 
-    // 1. Send kind:1059 gift wrap.
+    // 1. Send kind:1059 gift wrap (p-tagged at B, signed by an ephemeral key,
+    //    as NIP-17 prescribes) carrying the unique token as its content.
     let ephemeral_keys = Keys::generate();
     let p_tag = Tag::parse(["p", &keys_b.public_key().to_hex()]).expect("p tag");
     let gift_wrap = EventBuilder::new(Kind::Custom(1059), &unique_token)
@@ -1021,65 +1034,158 @@ async fn test_nip17_gift_wrap_not_searchable() {
     let ok = client.send_event(gift_wrap).await.expect("send gift wrap");
     assert!(ok.accepted, "relay rejected gift wrap: {}", ok.message);
 
-    // 2. Send kind:9 control message with the same content.
+    // 2. Send a kind:9 control message with the same token into A's channel.
     let ok2 = client
         .send_text_message(&keys_a, &channel, &unique_token, 9)
         .await
         .expect("send kind:9");
     assert!(ok2.accepted, "relay rejected kind:9: {}", ok2.message);
 
-    client.disconnect().await.expect("disconnect");
+    // Allow async indexing (Typesense) / write commit (Postgres) to settle.
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
-    // Wait for async Typesense indexing.
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // 3. Query Typesense DIRECTLY — bypasses all relay-level filtering.
-    let ts_url =
-        std::env::var("TYPESENSE_URL").unwrap_or_else(|_| "http://localhost:8108".to_string());
-    let ts_key = std::env::var("TYPESENSE_API_KEY").unwrap_or_else(|_| "buzz_dev_key".to_string());
-
-    let http = reqwest::Client::new();
-    let resp = http
-        .post(format!("{ts_url}/multi_search"))
-        .header("X-TYPESENSE-API-KEY", &ts_key)
-        .json(&serde_json::json!({
-            "searches": [{
-                "collection": "events",
-                "q": unique_token,
-                "query_by": "content",
-                "per_page": 10
-            }]
-        }))
-        .send()
+    // 3. Search as A within A's channel for the token. The kind:9 control MUST
+    //    come back (proves the token is searchable at all), and no kind:1059
+    //    must appear in the results.
+    let sid = sub_id("giftwrap-nosearch");
+    let filter = Filter::new()
+        .search(&unique_token)
+        .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()]);
+    client
+        .subscribe(&sid, vec![filter])
         .await
-        .expect("Typesense multi_search request");
+        .expect("subscribe");
+    let events = client
+        .collect_until_eose(&sid, Duration::from_secs(10))
+        .await
+        .expect("collect until EOSE");
 
+    // Control: the kind:9 message IS searchable.
     assert!(
-        resp.status().is_success(),
-        "Typesense returned {}",
-        resp.status()
+        events
+            .iter()
+            .any(|e| e.kind.as_u16() == 9 && e.content.contains(&unique_token)),
+        "kind:9 control message not returned by search — search broken for this backend. \
+         events: {:?}",
+        events
+            .iter()
+            .map(|e| (e.kind.as_u16(), &e.content))
+            .collect::<Vec<_>>()
     );
-    let body: serde_json::Value = resp.json().await.expect("parse Typesense response");
 
-    let hits = body["results"][0]["hits"].as_array().expect("hits array");
-
-    // Control: kind:9 IS indexed.
-    let has_kind9 = hits
-        .iter()
-        .any(|h| h["document"]["kind"].as_i64() == Some(9));
+    // Assertion: NO kind:1059 gift wrap is ever returned by search.
     assert!(
-        has_kind9,
-        "kind:9 control message not found in Typesense — indexing broken"
+        !events.iter().any(|e| e.kind.as_u16() == 1059),
+        "kind:1059 gift wrap returned by NIP-50 search — gift wraps must NOT be \
+         searchable on any backend. events: {:?}",
+        events
+            .iter()
+            .map(|e| (e.kind.as_u16(), &e.content))
+            .collect::<Vec<_>>()
     );
 
-    // Assertion: kind:1059 is NOT indexed.
-    let has_kind1059 = hits
-        .iter()
-        .any(|h| h["document"]["kind"].as_i64() == Some(1059));
+    client.disconnect().await.expect("disconnect");
+}
+
+/// Cross-author / cross-channel search isolation: a user who is NOT a member of
+/// another author's channel must never see that channel's messages via NIP-50
+/// search, even when they search with the exact channel `#h` and the exact
+/// content token.
+///
+/// This exercises gate #1 (no visibility widening): the channel-scope clamp in
+/// `handle_search_req` intersects the requested `#h` with the searcher's
+/// `accessible_channels` and skips the filter entirely when nothing remains
+/// (`req.rs`: the `#h` values that aren't accessible are dropped, and an empty
+/// resulting scope short-circuits to "match nothing"). Because that clamp runs
+/// relay-side BEFORE the backend call, it holds identically for typesense,
+/// postgres, and disabled — which is why this test carries no backend-specific
+/// branch.
+#[tokio::test]
+#[ignore]
+async fn test_nip50_search_cross_author_isolation() {
+    let url = relay_url();
+    let author = Keys::generate();
+    let outsider = Keys::generate();
+
+    // Author A owns a private-by-default working channel and posts a token.
+    let channel = create_test_channel(&author).await;
+    let unique_token = format!("isolation_{}", uuid::Uuid::new_v4().simple());
+    let content = format!("secret in A's channel {unique_token}");
+
+    let mut author_client = BuzzTestClient::connect(&url, &author)
+        .await
+        .expect("connect author");
+    let ok = author_client
+        .send_text_message(&author, &channel, &content, 9)
+        .await
+        .expect("author sends message");
+    assert!(ok.accepted, "relay rejected author message: {}", ok.message);
+
+    // Allow indexing / write commit to settle.
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // Sanity: the author themselves CAN find it (so a zero-result outsider
+    // search is proven to be isolation, not a broken/empty index).
+    let author_sid = sub_id("isolation-author");
+    author_client
+        .subscribe(
+            &author_sid,
+            vec![Filter::new()
+                .kind(Kind::Custom(9))
+                .search(&unique_token)
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()])],
+        )
+        .await
+        .expect("author subscribe");
+    let author_events = author_client
+        .collect_until_eose(&author_sid, Duration::from_secs(10))
+        .await
+        .expect("author collect until EOSE");
     assert!(
-        !has_kind1059,
-        "kind:1059 found in Typesense — gift wraps must NOT be indexed. hits: {hits:?}"
+        author_events
+            .iter()
+            .any(|e| e.content.contains(&unique_token)),
+        "author could not find their own message — search is broken, test is vacuous. \
+         events: {:?}",
+        author_events.iter().map(|e| &e.content).collect::<Vec<_>>()
     );
+    author_client.disconnect().await.expect("disconnect author");
+
+    // Outsider B — a different authenticated identity who never joined A's
+    // channel — searches with A's exact #h and exact token. Must get nothing.
+    let mut outsider_client = BuzzTestClient::connect(&url, &outsider)
+        .await
+        .expect("connect outsider");
+    let outsider_sid = sub_id("isolation-outsider");
+    outsider_client
+        .subscribe(
+            &outsider_sid,
+            vec![Filter::new()
+                .kind(Kind::Custom(9))
+                .search(&unique_token)
+                .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel.as_str()])],
+        )
+        .await
+        .expect("outsider subscribe");
+    let outsider_events = outsider_client
+        .collect_until_eose(&outsider_sid, Duration::from_secs(10))
+        .await
+        .expect("outsider collect until EOSE");
+    assert!(
+        outsider_events.is_empty(),
+        "outsider received {} search hit(s) for a channel they are not a member of — \
+         visibility widening. events: {:?}",
+        outsider_events.len(),
+        outsider_events
+            .iter()
+            .map(|e| (e.kind.as_u16(), &e.content))
+            .collect::<Vec<_>>()
+    );
+
+    outsider_client
+        .disconnect()
+        .await
+        .expect("disconnect outsider");
 }
 
 /// Send 3 messages with varying relevance to a query, wait for indexing, then search.
