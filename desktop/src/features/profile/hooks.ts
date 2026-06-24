@@ -107,6 +107,7 @@ export function useProfileQuery(enabled = true) {
             avatarUrl: cached.avatarUrl,
             about: null,
             nip05Handle: null,
+            ownerPubkey: null,
           } satisfies Profile)
         : undefined,
     [cached, pubkey],

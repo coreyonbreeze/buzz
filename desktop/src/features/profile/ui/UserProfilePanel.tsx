@@ -56,6 +56,7 @@ type UserProfilePanelProps = {
   layout?: "standalone" | "split";
   onClose: () => void;
   onOpenDm?: (pubkeys: string[]) => void;
+  onOpenProfile?: (pubkey: string) => void;
   onResetWidth?: () => void;
   onResizeStart?: (event: React.PointerEvent<HTMLButtonElement>) => void;
   onViewChange: (
@@ -136,6 +137,7 @@ export function UserProfilePanel({
   layout = "standalone",
   onClose,
   onOpenDm,
+  onOpenProfile,
   onResetWidth,
   onResizeStart,
   onViewChange,
@@ -172,6 +174,8 @@ export function UserProfilePanel({
   const { goChannel } = useAppNavigation();
 
   const profile = profileQuery.data;
+  const ownerPubkey = profile?.ownerPubkey ?? null;
+  const ownerProfileQuery = useUserProfileQuery(ownerPubkey ?? undefined);
   const pubkeyLower = pubkey.toLowerCase();
   const presenceStatus = presenceQuery.data?.[pubkeyLower];
   const userStatus = userStatusQuery.data?.[pubkeyLower];
@@ -252,7 +256,16 @@ export function UserProfilePanel({
 
   const displayName = profile?.displayName ?? truncatePubkey(pubkey);
   const ownerHandle = React.useMemo(() => {
-    if (currentPubkey === undefined) {
+    if (ownerPubkey) {
+      const ownerProfile = ownerProfileQuery.data;
+      return (
+        ownerProfile?.nip05Handle?.trim() ||
+        ownerProfile?.displayName?.trim() ||
+        truncatePubkey(ownerPubkey)
+      );
+    }
+
+    if (currentPubkey === undefined || isOwner !== true) {
       return null;
     }
 
@@ -262,8 +275,22 @@ export function UserProfilePanel({
       currentProfile?.displayName?.trim() ||
       truncatePubkey(currentPubkey)
     );
-  }, [currentProfileQuery.data, currentPubkey]);
-  const ownerDisplayName = ownerHandle ? `${ownerHandle} (you)` : null;
+  }, [
+    currentProfileQuery.data,
+    currentPubkey,
+    isOwner,
+    ownerProfileQuery.data,
+    ownerPubkey,
+  ]);
+  const isCurrentUserOwner =
+    currentPubkey !== undefined &&
+    ownerPubkey !== null &&
+    ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
+  const ownerDisplayName = ownerHandle
+    ? isCurrentUserOwner || (!ownerPubkey && isOwner === true)
+      ? `${ownerHandle} (you)`
+      : ownerHandle
+    : null;
   const panelTitle = VIEW_TITLES[view];
   const memoryCount = memoryQuery.data
     ? (memoryQuery.data.core ? 1 : 0) + memoryQuery.data.memories.length
@@ -334,8 +361,15 @@ export function UserProfilePanel({
           memoriesLoading={memoryQuery.isLoading}
           memoryCount={memoryCount}
           ownerDisplayName={ownerDisplayName}
+          ownerAvatarUrl={ownerProfileQuery.data?.avatarUrl ?? null}
           ownerHandle={ownerHandle}
+          ownerPubkey={ownerPubkey}
           onOpenChannels={() => onViewChange("channels")}
+          onOpenOwner={
+            ownerPubkey && onOpenProfile
+              ? () => onOpenProfile(ownerPubkey)
+              : undefined
+          }
           onOpenMemories={() => onViewChange("memories")}
           onOpenDm={onOpenDm}
           presenceLoaded={presenceQuery.isSuccess}
@@ -435,7 +469,7 @@ export function UserProfilePanel({
             isSinglePanelView
               ? `relative ${PANEL_SINGLE_COLUMN_HEADER_LAYER_CLASS} -mb-[4.75rem] min-h-[4.75rem] shrink-0 gap-2.5 bg-transparent pb-1 pl-4 pr-2 pt-[2.625rem] sm:pl-6 sm:pr-3`
               : isOverlay
-                ? "relative z-50 min-h-11 shrink-0 gap-3 bg-background/80 px-3 py-1.5 backdrop-blur-md supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-[backdrop-filter]:bg-background/55"
+                ? "relative z-50 min-h-14 shrink-0 gap-3 bg-background/80 px-5 py-2 backdrop-blur-md supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:backdrop-blur-xl dark:supports-[backdrop-filter]:bg-background/55"
                 : "absolute inset-x-0 top-[2.625rem] z-50 min-h-8 gap-3 bg-transparent px-3 py-1 after:absolute after:bottom-0 after:-left-px after:top-0 after:w-px after:bg-border/45 after:transition-colors peer-hover/profile-resize:after:bg-border/80 peer-focus-visible/profile-resize:after:bg-border/80",
           )}
           data-tauri-drag-region
