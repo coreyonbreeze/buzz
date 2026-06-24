@@ -18,6 +18,55 @@ cargo test -p buzz-test-client -- --ignored
 
 ---
 
+## Search Backend Test Matrix
+
+NIP-50 search runs behind the `BUZZ_SEARCH_BACKEND` flag (`typesense` |
+`postgres` | `disabled`, **default `postgres`**). The relay enforces two
+non-negotiable gates that must hold *identically across all three backends*:
+
+- **Gate #1 — no visibility widening.** A search must never return an event
+  the caller couldn't otherwise read. The auth/`#p` gates in `handle_req` run
+  *before* the backend call, and `handle_search_req` re-applies `filters_match`
+  to every hit, so the post-filter is backend-independent by construction.
+- **Gate #2 — `disabled` fails closed.** With `BUZZ_SEARCH_BACKEND=disabled`,
+  every NIP-50 query returns empty — no content leaks regardless of how well it
+  would otherwise match.
+
+The e2e search suite lives in
+[`crates/buzz-test-client/tests/e2e_nostr_interop.rs`](crates/buzz-test-client/tests/e2e_nostr_interop.rs)
+(all `#[ignore]`, require a running relay). The relay's backend is surfaced to
+the test process via `BUZZ_TEST_BACKEND`; backend-specific tests early-return
+(skip) when it doesn't match, so the same suite is safe against any backend.
+
+| Test | typesense | postgres | disabled | Proves |
+|------|:---------:|:--------:|:--------:|--------|
+| `test_nip50_search_returns_results_and_eose` | ✅ | ✅ | skip¹ | search finds a matching message; one-shot (no live events post-EOSE) |
+| `test_nip50_search_relevance_order` | ✅ | ✅ | skip¹ | rank-based ordering (proximity beats recency) |
+| `test_nip50_search_cross_author_isolation` | ✅ | ✅ | skip¹ | **gate #1**: outsider gets 0 hits from a *private* channel |
+| `test_nip17_gift_wrap_not_searchable` | ✅ | ✅ | skip¹ | **gate #1**: kind:1059 never surfaces via search; kind:9 control does |
+| `test_nip50_search_disabled_fails_closed` | skip² | skip² | ✅ | **gate #2**: a would-match query returns empty under `disabled` |
+| `test_nip50_search_empty_results` | ✅ | ✅ | ✅ | a non-matching query yields EOSE with no events |
+| `test_nip50_search_mixed_filters_rejected` | ✅ | ✅ | ✅ | mixed search + non-search filters → CLOSED |
+| `test_nip17_gift_wrap_accepted` / `_requires_p_filter` / `_recipient_receives` | ✅ | ✅ | ✅ | NIP-17 accept/auth paths (backend-independent) |
+
+¹ Hit-dependent — asserts a non-empty result, so it is only run against a real
+backend. ² Asserts empty — only meaningful, and only run, under `disabled`.
+
+To exercise the matrix, launch a relay per backend (set `BUZZ_SEARCH_BACKEND`)
+and run the suite with `BUZZ_TEST_BACKEND` set to match. For a real backend:
+
+```bash
+BUZZ_SEARCH_BACKEND=postgres buzz-relay &        # or typesense / disabled
+RELAY_URL=ws://localhost:3000 BUZZ_TEST_BACKEND=postgres \
+  cargo test -p buzz-test-client --test e2e_nostr_interop -- --ignored
+```
+
+For `disabled`, run only the fail-closed + result-independent tests — the
+hit-dependent ones skip themselves, so a full `--ignored` run is also safe but
+exercises fewer assertions.
+
+---
+
 ## Live Local Relay
 
 The fastest way to exercise the relay end-to-end is to build the release
@@ -267,7 +316,8 @@ out of the box with `just setup` or `just relay`. Common overrides:
 | `RELAY_URL`                       | `ws://localhost:3000`       | Advertised in NIP-11 / NIP-42 challenges. **Note: no `BUZZ_` prefix.** |
 | `DATABASE_URL`                    | `postgres://buzz:buzz_dev@localhost:5432/buzz` | |
 | `REDIS_URL`                       | `redis://localhost:6379`    | |
-| `TYPESENSE_URL`                   | `http://localhost:8108`     | |
+| `TYPESENSE_URL`                   | `http://localhost:8108`     | Only used when `BUZZ_SEARCH_BACKEND=typesense` |
+| `BUZZ_SEARCH_BACKEND`           | `postgres`                  | NIP-50 search backend: `typesense`, `postgres`, or `disabled` (fails closed) |
 | `BUZZ_REQUIRE_AUTH_TOKEN`       | `false`                     | When true, REST requires NIP-98 (no `X-Pubkey` fallback) |
 | `BUZZ_REQUIRE_RELAY_MEMBERSHIP` | `false`                     | When true, only pubkeys in `relay_members` can connect |
 | `BUZZ_AUTO_MIGRATE`             | `false`                     | Opt in with `true`/`1`/`yes`/`on` to run embedded SQLx migrations on relay startup |
