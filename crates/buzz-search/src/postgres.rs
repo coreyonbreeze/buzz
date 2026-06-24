@@ -47,7 +47,7 @@ pub async fn search(pool: &PgPool, query: &SearchQuery) -> Result<SearchResult, 
         "Executing Postgres FTS search"
     );
 
-    let per_page = query.per_page.min(MAX_PER_PAGE).max(1) as i64;
+    let per_page = query.per_page.clamp(1, MAX_PER_PAGE) as i64;
     let page = query.page.max(1) as i64;
     let offset = (page - 1) * per_page;
 
