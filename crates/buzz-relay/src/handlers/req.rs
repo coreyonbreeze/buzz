@@ -384,16 +384,26 @@ async fn handle_search_req(
                 break;
             }
 
-            let search_query = buzz_search::SearchQuery {
-                q: search_text.clone(),
-                kinds: kinds_vec.clone(),
-                authors: authors_vec.clone(),
-                channel_ids: channel_scope.clone(),
-                since: since_secs,
-                until: until_secs,
-                page,
-                per_page,
-            };
+            let search_query =
+                match buzz_search::SearchQuery::new(search_text.clone(), channel_scope.clone()) {
+                    Ok(q) => q
+                        .with_kinds(kinds_vec.clone())
+                        .with_authors(authors_vec.clone())
+                        .with_since(since_secs)
+                        .with_until(until_secs)
+                        .with_page(page)
+                        .with_per_page(per_page),
+                    Err(e) => {
+                        // Upstream guards (build_search_channel_scope_filter +
+                        // the per-filter h_tag validity check) make this
+                        // unreachable in normal operation. If a future refactor
+                        // ever lets an empty scope through, fail closed: log
+                        // and stop paginating this filter — no results, never
+                        // a widened search.
+                        warn!(sub_id = %sub_id, "NIP-50 search rejected empty channel scope: {e}");
+                        break;
+                    }
+                };
 
             let search_result = match state.search.search(&search_query).await {
                 Ok(r) => r,

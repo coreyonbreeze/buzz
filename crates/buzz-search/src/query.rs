@@ -17,40 +17,102 @@ pub const GLOBAL_CHANNEL_SENTINEL: &str = "__global__";
 /// structured fields into its own filter syntax (Typesense `filter_by` string,
 /// Postgres `WHERE` clause, …) so the call site doesn't have to know which
 /// backend is in use.
+///
+/// # Access-control invariant
+///
+/// `channel_ids` is required to be non-empty by construction: external code
+/// can only build a `SearchQuery` through [`SearchQuery::new`], which rejects
+/// an empty scope with [`SearchError::EmptyChannelScope`]. The fields are
+/// `pub(crate)` so backends inside this crate can read them directly, but
+/// struct-literal construction from outside the crate is impossible. This
+/// keeps "search cannot widen visibility" true at the type level instead of
+/// relying on every caller to remember to pass a channel filter.
 #[derive(Debug, Clone)]
 pub struct SearchQuery {
     /// The full-text query string. Empty string is treated as "match all".
-    pub q: String,
+    pub(crate) q: String,
     /// Nostr kinds to restrict to. Empty = no restriction.
-    pub kinds: Vec<u16>,
+    pub(crate) kinds: Vec<u16>,
     /// Event author pubkeys (hex). Empty = no restriction.
-    pub authors: Vec<String>,
-    /// Channel UUID strings to restrict to. Empty = no restriction. The
-    /// [`GLOBAL_CHANNEL_SENTINEL`] value (`"__global__"`) selects events that
-    /// have no `channel_id` set.
-    pub channel_ids: Vec<String>,
+    pub(crate) authors: Vec<String>,
+    /// Channel UUID strings to restrict to. Never empty — the access-control
+    /// boundary. The [`GLOBAL_CHANNEL_SENTINEL`] value (`"__global__"`)
+    /// selects events that have no `channel_id` set.
+    pub(crate) channel_ids: Vec<String>,
     /// Lower bound on `created_at` (Unix seconds, inclusive).
-    pub since: Option<i64>,
+    pub(crate) since: Option<i64>,
     /// Upper bound on `created_at` (Unix seconds, inclusive).
-    pub until: Option<i64>,
+    pub(crate) until: Option<i64>,
     /// Page number (1-indexed).
-    pub page: u32,
+    pub(crate) page: u32,
     /// Number of results per page.
-    pub per_page: u32,
+    pub(crate) per_page: u32,
 }
 
-impl Default for SearchQuery {
-    fn default() -> Self {
-        Self {
-            q: "*".into(),
+impl SearchQuery {
+    /// Build a `SearchQuery` with the required full-text term and channel
+    /// scope. Returns [`SearchError::EmptyChannelScope`] if `channel_ids` is
+    /// empty — see the type-level note on the access-control invariant.
+    ///
+    /// Optional facets (`kinds`, `authors`, `since`, `until`, `page`,
+    /// `per_page`) default to "no restriction" / page 1 of 20 results, and
+    /// can be set with the `with_*` builder methods.
+    pub fn new(q: impl Into<String>, channel_ids: Vec<String>) -> Result<Self, SearchError> {
+        if channel_ids.is_empty() {
+            return Err(SearchError::EmptyChannelScope);
+        }
+        Ok(Self {
+            q: q.into(),
             kinds: Vec::new(),
             authors: Vec::new(),
-            channel_ids: Vec::new(),
+            channel_ids,
             since: None,
             until: None,
             page: 1,
             per_page: 20,
-        }
+        })
+    }
+
+    /// Restrict to the given Nostr kinds.
+    #[must_use]
+    pub fn with_kinds(mut self, kinds: Vec<u16>) -> Self {
+        self.kinds = kinds;
+        self
+    }
+
+    /// Restrict to the given author pubkeys (hex).
+    #[must_use]
+    pub fn with_authors(mut self, authors: Vec<String>) -> Self {
+        self.authors = authors;
+        self
+    }
+
+    /// Set the lower bound on `created_at` (Unix seconds, inclusive).
+    #[must_use]
+    pub fn with_since(mut self, since: Option<i64>) -> Self {
+        self.since = since;
+        self
+    }
+
+    /// Set the upper bound on `created_at` (Unix seconds, inclusive).
+    #[must_use]
+    pub fn with_until(mut self, until: Option<i64>) -> Self {
+        self.until = until;
+        self
+    }
+
+    /// Set the 1-indexed page number.
+    #[must_use]
+    pub fn with_page(mut self, page: u32) -> Self {
+        self.page = page;
+        self
+    }
+
+    /// Set the page size.
+    #[must_use]
+    pub fn with_per_page(mut self, per_page: u32) -> Self {
+        self.per_page = per_page;
+        self
     }
 }
 
@@ -305,18 +367,31 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A non-empty channel scope used by tests that don't otherwise care
+    /// about which channel is being searched — the constructor requires
+    /// non-empty `channel_ids`, so tests pick a canonical placeholder.
+    const TEST_CHANNEL: &str = "11111111-1111-1111-1111-111111111111";
+
+    fn test_scope() -> Vec<String> {
+        vec![TEST_CHANNEL.to_string()]
+    }
+
+    #[test]
+    fn test_search_query_rejects_empty_channel_scope() {
+        // The access-control invariant: empty channel_ids must be refused
+        // at construction time, not silently accepted and then patched up
+        // by remembering to pass a filter at the call site.
+        let err = SearchQuery::new("hello", Vec::new()).expect_err("must reject empty scope");
+        assert!(matches!(err, SearchError::EmptyChannelScope));
+    }
+
     #[test]
     fn test_search_query_building() {
-        let q = SearchQuery {
-            q: "hello world".into(),
-            kinds: vec![1],
-            authors: Vec::new(),
-            channel_ids: Vec::new(),
-            since: None,
-            until: None,
-            page: 2,
-            per_page: 10,
-        };
+        let q = SearchQuery::new("hello world", test_scope())
+            .expect("non-empty scope")
+            .with_kinds(vec![1])
+            .with_page(2)
+            .with_per_page(10);
 
         let params = q.to_query_params();
         let get = |key: &str| -> Option<String> {
@@ -330,23 +405,18 @@ mod tests {
         assert_eq!(get("query_by").unwrap(), "content");
         assert_eq!(get("page").unwrap(), "2");
         assert_eq!(get("per_page").unwrap(), "10");
-        assert_eq!(get("filter_by").unwrap(), "kind:=[1]");
+        let filter = get("filter_by").unwrap();
+        assert!(filter.contains(&format!("channel_id:=[{TEST_CHANNEL}]")));
+        assert!(filter.contains("kind:=[1]"));
         // sort_by is no longer emitted — Typesense default = relevance.
         assert!(params.iter().all(|(k, _)| k != "sort_by"));
     }
 
     #[test]
-    fn test_search_query_no_optional_fields() {
-        let q = SearchQuery {
-            q: "*".into(),
-            kinds: Vec::new(),
-            authors: Vec::new(),
-            channel_ids: Vec::new(),
-            since: None,
-            until: None,
-            page: 1,
-            per_page: 20,
-        };
+    fn test_search_query_minimum_filters() {
+        // Even with no optional facets, channel scope is always rendered —
+        // the access boundary follows the query through every backend path.
+        let q = SearchQuery::new("*", test_scope()).expect("non-empty scope");
 
         let params = q.to_query_params();
         let has_key = |key: &str| params.iter().any(|(k, _)| k == key);
@@ -355,23 +425,31 @@ mod tests {
         assert!(has_key("query_by"));
         assert!(has_key("page"));
         assert!(has_key("per_page"));
-        assert!(!has_key("filter_by"));
+        assert!(has_key("filter_by"));
         assert!(!has_key("sort_by"));
+
+        let get = |key: &str| -> Option<String> {
+            params
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(
+            get("filter_by").unwrap(),
+            format!("channel_id:=[{TEST_CHANNEL}]")
+        );
     }
 
     #[test]
     fn test_typesense_filter_by_renders_structured_fields() {
-        let q = SearchQuery {
-            q: "hello".into(),
-            kinds: vec![1, 42],
-            authors: vec!["deadbeef".into()],
-            channel_ids: vec!["11111111-1111-1111-1111-111111111111".into()],
-            since: Some(1_700_000_000),
-            until: Some(1_700_000_100),
-            ..Default::default()
-        };
+        let q = SearchQuery::new("hello", test_scope())
+            .expect("non-empty scope")
+            .with_kinds(vec![1, 42])
+            .with_authors(vec!["deadbeef".into()])
+            .with_since(Some(1_700_000_000))
+            .with_until(Some(1_700_000_100));
         let filter = q.typesense_filter_by().expect("non-empty filter");
-        assert!(filter.contains("channel_id:=[11111111-1111-1111-1111-111111111111]"));
+        assert!(filter.contains(&format!("channel_id:=[{TEST_CHANNEL}]")));
         assert!(filter.contains("kind:=[1,42]"));
         assert!(filter.contains("pubkey:=[deadbeef]"));
         assert!(filter.contains("created_at:>=1700000000"));
@@ -380,27 +458,24 @@ mod tests {
 
     #[test]
     fn test_typesense_filter_by_handles_global_sentinel() {
-        let with_global_only = SearchQuery {
-            q: "*".into(),
-            channel_ids: vec![GLOBAL_CHANNEL_SENTINEL.to_string()],
-            ..Default::default()
-        };
+        let with_global_only = SearchQuery::new("*", vec![GLOBAL_CHANNEL_SENTINEL.to_string()])
+            .expect("non-empty scope");
         assert_eq!(
             with_global_only.typesense_filter_by().as_deref(),
             Some("channel_id:=__global__")
         );
 
-        let with_mix = SearchQuery {
-            q: "*".into(),
-            channel_ids: vec![
-                "11111111-1111-1111-1111-111111111111".into(),
+        let with_mix = SearchQuery::new(
+            "*",
+            vec![
+                TEST_CHANNEL.to_string(),
                 GLOBAL_CHANNEL_SENTINEL.to_string(),
             ],
-            ..Default::default()
-        };
+        )
+        .expect("non-empty scope");
         let filter = with_mix.typesense_filter_by().expect("non-empty");
         assert!(filter.contains("|| channel_id:=__global__"));
-        assert!(filter.contains("channel_id:=[11111111-1111-1111-1111-111111111111]"));
+        assert!(filter.contains(&format!("channel_id:=[{TEST_CHANNEL}]")));
     }
 
     #[test]

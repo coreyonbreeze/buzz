@@ -372,10 +372,13 @@ mod integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let result = service
-            .search(&SearchQuery {
-                q: unique_token.clone(),
-                ..Default::default()
-            })
+            .search(
+                &SearchQuery::new(
+                    unique_token.clone(),
+                    vec![GLOBAL_CHANNEL_SENTINEL.to_string()],
+                )
+                .expect("non-empty scope"),
+            )
             .await
             .unwrap();
 
@@ -429,11 +432,11 @@ mod integration_tests {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
         let result = service
-            .search(&SearchQuery {
-                q: unique.clone(),
-                kinds: vec![1],
-                ..Default::default()
-            })
+            .search(
+                &SearchQuery::new(unique.clone(), vec![GLOBAL_CHANNEL_SENTINEL.to_string()])
+                    .expect("non-empty scope")
+                    .with_kinds(vec![1]),
+            )
             .await
             .unwrap();
 
@@ -447,7 +450,9 @@ mod integration_tests {
     #[tokio::test]
     async fn disabled_backend_returns_empty_results() {
         let service = SearchService::disabled();
-        let result = service.search(&SearchQuery::default()).await.unwrap();
+        let query = SearchQuery::new("*", vec![GLOBAL_CHANNEL_SENTINEL.to_string()])
+            .expect("non-empty scope");
+        let result = service.search(&query).await.unwrap();
         assert_eq!(result.found, 0);
         assert!(result.hits.is_empty());
 

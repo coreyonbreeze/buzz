@@ -40,4 +40,14 @@ pub enum SearchError {
     /// A database error from sqlx (Postgres backend only).
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
+
+    /// `SearchQuery::new` was called with an empty `channel_ids` set.
+    ///
+    /// `channel_ids` is the access-control boundary: every search must be
+    /// scoped to an explicit, non-empty set of channel UUIDs (or the
+    /// [`crate::query::GLOBAL_CHANNEL_SENTINEL`]). Empty means "no scope,"
+    /// which would widen visibility — refused at construction time so the
+    /// invariant holds by type, not by remembering to filter at the call site.
+    #[error("SearchQuery requires a non-empty channel_ids scope")]
+    EmptyChannelScope,
 }

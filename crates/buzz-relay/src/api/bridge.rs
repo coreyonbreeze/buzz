@@ -751,15 +751,23 @@ async fn handle_bridge_search(
         let since_secs = filter.since.map(|t| t.as_secs() as i64);
         let until_secs = filter.until.map(|t| t.as_secs() as i64);
 
-        let search_query = buzz_search::SearchQuery {
-            q: search_text,
-            kinds: kinds_vec,
-            authors: authors_vec,
-            channel_ids: filter_channel_scope,
-            since: since_secs,
-            until: until_secs,
-            page: 1,
-            per_page: limit,
+        let search_query = match buzz_search::SearchQuery::new(search_text, filter_channel_scope) {
+            Ok(q) => q
+                .with_kinds(kinds_vec)
+                .with_authors(authors_vec)
+                .with_since(since_secs)
+                .with_until(until_secs)
+                .with_page(1)
+                .with_per_page(limit),
+            Err(e) => {
+                // Upstream guards (the per-filter h_tag validity check
+                // immediately above + the outer accessible_channels gate)
+                // make this unreachable in normal operation. If a future
+                // refactor ever lets an empty scope through, fail closed:
+                // log and skip this filter instead of widening visibility.
+                tracing::warn!("bridge search rejected empty channel scope: {e}");
+                continue;
+            }
         };
 
         let search_result = state

@@ -197,6 +197,10 @@ async fn main() -> anyhow::Result<()> {
                 collection: std::env::var("TYPESENSE_COLLECTION")
                     .unwrap_or_else(|_| "events".to_string()),
             };
+            info!(
+                collection = %search_config.collection,
+                "Search backend: typesense"
+            );
             let service = SearchService::new(search_config);
             if let Err(e) = service.ensure_collection().await {
                 error!("Typesense collection setup failed (non-fatal): {e}");
