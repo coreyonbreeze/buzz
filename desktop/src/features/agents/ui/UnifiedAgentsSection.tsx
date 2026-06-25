@@ -40,6 +40,7 @@ import { AgentIdentityCard } from "./AgentIdentityCard";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { EditAgentDialog } from "./EditAgentDialog";
 import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
+import { buildUnifiedGroups, pickProfileAgent } from "./unifiedAgentGroups";
 
 type UnifiedAgentsSectionProps = {
   actionErrorMessage: string | null;
@@ -84,38 +85,8 @@ type UnifiedAgentsSectionProps = {
   onImportPersonaFile: (fileBytes: number[], fileName: string) => void;
 };
 
-type PersonaGroup = { persona: AgentPersona; agents: ManagedAgent[] };
-
 const AGENT_CARD_COLUMN_CLASS = "w-full";
 const AGENT_CARD_GRID_CLASS = `${AGENT_CARD_COLUMN_CLASS} grid grid-cols-[repeat(auto-fill,minmax(220px,240px))] justify-start gap-3`;
-
-function buildUnifiedGroups(personas: AgentPersona[], agents: ManagedAgent[]) {
-  const byPersonaId = new Map<string, ManagedAgent[]>();
-  const ungrouped: ManagedAgent[] = [];
-
-  for (const agent of agents) {
-    if (!agent.personaId) {
-      ungrouped.push(agent);
-    } else {
-      const list = byPersonaId.get(agent.personaId) ?? [];
-      list.push(agent);
-      byPersonaId.set(agent.personaId, list);
-    }
-  }
-
-  const matched = new Set<string>();
-  const groups: PersonaGroup[] = personas.map((p) => {
-    matched.add(p.id);
-    return { persona: p, agents: byPersonaId.get(p.id) ?? [] };
-  });
-
-  const unknown: ManagedAgent[] = [];
-  for (const [id, list] of byPersonaId) {
-    if (!matched.has(id)) unknown.push(...list);
-  }
-
-  return { groups, ungrouped, unknown };
-}
 
 export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
   const {
@@ -374,15 +345,6 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
       ) : null}
     </section>
   );
-}
-
-function pickProfileAgent(agents: ManagedAgent[]) {
-  return [...agents].sort((left, right) => {
-    const activeDiff =
-      Number(isManagedAgentActive(right)) - Number(isManagedAgentActive(left));
-    if (activeDiff !== 0) return activeDiff;
-    return left.name.localeCompare(right.name);
-  })[0];
 }
 
 type AgentMenuProps = {
