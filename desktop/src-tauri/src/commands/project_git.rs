@@ -23,6 +23,7 @@ pub struct ProjectRepoFileInfo {
     pub kind: String,
     pub size: Option<u64>,
     pub preview_content: Option<String>,
+    pub last_changed_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -161,7 +162,29 @@ fn read_preview_content(
     String::from_utf8(bytes).ok()
 }
 
-fn parse_ls_tree(repo_dir: &std::path::Path, output: &str) -> Vec<ProjectRepoFileInfo> {
+fn parse_last_changed_at(output: &str) -> std::collections::HashMap<String, i64> {
+    let mut current_timestamp = None;
+    let mut result = std::collections::HashMap::new();
+
+    for line in output.lines().filter(|line| !line.trim().is_empty()) {
+        if let Ok(timestamp) = line.parse::<i64>() {
+            current_timestamp = Some(timestamp);
+            continue;
+        }
+
+        if let Some(timestamp) = current_timestamp {
+            result.entry(line.to_string()).or_insert(timestamp);
+        }
+    }
+
+    result
+}
+
+fn parse_ls_tree(
+    repo_dir: &std::path::Path,
+    output: &str,
+    last_changed_by_path: &std::collections::HashMap<String, i64>,
+) -> Vec<ProjectRepoFileInfo> {
     output
         .lines()
         .filter_map(|line| {
@@ -181,6 +204,7 @@ fn parse_ls_tree(repo_dir: &std::path::Path, output: &str) -> Vec<ProjectRepoFil
                 kind,
                 size,
                 preview_content,
+                last_changed_at: last_changed_by_path.get(path).copied(),
             })
         })
         .take(250)
@@ -196,8 +220,22 @@ fn snapshot_from_repo(repo_dir: &std::path::Path, auth: &GitAuthConfig) -> Proje
     .ok()
     .and_then(|output| parse_latest_commit(&output));
     let files = if latest_commit.is_some() {
+        let last_changed_by_path = run_git(
+            &[
+                "log",
+                "--format=%ct",
+                "--name-only",
+                "--diff-filter=ACMRT",
+                "--",
+            ],
+            Some(repo_dir),
+            auth,
+        )
+        .map(|output| parse_last_changed_at(&output))
+        .unwrap_or_default();
+
         run_git(&["ls-tree", "-r", "--long", "HEAD"], Some(repo_dir), auth)
-            .map(|output| parse_ls_tree(repo_dir, &output))
+            .map(|output| parse_ls_tree(repo_dir, &output, &last_changed_by_path))
             .unwrap_or_default()
     } else {
         Vec::new()

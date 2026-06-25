@@ -556,7 +556,7 @@ function ProjectGridCard({
 }) {
   return (
     <Card
-      className="group relative flex min-h-48 flex-col overflow-hidden border-border/60 bg-gradient-to-br from-card via-card to-muted/30 p-4 shadow-sm transition-colors duration-150 hover:border-primary/30 hover:shadow-md"
+      className="group relative flex min-h-48 flex-col overflow-hidden border-border/60 bg-gradient-to-br from-card via-card to-muted/30 p-4 shadow-none transition-colors duration-150 hover:border-primary/30"
       data-testid={`project-card-${project.dtag}`}
     >
       <ProjectCardButton onOpen={onOpen} project={project} />
@@ -602,9 +602,9 @@ function ProjectGridCard({
           </MetadataItem>
         </div>
 
-        <div className="mt-auto space-y-2 rounded-lg border border-border/40 bg-background/55 px-2.5 py-2 shadow-inner">
+        <div className="mt-auto space-y-2 rounded-lg bg-muted/70 px-2.5 py-2">
           <div className="flex min-w-0 items-center justify-between gap-2">
-            <p className="truncate text-xs text-muted-foreground">
+            <p className="truncate text-xs font-medium text-muted-foreground">
               {getActivityLabel(summary)}
             </p>
             <div className="relative z-10 flex shrink-0 items-center gap-1">
@@ -646,7 +646,7 @@ function ProjectListRow({
 }) {
   return (
     <Card
-      className="group relative overflow-hidden border-border/60 bg-gradient-to-r from-card via-card to-muted/20 p-3 shadow-sm transition-colors duration-150 hover:border-primary/30 hover:shadow-md"
+      className="group relative overflow-hidden border-border/60 bg-gradient-to-r from-card via-card to-muted/20 p-3 shadow-none transition-colors duration-150 hover:border-primary/30"
       data-testid={`project-row-${project.dtag}`}
     >
       <ProjectCardButton onOpen={onOpen} project={project} />
@@ -685,8 +685,8 @@ function ProjectListRow({
           </div>
         </div>
 
-        <div className="relative z-10 flex min-w-0 items-center justify-start gap-2 lg:justify-end">
-          <p className="truncate text-xs text-muted-foreground">
+        <div className="relative z-10 flex min-w-0 items-center justify-start gap-2 rounded-lg bg-muted/70 px-2.5 py-2 lg:justify-end">
+          <p className="truncate text-xs font-medium text-muted-foreground">
             {getActivityLabel(summary)}
           </p>
           <ProjectPeopleStack

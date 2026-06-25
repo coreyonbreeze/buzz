@@ -1519,9 +1519,10 @@ function FileCard({
   );
 }
 
-function SyntaxHighlightedCode({
+export function SyntaxHighlightedCode({
   code,
   language,
+  className,
   ...props
 }: {
   code: string;
@@ -1597,7 +1598,7 @@ function SyntaxHighlightedCode({
     }
   }, [code, language, themeName, loadedKey]);
 
-  const codeClassName = CODE_BLOCK_CLASS;
+  const codeClassName = cn(CODE_BLOCK_CLASS, className);
 
   if (!tokens) {
     const lines = code.split("\n");

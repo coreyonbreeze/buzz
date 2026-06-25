@@ -19,7 +19,6 @@ import * as React from "react";
 import { useAppNavigation } from "@/app/navigation/useAppNavigation";
 import {
   type Project,
-  type ProjectRepoFile,
   type ProjectRepoSnapshot,
   useProjectIssuesQuery,
   useProjectQuery,
@@ -37,6 +36,11 @@ import { Button } from "@/shared/ui/button";
 import { Card } from "@/shared/ui/card";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { UserAvatar } from "@/shared/ui/UserAvatar";
+import {
+  findReadmeFile,
+  ReadmePanel,
+  RepositoryFilesPanel,
+} from "./ProjectRepositoryPanel";
 
 function CloneUrlRow({ url }: { url: string }) {
   const [copied, setCopied] = React.useState(false);
@@ -123,138 +127,6 @@ function projectPeople(project: Project, issues: ProjectIssue[]) {
   ];
 }
 
-function formatFileSize(size: number | null) {
-  if (size === null) return "—";
-  if (size < 1024) return `${size} B`;
-  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
-  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function baseName(path: string) {
-  return path.split("/").pop() || path;
-}
-
-function dirName(path: string) {
-  const index = path.lastIndexOf("/");
-  return index >= 0 ? path.slice(0, index) : "/";
-}
-
-function FileBrowser({
-  files,
-  selectedFile,
-  onSelectFile,
-}: {
-  files: ProjectRepoFile[];
-  selectedFile: ProjectRepoFile | null;
-  onSelectFile: (file: ProjectRepoFile) => void;
-}) {
-  if (files.length === 0) {
-    return (
-      <div className="flex h-full items-center justify-center p-4 text-center text-sm text-muted-foreground">
-        No files have been pushed yet.
-      </div>
-    );
-  }
-
-  return (
-    <div className="h-full overflow-y-auto py-2">
-      {files.slice(0, 200).map((file) => {
-        const isSelected = selectedFile?.path === file.path;
-        return (
-          <button
-            className={cn(
-              "flex w-full min-w-0 items-center gap-2 px-3 py-1.5 text-left font-mono text-xs transition-colors",
-              isSelected
-                ? "bg-primary/10 text-foreground"
-                : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
-            )}
-            key={file.path}
-            onClick={() => onSelectFile(file)}
-            type="button"
-          >
-            <FileDiff className="h-3.5 w-3.5 shrink-0" />
-            <span className="truncate">{file.path}</span>
-          </button>
-        );
-      })}
-    </div>
-  );
-}
-
-function FilePreview({ file }: { file: ProjectRepoFile | null }) {
-  if (!file) {
-    return (
-      <div className="flex h-full items-center justify-center p-6 text-center text-sm text-muted-foreground">
-        Select a file to inspect its path and contents.
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex h-full min-h-0 flex-col">
-      <div className="flex min-h-9 items-center gap-2 border-border/50 border-b bg-muted/20 px-3">
-        <FileDiff className="h-3.5 w-3.5 text-muted-foreground" />
-        <span className="truncate font-mono text-xs text-foreground">
-          {baseName(file.path)}
-        </span>
-        <span className="ml-auto shrink-0 text-2xs text-muted-foreground">
-          {formatFileSize(file.size)}
-        </span>
-      </div>
-      <div className="min-h-0 flex-1 overflow-y-auto bg-background/60">
-        {file.previewContent ? (
-          <pre className="min-h-full overflow-x-auto p-4 font-mono text-xs leading-relaxed text-foreground">
-            <code>{file.previewContent}</code>
-          </pre>
-        ) : (
-          <div className="space-y-3 p-4">
-            <div className="space-y-3 rounded-lg border border-border/50 bg-background/50 p-4">
-              <div>
-                <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
-                  Path
-                </p>
-                <p className="mt-1 break-all font-mono text-sm text-foreground">
-                  {file.path}
-                </p>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-3">
-                <div>
-                  <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
-                    File
-                  </p>
-                  <p className="mt-1 truncate text-sm text-foreground">
-                    {baseName(file.path)}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
-                    Folder
-                  </p>
-                  <p className="mt-1 truncate font-mono text-sm text-foreground">
-                    {dirName(file.path)}
-                  </p>
-                </div>
-                <div>
-                  <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
-                    Size
-                  </p>
-                  <p className="mt-1 text-sm text-foreground">
-                    {formatFileSize(file.size)}
-                  </p>
-                </div>
-              </div>
-            </div>
-            <p className="text-sm text-muted-foreground">
-              Preview unavailable for this file. Large and binary files only
-              show metadata.
-            </p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
 function LatestCommitPanel({
   snapshot,
   isLoading,
@@ -282,7 +154,7 @@ function LatestCommitPanel({
 
   return (
     <div className="space-y-3 p-4">
-      <div className="rounded-lg bg-muted/50 p-4">
+      <div className="rounded-lg bg-muted/70 p-4">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0 space-y-1">
             <p className="line-clamp-2 text-sm font-medium text-foreground">
@@ -292,7 +164,7 @@ function LatestCommitPanel({
               {latestCommit.authorName} · {compactDate(latestCommit.timestamp)}
             </p>
           </div>
-          <code className="shrink-0 rounded-md bg-muted px-2 py-1 text-xs text-muted-foreground">
+          <code className="shrink-0 rounded-md bg-background/55 px-2 py-1 text-xs text-muted-foreground">
             {latestCommit.shortHash}
           </code>
         </div>
@@ -396,7 +268,7 @@ function IssuesPanel({
     <div className="space-y-2 p-4">
       {issues.slice(0, 10).map((issue) => (
         <article
-          className="space-y-2 rounded-lg bg-muted/50 p-3"
+          className="space-y-2 rounded-lg bg-muted/70 p-3"
           key={issue.id}
         >
           <div className="flex items-start justify-between gap-3">
@@ -410,7 +282,7 @@ function IssuesPanel({
                 </p>
               ) : null}
             </div>
-            <span className="shrink-0 rounded-full bg-muted px-2 py-0.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
+            <span className="shrink-0 rounded-full bg-background/55 px-2 py-0.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
               {issue.status}
             </span>
           </div>
@@ -451,98 +323,68 @@ function WorkspaceTabs({
   issuesLoading: boolean;
 }) {
   const files = snapshot?.files ?? [];
-  const [selectedPath, setSelectedPath] = React.useState<string | null>(null);
-  const selectedFile =
-    files.find((file) => file.path === selectedPath) ?? files[0] ?? null;
-
-  React.useEffect(() => {
-    if (files.length > 0 && !files.some((file) => file.path === selectedPath)) {
-      setSelectedPath(files[0].path);
-    }
-  }, [files, selectedPath]);
+  const readmeFile = React.useMemo(() => findReadmeFile(files), [files]);
 
   return (
-    <section className="overflow-hidden rounded-xl border border-border/50 bg-card/60 shadow-none">
-      <Tabs className="flex min-h-[32rem] flex-col" defaultValue="files">
-        <div className="flex items-center justify-between gap-3 border-border/50 border-b bg-muted/20 px-3 py-2">
-          <div className="flex min-w-0 items-center gap-2">
-            <FolderGit2 className="h-4 w-4 text-muted-foreground" />
-            <span className="truncate text-sm font-medium text-foreground">
-              Workspace
-            </span>
-          </div>
-          <TabsList className="h-8">
-            <TabsTrigger className="h-7 gap-1 px-2" value="files">
-              <FolderGit2 className="h-3.5 w-3.5" />
-              Files
-            </TabsTrigger>
-            <TabsTrigger className="h-7 gap-1 px-2" value="activity">
-              <CircleDot className="h-3.5 w-3.5" />
-              Activity
-            </TabsTrigger>
-            <TabsTrigger className="h-7 gap-1 px-2" value="issues">
-              <ListTodo className="h-3.5 w-3.5" />
-              Issues
-            </TabsTrigger>
-            <TabsTrigger className="h-7 gap-1 px-2" value="branches">
-              <GitBranch className="h-3.5 w-3.5" />
-              Branches
-            </TabsTrigger>
-          </TabsList>
-        </div>
+    <Tabs className="space-y-3" defaultValue="files">
+      <TabsList className="h-8 w-fit justify-start">
+        <TabsTrigger className="h-7 gap-1 px-2" value="files">
+          <FolderGit2 className="h-3.5 w-3.5" />
+          Files
+        </TabsTrigger>
+        <TabsTrigger className="h-7 gap-1 px-2" value="activity">
+          <CircleDot className="h-3.5 w-3.5" />
+          Activity
+        </TabsTrigger>
+        <TabsTrigger className="h-7 gap-1 px-2" value="issues">
+          <ListTodo className="h-3.5 w-3.5" />
+          Issues
+        </TabsTrigger>
+        <TabsTrigger className="h-7 gap-1 px-2" value="branches">
+          <GitBranch className="h-3.5 w-3.5" />
+          Branches
+        </TabsTrigger>
+      </TabsList>
 
-        <TabsContent className="m-0 min-h-0 flex-1" value="files">
-          <div className="grid h-[32rem] min-h-0 grid-cols-1 lg:grid-cols-[18rem_minmax(0,1fr)]">
-            <aside className="min-h-0 border-border/50 border-b bg-background/35 lg:border-r lg:border-b-0">
-              <div className="flex h-8 items-center justify-between border-border/50 border-b px-3">
-                <span className="text-2xs font-semibold uppercase tracking-wide text-muted-foreground">
-                  Explorer
-                </span>
-                <span className="text-2xs text-muted-foreground">
-                  {files.length} files
-                </span>
-              </div>
-              {snapshotLoading ? (
-                <p className="p-3 text-sm text-muted-foreground">
-                  Loading files…
-                </p>
-              ) : snapshotError ? (
-                <p className="p-3 text-sm text-muted-foreground">
-                  Could not load file tree.
-                </p>
-              ) : (
-                <FileBrowser
-                  files={files}
-                  onSelectFile={(file) => setSelectedPath(file.path)}
-                  selectedFile={selectedFile}
-                />
-              )}
-            </aside>
-            <FilePreview file={selectedFile} />
-          </div>
-        </TabsContent>
+      <TabsContent className="m-0 space-y-4" value="files">
+        <RepositoryFilesPanel
+          error={snapshotError}
+          files={files}
+          isLoading={snapshotLoading}
+          snapshot={snapshot}
+        />
+        <ReadmePanel file={readmeFile} />
+      </TabsContent>
 
-        <TabsContent className="m-0 min-h-0 flex-1" value="activity">
-          <LatestCommitPanel
-            error={snapshotError}
-            isLoading={snapshotLoading}
-            snapshot={snapshot}
-          />
-        </TabsContent>
+      <TabsContent
+        className="m-0 overflow-hidden rounded-xl border border-border/50 bg-card/60"
+        value="activity"
+      >
+        <LatestCommitPanel
+          error={snapshotError}
+          isLoading={snapshotLoading}
+          snapshot={snapshot}
+        />
+      </TabsContent>
 
-        <TabsContent className="m-0 min-h-0 flex-1" value="issues">
-          <IssuesPanel isLoading={issuesLoading} issues={issues} />
-        </TabsContent>
+      <TabsContent
+        className="m-0 overflow-hidden rounded-xl border border-border/50 bg-card/60"
+        value="issues"
+      >
+        <IssuesPanel isLoading={issuesLoading} issues={issues} />
+      </TabsContent>
 
-        <TabsContent className="m-0 min-h-0 flex-1" value="branches">
-          <BranchesPanel
-            isLoading={repoStateLoading}
-            project={project}
-            repoState={repoState}
-          />
-        </TabsContent>
-      </Tabs>
-    </section>
+      <TabsContent
+        className="m-0 overflow-hidden rounded-xl border border-border/50 bg-card/60"
+        value="branches"
+      >
+        <BranchesPanel
+          isLoading={repoStateLoading}
+          project={project}
+          repoState={repoState}
+        />
+      </TabsContent>
+    </Tabs>
   );
 }
 

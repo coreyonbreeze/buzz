@@ -172,6 +172,7 @@ export type ProjectRepoFile = {
   kind: string;
   size: number | null;
   previewContent: string | null;
+  lastChangedAt: number | null;
 };
 
 export type ProjectRepoSnapshot = {

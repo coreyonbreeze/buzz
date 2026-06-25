@@ -15,6 +15,7 @@ type RawProjectRepoFile = {
   kind: string;
   size: number | null;
   preview_content: string | null;
+  last_changed_at: number | null;
 };
 
 type RawProjectRepoSnapshot = {
@@ -41,6 +42,7 @@ function fromRawProjectRepoSnapshot(
       kind: file.kind,
       size: file.size,
       previewContent: file.preview_content,
+      lastChangedAt: file.last_changed_at,
     })),
   };
 }
