@@ -408,6 +408,24 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
     )
 }
 
+/// Channel-message kinds that carry a free-text display body, mirroring the
+/// thread-reply set the CLI treats as channel messages (`messages.rs`). In a
+/// latched E2E DM these bodies MUST be NIP-44 ciphertext (rule 15c) — gating
+/// kind:9 alone left the edit (40003), v2 (40002), diff (40008), and forum
+/// comment (45003) paths able to land plaintext into a latched channel, the
+/// exact leak the latch exists to prevent. None of these are global-only
+/// kinds, so each carries an `h` tag and resolves to a channel at ingest.
+pub(crate) fn is_e2e_enforced_content_kind(kind: u32) -> bool {
+    matches!(
+        kind,
+        KIND_STREAM_MESSAGE
+            | KIND_STREAM_MESSAGE_V2
+            | KIND_STREAM_MESSAGE_EDIT
+            | KIND_STREAM_MESSAGE_DIFF
+            | KIND_FORUM_COMMENT
+    )
+}
+
 /// Check channel membership: member OR open-visibility channel.
 ///
 /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
@@ -1451,10 +1469,18 @@ pub async fn ingest_event(
     // ── 15c. E2E DM ciphertext enforcement (D2) ──────────────────────────
     // A DM channel with the encryption latch set (`encryption_activated_at`)
     // is end-to-end encrypted. The relay cannot decrypt, so it enforces the
-    // boundary syntactically: in a latched channel, EVERY incoming kind:9 MUST
-    // be NIP-44 v2 ciphertext, or it is rejected fail-visible — never silently
-    // stored as plaintext. We use the strong validator, not the length-only
-    // check, or a long plaintext message in range would pass.
+    // boundary syntactically: in a latched channel, EVERY incoming channel
+    // message that carries a free-text display body (see
+    // `is_e2e_enforced_content_kind`) MUST be NIP-44 v2 ciphertext, or it is
+    // rejected fail-visible — never silently stored as plaintext. We use the
+    // strong validator, not the length-only check, or a long plaintext message
+    // in range would pass.
+    //
+    // The gate spans the full channel-message-kind set, not kind:9 alone:
+    // edits (40003), v2 messages (40002), diffs (40008), and forum comments
+    // (45003) all carry a display body and an `h` tag, so a plaintext one would
+    // otherwise land in a latched channel and defeat the latch — the exact leak
+    // this guard prevents.
     //
     // Enforcement is latch-PRESENCE only — it deliberately does NOT compare the
     // event's `created_at` against the latch timestamp. A `created_at >= latch`
@@ -1472,7 +1498,7 @@ pub async fn ingest_event(
     // the exact leak this guard prevents. A `ChannelNotFound` is different: the
     // channel cannot have a latch, and the event is rejected downstream at
     // insert, so it falls through here to keep that existing not-found behavior.
-    if kind_u32 == KIND_STREAM_MESSAGE {
+    if is_e2e_enforced_content_kind(kind_u32) {
         if let Some(ch_id) = channel_id {
             match state.db.get_channel(ch_id).await {
                 Ok(channel) => {
@@ -2241,6 +2267,49 @@ mod tests {
             ],
         );
         assert!(validate_diff_event(&event).is_err());
+    }
+
+    // ── 15c gate: content-bearing channel-message kinds ──────────────────
+
+    #[test]
+    fn e2e_gate_covers_all_channel_message_kinds() {
+        // The latch-enforcement gate must span every channel-message kind that
+        // carries a free-text display body — not kind:9 alone. A plaintext edit
+        // (40003), v2 message (40002), diff (40008), or forum comment (45003)
+        // into a latched DM is the exact leak the latch exists to prevent.
+        for kind in [
+            KIND_STREAM_MESSAGE,
+            KIND_STREAM_MESSAGE_V2,
+            KIND_STREAM_MESSAGE_EDIT,
+            KIND_STREAM_MESSAGE_DIFF,
+            KIND_FORUM_COMMENT,
+        ] {
+            assert!(
+                is_e2e_enforced_content_kind(kind),
+                "kind {kind} carries a display body and must be E2E-enforced in a latched channel"
+            );
+        }
+    }
+
+    #[test]
+    fn e2e_gate_excludes_uncovered_kinds() {
+        // Reactions, deletions, and forum votes carry no free-text display body,
+        // and profiles are global-only — none can leak readable content into a
+        // latched channel, so gating them would only reject legitimate events.
+        // Forum posts (45001) carry a body but sit outside the channel-message
+        // set the gate mirrors; they are deliberately out of this fix's scope.
+        for kind in [
+            KIND_REACTION,
+            KIND_DELETION,
+            KIND_FORUM_VOTE,
+            KIND_PROFILE,
+            KIND_FORUM_POST,
+        ] {
+            assert!(
+                !is_e2e_enforced_content_kind(kind),
+                "kind {kind} is outside the gated channel-message set"
+            );
+        }
     }
 
     fn make_dummy_event() -> Event {
