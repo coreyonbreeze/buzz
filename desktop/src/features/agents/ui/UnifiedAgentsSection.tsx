@@ -15,7 +15,9 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 
+import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
 import { isManagedAgentActive } from "@/features/agents/lib/managedAgentControlActions";
+import { AgentStatusBadge } from "@/features/agents/ui/AgentStatusBadge";
 import { useUserProfileQuery } from "@/features/profile/hooks";
 import type {
   AgentPersona,
@@ -24,6 +26,7 @@ import type {
 } from "@/shared/api/types";
 import { useFeedbackToasts } from "@/shared/hooks/useToastEffect";
 import { useFileImportZone } from "@/shared/hooks/useFileImportZone";
+import { normalizePubkey } from "@/shared/lib/pubkey";
 import { Button } from "@/shared/ui/button";
 import {
   DropdownMenu,
@@ -36,6 +39,7 @@ import { IdentityCardSkeleton } from "@/shared/ui/identity-card-skeleton";
 import { AgentIdentityCard } from "./AgentIdentityCard";
 import { CreateIdentityCard } from "./CreateIdentityCard";
 import { EditAgentDialog } from "./EditAgentDialog";
+import { ManagedAgentLogPanel } from "./ManagedAgentLogPanel";
 
 type UnifiedAgentsSectionProps = {
   actionErrorMessage: string | null;
@@ -121,6 +125,12 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     agentsError,
     isActionPending,
     isAgentsLoading,
+    logContent,
+    logError,
+    logLoading,
+    presenceLoaded,
+    presenceLookup,
+    selectedLogAgentPubkey,
     onAddToChannel,
     onBulkRemoveStopped,
     onBulkStopRunning,
@@ -170,6 +180,14 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
     }
     return additional;
   }, [groups]);
+  const selectedLogAgent = React.useMemo(
+    () =>
+      selectedLogAgentPubkey
+        ? (agents.find((agent) => agent.pubkey === selectedLogAgentPubkey) ??
+          null)
+        : null,
+    [agents, selectedLogAgentPubkey],
+  );
   const [collapsed, setCollapsed] = React.useState<Set<string>>(new Set());
   const {
     fileInputRef,
@@ -249,6 +267,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
                   key={group.persona.id}
                   persona={group.persona}
                   personaMenuProps={personaMenuProps}
+                  presenceLoaded={presenceLoaded}
+                  presenceLookup={presenceLookup}
                   onOpenAgentProfile={onOpenAgentProfile}
                 />
               );
@@ -270,6 +290,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               collapsed={collapsed}
               groupKey="__additional_persona_agents__"
               label="Additional agent instances"
+              presenceLoaded={presenceLoaded}
+              presenceLookup={presenceLookup}
               onToggle={toggle}
               onOpenAgentProfile={onOpenAgentProfile}
             />
@@ -281,6 +303,8 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               collapsed={collapsed}
               groupKey="__unknown__"
               label="Unknown Persona"
+              presenceLoaded={presenceLoaded}
+              presenceLookup={presenceLookup}
               onToggle={toggle}
               onOpenAgentProfile={onOpenAgentProfile}
             />
@@ -292,9 +316,24 @@ export function UnifiedAgentsSection(props: UnifiedAgentsSectionProps) {
               collapsed={collapsed}
               groupKey="__ungrouped__"
               label="Custom Agents"
+              presenceLoaded={presenceLoaded}
+              presenceLookup={presenceLookup}
               onToggle={toggle}
               onOpenAgentProfile={onOpenAgentProfile}
             />
+          ) : null}
+          {selectedLogAgent ? (
+            <div
+              className={AGENT_CARD_COLUMN_CLASS}
+              data-testid="managed-agent-log-row"
+            >
+              <ManagedAgentLogPanel
+                error={logError}
+                isLoading={logLoading}
+                logContent={logContent}
+                selectedAgent={selectedLogAgent}
+              />
+            </div>
           ) : null}
         </div>
       ) : null}
@@ -371,12 +410,16 @@ function AgentPersonaCard({
   agentMenuProps,
   persona,
   personaMenuProps,
+  presenceLoaded,
+  presenceLookup,
   onOpenAgentProfile,
 }: {
   agent: ManagedAgent | undefined;
   agentMenuProps: AgentMenuProps;
   persona: AgentPersona;
   personaMenuProps: PersonaMenuProps;
+  presenceLoaded: boolean;
+  presenceLookup: PresenceLookup;
   onOpenAgentProfile?: (pubkey: string) => void;
 }) {
   const title = persona.displayName;
@@ -408,6 +451,15 @@ function AgentPersonaCard({
         }
         personaMenuProps.onEditPersona(persona);
       }}
+      status={
+        agent ? (
+          <AgentCardStatus
+            agent={agent}
+            presenceLoaded={presenceLoaded}
+            presenceLookup={presenceLookup}
+          />
+        ) : null
+      }
     />
   );
 }
@@ -415,10 +467,14 @@ function AgentPersonaCard({
 function StandaloneAgentCard({
   agent,
   agentMenuProps,
+  presenceLoaded,
+  presenceLookup,
   onOpenAgentProfile,
 }: {
   agent: ManagedAgent;
   agentMenuProps: AgentMenuProps;
+  presenceLoaded: boolean;
+  presenceLookup: PresenceLookup;
   onOpenAgentProfile?: (pubkey: string) => void;
 }) {
   const title = agent.name;
@@ -439,6 +495,35 @@ function StandaloneAgentCard({
           agentMenuProps.onOpenLogs(agent.pubkey);
         }
       }}
+      status={
+        <AgentCardStatus
+          agent={agent}
+          presenceLoaded={presenceLoaded}
+          presenceLookup={presenceLookup}
+        />
+      }
+    />
+  );
+}
+
+function AgentCardStatus({
+  agent,
+  presenceLoaded,
+  presenceLookup,
+}: {
+  agent: ManagedAgent;
+  presenceLoaded: boolean;
+  presenceLookup: PresenceLookup;
+}) {
+  const activeTurns = useActiveAgentTurns(agent.pubkey);
+  const presenceStatus = presenceLookup[normalizePubkey(agent.pubkey)];
+
+  return (
+    <AgentStatusBadge
+      isWorking={activeTurns.length > 0}
+      presenceLoaded={presenceLoaded}
+      presenceStatus={presenceStatus}
+      status={agent.status}
     />
   );
 }
@@ -465,6 +550,9 @@ function AgentPersonaActionsMenu({
           <button
             aria-label={`Open actions for ${persona.displayName}`}
             className="flex h-7 w-7 items-center justify-center rounded-md bg-background/70 text-muted-foreground transition-colors hover:bg-background hover:text-foreground data-[state=open]:bg-background data-[state=open]:text-foreground"
+            data-testid={
+              agent ? `managed-agent-actions-${agent.pubkey}` : undefined
+            }
             type="button"
           >
             <Ellipsis className="h-4 w-4" />
@@ -874,6 +962,8 @@ function CollapsibleAgentGroup({
   agents,
   agentMenuProps,
   collapsed,
+  presenceLoaded,
+  presenceLookup,
   onToggle,
   onOpenAgentProfile,
 }: {
@@ -882,6 +972,8 @@ function CollapsibleAgentGroup({
   agents: ManagedAgent[];
   agentMenuProps: AgentMenuProps;
   collapsed: ReadonlySet<string>;
+  presenceLoaded: boolean;
+  presenceLookup: PresenceLookup;
   onToggle: (key: string) => void;
   onOpenAgentProfile?: (pubkey: string) => void;
 }) {
@@ -908,6 +1000,8 @@ function CollapsibleAgentGroup({
               agent={agent}
               agentMenuProps={agentMenuProps}
               key={agent.pubkey}
+              presenceLoaded={presenceLoaded}
+              presenceLookup={presenceLookup}
               onOpenAgentProfile={onOpenAgentProfile}
             />
           ))}

@@ -115,10 +115,7 @@ test("create agent supports parallelism and system prompt overrides", async ({
 
   await page.goto("/");
   await page.getByTestId("open-agents-view").click();
-  await page
-    .getByTestId("agents-library-personas")
-    .getByRole("button", { name: "New", exact: true })
-    .click();
+  await page.getByTestId("new-agent-card").click();
   await page.getByText("Custom Agent").click();
 
   await page.getByTestId("agent-name-input").fill(agentName);

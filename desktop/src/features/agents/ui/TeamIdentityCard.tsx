@@ -1,5 +1,5 @@
 import type { ReactNode } from "react";
-import { Link, Users } from "lucide-react";
+import { Info, Link, Users } from "lucide-react";
 
 import { ProfileAvatar } from "@/features/profile/ui/ProfileAvatar";
 import type { AgentPersona } from "@/shared/api/types";
@@ -28,6 +28,7 @@ export function TeamIdentityCard({
   actions,
   children,
   dataTestId,
+  description,
   isSymlink = false,
   memberCount,
   personas,
@@ -37,6 +38,7 @@ export function TeamIdentityCard({
   version,
 }: TeamIdentityCardProps) {
   const footerModelLabel = getTeamFooterModelLabel(personas);
+  const trimmedDescription = description?.trim();
 
   return (
     <Card
@@ -61,6 +63,22 @@ export function TeamIdentityCard({
             <span className="rounded-full border border-border/65 bg-background/90 px-2 py-1 text-2xs font-medium leading-none text-muted-foreground shadow-xs">
               v{version}
             </span>
+          ) : null}
+          {trimmedDescription ? (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <button
+                  aria-label={`${teamName} description`}
+                  className="flex h-6 w-6 items-center justify-center rounded-full border border-border/65 bg-background/90 text-muted-foreground shadow-xs"
+                  type="button"
+                >
+                  <Info className="h-3.5 w-3.5" />
+                </button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom" className="max-w-xs">
+                <p>{trimmedDescription}</p>
+              </TooltipContent>
+            </Tooltip>
           ) : null}
         </div>
 

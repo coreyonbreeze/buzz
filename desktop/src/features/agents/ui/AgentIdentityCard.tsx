@@ -12,6 +12,7 @@ type AgentIdentityCardProps = {
   label: string;
   modelLabel: string;
   onClick: () => void;
+  status?: ReactNode;
 };
 
 export function AgentIdentityCard({
@@ -22,6 +23,7 @@ export function AgentIdentityCard({
   label,
   modelLabel,
   onClick,
+  status,
 }: AgentIdentityCardProps) {
   const trimmedAvatarUrl = avatarUrl?.trim() || null;
 
@@ -54,6 +56,12 @@ export function AgentIdentityCard({
 
       {actions ? (
         <div className="absolute top-3 right-3 z-40">{actions}</div>
+      ) : null}
+
+      {status ? (
+        <div className="absolute top-3 left-3 z-30 flex max-w-[calc(100%-4rem)] flex-wrap items-center gap-1.5">
+          {status}
+        </div>
       ) : null}
 
       <div className="absolute right-3 bottom-3 left-3 z-30 flex min-w-0 flex-col gap-0.5 text-left text-sm leading-5">

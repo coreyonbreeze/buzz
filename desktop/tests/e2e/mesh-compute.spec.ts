@@ -76,10 +76,7 @@ async function openManagedAgentActions(
 }
 
 async function openNewAgentMenu(page: import("@playwright/test").Page) {
-  await page
-    .getByTestId("agents-library-personas")
-    .getByRole("button", { name: "New", exact: true })
-    .click();
+  await page.getByTestId("new-agent-card").click();
 }
 
 test.beforeEach(async ({ page }) => {
