@@ -46,8 +46,9 @@ const overrides = new Map([
   ["src-tauri/src/managed_agents/nest.rs", 1450],
   // harness-persona-sync: persona-runtime resolution threaded into the spawn
   // path here. Load-bearing feature growth; queued to split in the resolver
-  // unify refactor followup.
-  ["src-tauri/src/managed_agents/runtime.rs", 2031],
+  // unify refactor followup. +1 line from activity-ui-polish threads avatar_url
+  // into build_managed_agent_summary for the assistant-bubble pinned snapshot.
+  ["src-tauri/src/managed_agents/runtime.rs", 2032],
   ["src-tauri/src/managed_agents/personas.rs", 1080],
   // Phase-2 inbound reconcile + review-fix cycle: reconcile_inbound_persona_event
   // dispatches 30175/30176/30177 inbound plus kind:5 tombstone consume

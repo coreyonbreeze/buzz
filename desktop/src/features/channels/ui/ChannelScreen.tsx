@@ -273,25 +273,6 @@ export function ChannelScreen({
         : [],
     [activeChannel],
   );
-  const messageProfilePubkeys = React.useMemo(
-    () => [
-      ...new Set([
-        ...messageAuthorPubkeys,
-        ...messageMentionPubkeys,
-        ...activeDmParticipantPubkeys,
-        ...typingEntries.map((entry) => entry.pubkey),
-      ]),
-    ],
-    [
-      activeDmParticipantPubkeys,
-      messageAuthorPubkeys,
-      messageMentionPubkeys,
-      typingEntries,
-    ],
-  );
-  const messageProfilesQuery = useUsersBatchQuery(messageProfilePubkeys, {
-    enabled: messageProfilePubkeys.length > 0,
-  });
   const channelMembersQuery = useChannelMembersQuery(activeChannel?.id ?? null);
   const channelMembers = channelMembersQuery.data;
   const managedAgentsQuery = useManagedAgentsQuery();
@@ -313,6 +294,27 @@ export function ChannelScreen({
     }
     return pubkeys;
   }, [channelMembers, managedAgents, relayAgents]);
+  const messageProfilePubkeys = React.useMemo(
+    () => [
+      ...new Set([
+        ...messageAuthorPubkeys,
+        ...messageMentionPubkeys,
+        ...activeDmParticipantPubkeys,
+        ...agentPubkeys,
+        ...typingEntries.map((entry) => entry.pubkey),
+      ]),
+    ],
+    [
+      activeDmParticipantPubkeys,
+      agentPubkeys,
+      messageAuthorPubkeys,
+      messageMentionPubkeys,
+      typingEntries,
+    ],
+  );
+  const messageProfilesQuery = useUsersBatchQuery(messageProfilePubkeys, {
+    enabled: messageProfilePubkeys.length > 0,
+  });
   const {
     agentSessionCandidates,
     botTypingEntries,
