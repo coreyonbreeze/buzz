@@ -91,7 +91,46 @@ pub async fn handle_req(
 
     let channel_id = extract_channel_id_from_filters(&filters);
 
-    // ── #p / engram gating for globally-stored sensitive kinds ───────────────
+    // Confirm channel access up front so the repaired `accessible_channels`
+    // vector reaches every downstream consumer: the NIP-50 search branch
+    // below, subscription registration, historical delivery, and COUNT. A
+    // cache-negative may be a stale miss on a non-writer pod (member just added
+    // on the pod that processed the write, before the 10s TTL expires or the
+    // cross-pod invalidation lands), so on a miss we confirm uncached against
+    // the DB; a verified positive repairs the vector request-locally (see
+    // `resolve_request_local_access`). Running this ahead of the search branch
+    // is what fixes the search false-miss: a `#h=<just-added>` search would
+    // otherwise be scoped against the stale vector and return empty.
+    if let Some(ch_id) = channel_id {
+        let token_allows = token_channel_ids
+            .as_deref()
+            .is_none_or(|allowed| allowed.contains(&ch_id));
+        let db_is_member = if !token_allows || accessible_channels.contains(&ch_id) {
+            None
+        } else {
+            match state.db.is_member(ch_id, &pubkey_bytes).await {
+                Ok(member) => Some(member),
+                Err(e) => {
+                    warn!(conn_id = %conn_id, "Channel membership confirmation failed: {e}");
+                    conn.send(RelayMessage::closed(&sub_id, "error: database error"));
+                    return;
+                }
+            }
+        };
+        if !resolve_request_local_access(
+            &mut accessible_channels,
+            ch_id,
+            token_allows,
+            db_is_member,
+        ) {
+            conn.send(RelayMessage::closed(
+                &sub_id,
+                "restricted: not a channel member",
+            ));
+            return;
+        }
+    }
+
     // Applied BEFORE the NIP-50 search branch so that an authenticated member
     // cannot use `{"search":"...","kinds":[30174]}` (or similar for p-gated
     // kinds) to harvest indexed-but-globally-stored sensitive events. Search
@@ -125,7 +164,6 @@ pub async fn handle_req(
         }
     }
 
-    // ── NIP-50 search: one-shot, no persistent subscription ──────────────────
     // Search filters hit Typesense and return historical hits, then EOSE.
     // They are not registered for fan-out. The sensitive-kind gates above
     // already ran, so an authed member cannot use search to bypass author/#p
@@ -151,17 +189,6 @@ pub async fn handle_req(
         )
         .await;
         return;
-    }
-
-    // Check channel access BEFORE registering the subscription.
-    if let Some(ch_id) = channel_id {
-        if !accessible_channels.contains(&ch_id) {
-            conn.send(RelayMessage::closed(
-                &sub_id,
-                "restricted: not a channel member",
-            ));
-            return;
-        }
     }
 
     {
@@ -273,6 +300,52 @@ pub async fn handle_req(
 /// Search subscriptions are one-shot — no persistent subscription is registered.
 /// Maximum Typesense pages to fetch per filter (prevents unbounded loops).
 const MAX_SEARCH_PAGES: u32 = 10;
+
+/// Resolve request-local channel access, repairing a stale cache-negative.
+///
+/// `accessible_channels` is the per-request membership vector — built once from
+/// the 10s cache (and already narrowed by any scoped-auth `token_channel_ids`
+/// via `retain`) and reused for subscription registration, historical delivery,
+/// search scope, and COUNT. On a multi-pod relay it can be stale on a non-writer
+/// pod (a member just added on another pod, before the TTL expires or the
+/// cross-pod invalidation lands), so the cache-negative branch confirms against
+/// the DB uncached and passes the result here.
+///
+/// `token_allows` is the scoped-auth upper bound: `false` when a scoped token is
+/// present and does NOT cover `ch_id`. The DB-positive repair must never push a
+/// channel back in past that bound, or a token scoped to channel A could reach
+/// channel B merely because the user is a DB member of B.
+///
+/// Truth table:
+/// - token denies `ch_id`               → denied, no DB needed, no repair
+/// - cached contains `ch_id`            → allowed, no repair, no DB needed
+/// - cache-miss + DB says member        → allowed, `ch_id` pushed once (repair)
+/// - cache-miss + DB says not a member  → denied, vector unchanged
+///
+/// The push is what makes the confirmation request-local-authoritative: every
+/// downstream consumer reads the same repaired vector, so a stale negative
+/// cannot stay sticky for the rest of the request. `db_is_member` is `None` when
+/// the cache hit or the token bound denied (DB was never consulted).
+pub(crate) fn resolve_request_local_access(
+    accessible_channels: &mut Vec<uuid::Uuid>,
+    ch_id: uuid::Uuid,
+    token_allows: bool,
+    db_is_member: Option<bool>,
+) -> bool {
+    if !token_allows {
+        return false;
+    }
+    if accessible_channels.contains(&ch_id) {
+        return true;
+    }
+    match db_is_member {
+        Some(true) => {
+            accessible_channels.push(ch_id);
+            true
+        }
+        _ => false,
+    }
+}
 
 pub(crate) fn build_search_channel_scope_filter(
     accessible_channels: &[uuid::Uuid],
@@ -889,6 +962,75 @@ mod tests {
     use super::*;
     use nostr::{Alphabet, Filter, SingleLetterTag};
 
+    #[test]
+    fn request_local_access_cache_positive_no_db_no_repair() {
+        let ch = uuid::Uuid::new_v4();
+        let mut accessible = vec![ch];
+        // Cache hit: DB was never consulted (None), allowed, vector unchanged.
+        assert!(resolve_request_local_access(
+            &mut accessible,
+            ch,
+            true,
+            None
+        ));
+        assert_eq!(accessible, vec![ch], "no repair, no duplicate on cache hit");
+    }
+
+    #[test]
+    fn request_local_access_cache_negative_db_member_repairs() {
+        let ch = uuid::Uuid::new_v4();
+        let mut accessible: Vec<uuid::Uuid> = vec![];
+        // Stale cache-miss but DB confirms membership: allowed AND repaired.
+        assert!(resolve_request_local_access(
+            &mut accessible,
+            ch,
+            true,
+            Some(true)
+        ));
+        assert!(
+            accessible.contains(&ch),
+            "verified positive must push ch_id so the rest of the request sees it"
+        );
+    }
+
+    #[test]
+    fn request_local_access_cache_negative_db_nonmember_denied() {
+        let ch = uuid::Uuid::new_v4();
+        let mut accessible: Vec<uuid::Uuid> = vec![];
+        // Cache-miss and DB confirms non-membership: denied, vector unchanged.
+        assert!(!resolve_request_local_access(
+            &mut accessible,
+            ch,
+            true,
+            Some(false)
+        ));
+        assert!(
+            accessible.is_empty(),
+            "denied access must not mutate the request-local vector"
+        );
+    }
+
+    #[test]
+    fn request_local_access_token_denies_never_repairs() {
+        let ch = uuid::Uuid::new_v4();
+        let mut accessible: Vec<uuid::Uuid> = vec![];
+        // Scoped token does NOT cover ch_id: denied even though the DB confirms
+        // membership. The token scope is an upper bound on the repair — a DB
+        // positive must never push a channel back in past a narrower token, or
+        // a token scoped to channel A could reach channel B merely because the
+        // user is a DB member of B.
+        assert!(!resolve_request_local_access(
+            &mut accessible,
+            ch,
+            false,
+            Some(true)
+        ));
+        assert!(
+            accessible.is_empty(),
+            "token-denied access must not be repaired into the vector"
+        );
+    }
+
     fn filter_with_channel(channel_id: uuid::Uuid) -> Filter {
         Filter::new().custom_tag(
             SingleLetterTag::lowercase(Alphabet::H),
@@ -1082,8 +1224,6 @@ mod tests {
         );
     }
 
-    // ── NIP-AE engram read gating ────────────────────────────────────────
-
     /// Three real x-only pubkeys (valid for `PublicKey::from_hex`). Distinct,
     /// so we can label them clearly in tests.
     fn three_pubkeys() -> (String, String, String) {
@@ -1193,7 +1333,6 @@ mod tests {
         assert!(!engram_filters_authorized(&[f], &agent));
     }
 
-    // ── NIP-50 search bypass regressions ─────────────────────────────────
     // These filters are the shape an authenticated relay member would send
     // to try to harvest indexed engram envelopes via the search path. The
     // gate must reject them regardless of the presence of `search`.

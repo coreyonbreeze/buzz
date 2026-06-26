@@ -48,7 +48,6 @@ async fn main() -> anyhow::Result<()> {
         "Config loaded"
     );
 
-    // ── Metrics recorder (Prometheus exporter on :9102) ──────────────────────
     relay_metrics::install(config.metrics_port);
     info!(
         port = config.metrics_port,
@@ -186,6 +185,12 @@ async fn main() -> anyhow::Result<()> {
     // fanned out to local WebSocket subscribers.
     let pubsub_for_sub = Arc::clone(&pubsub);
     tokio::spawn(async move { pubsub_for_sub.run_subscriber().await });
+
+    // Spawn Redis pub/sub subscriber for cross-pod cache-key invalidation.
+    // Membership / visibility changes on other pods are received here and the
+    // matching local moka caches are dropped (via the consumer loop below).
+    let pubsub_for_cache = Arc::clone(&pubsub);
+    tokio::spawn(async move { pubsub_for_cache.run_cache_invalidation_subscriber().await });
 
     let auth = AuthService::new(config.auth.clone());
 
@@ -513,12 +518,37 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Cross-pod cache-invalidation consumer: receive cache-key drops from Redis
+    // pub/sub (published by other relay instances when membership/visibility
+    // changes) and apply the matching local moka drop. Uses the `*_local` drop
+    // variants so a received drop is never re-published.
+    {
+        let state_for_cache = Arc::clone(&state);
+        let mut rx = state_for_cache.pubsub.subscribe_cache_invalidations();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(invalidation) => {
+                        state_for_cache.apply_cache_invalidation(invalidation);
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        metrics::counter!("buzz_cache_invalidation_lag_total").increment(n);
+                        tracing::warn!("Cache-invalidation consumer lagged by {n} messages");
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        tracing::error!("Cache-invalidation broadcast channel closed");
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
     let router = build_router(Arc::clone(&state));
     let health_router = build_health_router(Arc::clone(&state));
 
     serve(router, health_router, Arc::clone(&state)).await?;
 
-    // ── Drain audit queue ────────────────────────────────────────────────────
     // Signal the audit worker to stop accepting, flush buffered entries, and
     // exit. Uses a CancellationToken so it works regardless of how many
     // Arc<AppState> clones are still alive in background tasks.
@@ -550,7 +580,6 @@ async fn serve(
 ) -> anyhow::Result<()> {
     let config = &state.config;
 
-    // ── Health listener (port 8080) ──────────────────────────────────────────
     let health_listener = tokio::net::TcpListener::bind(("0.0.0.0", config.health_port))
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind health port {}: {e}", config.health_port))?;
@@ -559,7 +588,6 @@ async fn serve(
         axum::serve(health_listener, health_router).await.ok();
     });
 
-    // ── Shutdown coordination ────────────────────────────────────────────────
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let shutdown_flag = Arc::clone(&state.shutting_down);
     let tx = shutdown_tx.clone();
@@ -577,13 +605,11 @@ async fn serve(
         std::process::exit(1);
     });
 
-    // ── App listener (TCP) ───────────────────────────────────────────────────
     let tcp_listener = tokio::net::TcpListener::bind(&config.bind_addr)
         .await
         .map_err(|e| anyhow::anyhow!("Failed to bind {}: {e}", config.bind_addr))?;
     info!(addr = %config.bind_addr, "buzz-relay TCP listening");
 
-    // ── App listener (UDS, optional) ─────────────────────────────────────────
     #[cfg(unix)]
     if let Some(ref uds_path) = config.uds_path {
         use std::os::unix::fs::FileTypeExt as _;

@@ -57,7 +57,7 @@ fn bounded_kind_label(kind: u32) -> String {
 /// survives on another node after an open->private flip, its events are not
 /// delivered here.
 pub async fn filter_fanout_by_access(
-    state: &Arc<AppState>,
+    state: &AppState,
     stored_event: &StoredEvent,
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
@@ -110,6 +110,54 @@ pub async fn filter_fanout_by_access(
         }
     }
     allowed
+}
+
+/// Deliver one event to this relay's local subscribers through the access gate.
+///
+/// This is the single guarded send path for relay-local EVENT delivery. It runs
+/// `fan_out()` to find matching subscriptions, then `filter_fanout_by_access()`
+/// to drop recipients without access (private-channel non-members, author-only
+/// kinds delivered to non-authors), then writes the EVENT frames. The invariant
+/// it enforces: a registered subscription is never sufficient for delivery —
+/// delivery always revalidates access on the sending pod, so a stale
+/// subscription surviving a membership/visibility change (e.g. after an
+/// open→private flip or a cross-pod cache lag) cannot leak events.
+///
+/// All relay-local live fan-out routes through here. The two exceptions are
+/// `dispatch_persistent_event` (persistent ingest) and `fan_out_pubsub_event`
+/// (Redis cross-node), which call `filter_fanout_by_access` inline: the former
+/// layers an additional per-recipient DM-visibility-owner gate on top, the
+/// latter skips local echoes — both are equivalent to this helper plus their
+/// own extra step.
+pub(crate) async fn fan_out_event_to_local_subscribers(state: &AppState, stored: &StoredEvent) {
+    let matches = state.sub_registry.fan_out(stored);
+    let matches = filter_fanout_by_access(state, stored, matches).await;
+    metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
+    if matches.is_empty() {
+        return;
+    }
+
+    let event_json = match serde_json::to_string(&stored.event) {
+        Ok(json) => json,
+        Err(e) => {
+            error!(event_id = %stored.event.id.to_hex(), "Failed to serialize event for fan-out: {e}");
+            return;
+        }
+    };
+    let mut drop_count = 0u32;
+    for (conn_id, sub_id) in &matches {
+        let msg = format!(r#"["EVENT","{}",{}]"#, sub_id, event_json);
+        if !state.conn_manager.send_to(*conn_id, msg) {
+            drop_count += 1;
+        }
+    }
+    if drop_count > 0 {
+        tracing::warn!(
+            event_id = %stored.event.id.to_hex(),
+            drop_count,
+            "fan-out: {drop_count} connection(s) cancelled due to full/closed buffers"
+        );
+    }
 }
 
 /// Fan out one event received from Redis pub/sub to this relay's local subscribers.
@@ -312,7 +360,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
     debug!(event_id = %event_id_hex, kind = kind_u32, "EVENT");
     metrics::counter!("buzz_events_received_total", "kind" => kind_str.clone()).increment(1);
 
-    // ── Extract auth from WS connection state ────────────────────────────
     let (conn_id, pubkey_bytes, auth_pubkey, scopes, channel_ids) = {
         let auth = conn.auth_state.read().await;
         match &*auth {
@@ -335,7 +382,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         }
     };
 
-    // ── Pubkey / auth identity match (all events) ─────────────────────
     // Must run before both ephemeral and persistent branches. Persistent
     // events get a second check inside ingest_event() (step 3), but
     // ephemeral events bypass the pipeline entirely.
@@ -351,7 +397,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    // ── Blocked kinds (both ephemeral and persistent) ─────────────────
     if kind_u32 == buzz_core::kind::KIND_AUTH {
         reject("invalid");
         conn.send(RelayMessage::ok(
@@ -362,7 +407,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    // ── Agent observer frames are owner-scoped, encrypted, and never stored ──
     if kind_u32 == KIND_AGENT_OBSERVER_FRAME {
         if !scopes.is_empty()
             && !scopes.contains(&buzz_auth::Scope::MessagesWrite)
@@ -380,7 +424,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    // ── Ephemeral events are WS-only (never stored) ──────────────────────
     // Scope enforcement for ephemeral kinds: require MessagesWrite or
     // ProxySubmit. Persistent events skip this gate and rely on
     // ingest_event()'s per-kind scope allowlist instead, so a token with
@@ -427,7 +470,6 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         return;
     }
 
-    // ── Persistent events → ingest pipeline ──────────────────────────────
     let ingest_auth = IngestAuth::Nip42 {
         pubkey: auth_pubkey,
         scopes,
@@ -594,27 +636,12 @@ async fn handle_ephemeral_event(
             warn!(conn_id = %conn_id, event_id = %event_id_hex, "Ephemeral publish failed: {e}");
         }
 
-        // Direct fan-out to local WS subscribers.
+        // Direct fan-out to local WS subscribers, through the guarded send path
+        // so a stale subscription on a removed/non-member connection cannot
+        // receive this private-channel ephemeral event.
         // Pass the channel_id so fan_out() uses the channel-kind index.
         let stored_event = StoredEvent::new(event.clone(), Some(ch_id));
-        let matches = state.sub_registry.fan_out(&stored_event);
-        metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
-        let event_json = serde_json::to_string(&event)
-            .expect("nostr::Event serialization is infallible for well-formed events");
-        let mut drop_count = 0u32;
-        for (target_conn_id, sub_id) in &matches {
-            let msg = format!(r#"["EVENT","{}",{}]"#, sub_id, event_json);
-            if !state.conn_manager.send_to(*target_conn_id, msg) {
-                drop_count += 1;
-            }
-        }
-        if drop_count > 0 {
-            tracing::warn!(
-                event_id = %event_id_hex,
-                drop_count,
-                "fan-out: {drop_count} connection(s) cancelled due to full/closed buffers"
-            );
-        }
+        fan_out_event_to_local_subscribers(&state, &stored_event).await;
     } else {
         // Channel-less ephemeral events (e.g., NIP-AB pairing kind:24134).
         //
@@ -631,27 +658,12 @@ async fn handle_ephemeral_event(
             warn!(conn_id = %conn_id, event_id = %event_id_hex, "Ephemeral global publish failed: {e}");
         }
 
-        // Direct fan-out to local WS subscribers.
-        // Pass channel_id=None so fan_out() uses the global subscriber index.
+        // Direct fan-out to local WS subscribers through the guarded send path.
+        // Pass channel_id=None so fan_out() uses the global subscriber index;
+        // filter_fanout_by_access no-ops for channel-less events except the
+        // author-only-kind gate.
         let stored_event = StoredEvent::new(event.clone(), None);
-        let matches = state.sub_registry.fan_out(&stored_event);
-        metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
-        let event_json = serde_json::to_string(&event)
-            .expect("nostr::Event serialization is infallible for well-formed events");
-        let mut drop_count = 0u32;
-        for (target_conn_id, sub_id) in &matches {
-            let msg = format!(r#"["EVENT","{}",{}]"#, sub_id, event_json);
-            if !state.conn_manager.send_to(*target_conn_id, msg) {
-                drop_count += 1;
-            }
-        }
-        if drop_count > 0 {
-            tracing::warn!(
-                event_id = %event_id_hex,
-                drop_count,
-                "fan-out: {drop_count} connection(s) cancelled due to full/closed buffers"
-            );
-        }
+        fan_out_event_to_local_subscribers(&state, &stored_event).await;
     }
 
     conn.send(RelayMessage::ok(event_id_hex, true, ""));
@@ -806,19 +818,6 @@ async fn handle_agent_observer_event(
         }
     }
 
-    let event_json = match serde_json::to_string(&event) {
-        Ok(json) => json,
-        Err(e) => {
-            error!(event_id = %event_id_hex, "Failed to serialize agent observer event: {e}");
-            conn.send(RelayMessage::ok(
-                event_id_hex,
-                false,
-                "error: internal server error",
-            ));
-            return;
-        }
-    };
-
     state.mark_local_event(&event.id);
     if let Err(e) = state.pubsub.publish_event(uuid::Uuid::nil(), &event).await {
         state.local_event_ids.invalidate(&event.id.to_bytes());
@@ -826,31 +825,14 @@ async fn handle_agent_observer_event(
     }
 
     let stored_event = StoredEvent::new(event.clone(), None);
-    let matches = state.sub_registry.fan_out(&stored_event);
-    metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
     debug!(
         event_id = %event_id_hex,
         agent = %route.agent.to_hex(),
         owner = %route.owner.to_hex(),
         direction = ?route.direction,
-        match_count = matches.len(),
         "Agent observer fan-out"
     );
-
-    let mut drop_count = 0u32;
-    for (target_conn_id, sub_id) in &matches {
-        let msg = format!(r#"["EVENT","{}",{}]"#, sub_id, event_json);
-        if !state.conn_manager.send_to(*target_conn_id, msg) {
-            drop_count += 1;
-        }
-    }
-    if drop_count > 0 {
-        tracing::warn!(
-            event_id = %event_id_hex,
-            drop_count,
-            "agent observer fan-out: {drop_count} connection(s) cancelled due to full/closed buffers"
-        );
-    }
+    fan_out_event_to_local_subscribers(&state, &stored_event).await;
 
     conn.send(RelayMessage::ok(event_id_hex, true, ""));
 }
@@ -1039,7 +1021,7 @@ mod tests {
         use std::sync::Arc;
 
         use axum::extract::ws::Message;
-        use buzz_core::kind::KIND_PRESENCE_UPDATE;
+        use buzz_core::kind::{KIND_MEMBER_ADDED_NOTIFICATION, KIND_PRESENCE_UPDATE};
         use buzz_pubsub::ChannelEvent;
         use nostr::{EventBuilder, Filter, Keys, Kind};
         use tokio::sync::{mpsc, Mutex};
@@ -1053,9 +1035,11 @@ mod tests {
             super::fanout_access::test_state().await
         }
 
-        fn register_presence_sub(
+        fn register_global_sub(
             state: &AppState,
             sub_id: &str,
+            filter: Filter,
+            pubkey: Option<Vec<u8>>,
         ) -> (Uuid, mpsc::Receiver<Message>) {
             let conn_id = Uuid::new_v4();
             let (tx, rx) = mpsc::channel(10);
@@ -1065,20 +1049,58 @@ mod tests {
                 CancellationToken::new(),
                 Arc::new(AtomicU8::new(0)),
                 Arc::new(Mutex::new(HashMap::new())),
+                3,
             );
-            state.sub_registry.register(
-                conn_id,
-                sub_id.to_string(),
-                vec![Filter::new().kind(Kind::Custom(KIND_PRESENCE_UPDATE as u16))],
-                None,
-            );
+            if let Some(pubkey) = pubkey {
+                state.conn_manager.set_authenticated_pubkey(conn_id, pubkey);
+            }
+            state
+                .sub_registry
+                .register(conn_id, sub_id.to_string(), vec![filter], None);
             (conn_id, rx)
+        }
+
+        fn register_presence_sub(
+            state: &AppState,
+            sub_id: &str,
+        ) -> (Uuid, mpsc::Receiver<Message>) {
+            register_global_sub(
+                state,
+                sub_id,
+                Filter::new().kind(Kind::Custom(KIND_PRESENCE_UPDATE as u16)),
+                None,
+            )
+        }
+
+        fn register_membership_sub(
+            state: &AppState,
+            sub_id: &str,
+            target: &Keys,
+        ) -> (Uuid, mpsc::Receiver<Message>) {
+            register_global_sub(
+                state,
+                sub_id,
+                Filter::new()
+                    .kind(Kind::Custom(KIND_MEMBER_ADDED_NOTIFICATION as u16))
+                    .pubkey(target.public_key()),
+                Some(target.public_key().to_bytes().to_vec()),
+            )
         }
 
         fn presence_event(status: &str) -> nostr::Event {
             EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE as u16), status)
                 .sign_with_keys(&Keys::generate())
                 .expect("sign presence")
+        }
+
+        fn membership_event(target: &Keys, channel_id: Uuid) -> nostr::Event {
+            EventBuilder::new(Kind::Custom(KIND_MEMBER_ADDED_NOTIFICATION as u16), "{}")
+                .tags([
+                    nostr::Tag::parse(["p", &target.public_key().to_hex()]).expect("p tag"),
+                    nostr::Tag::parse(["h", &channel_id.to_string()]).expect("h tag"),
+                ])
+                .sign_with_keys(&Keys::generate())
+                .expect("sign membership notification")
         }
 
         fn event_from_ws_message(msg: Message) -> nostr::Event {
@@ -1130,6 +1152,39 @@ mod tests {
             assert!(
                 rx.try_recv().is_err(),
                 "Redis echo of locally fanned-out presence must be suppressed"
+            );
+        }
+
+        #[tokio::test]
+        async fn global_membership_pubsub_event_fans_out_by_p_tag() {
+            let state = test_state().await;
+            let target = Keys::generate();
+            let other = Keys::generate();
+            let (_target_conn, mut target_rx) =
+                register_membership_sub(&state, "membership-target", &target);
+            let (_other_conn, mut other_rx) =
+                register_membership_sub(&state, "membership-other", &other);
+            let event = membership_event(&target, Uuid::new_v4());
+            let event_id = event.id;
+
+            fan_out_pubsub_event(
+                &state,
+                ChannelEvent {
+                    channel_id: Uuid::nil(),
+                    event,
+                },
+            )
+            .await;
+
+            let delivered = event_from_ws_message(
+                target_rx
+                    .try_recv()
+                    .expect("target receives membership notification"),
+            );
+            assert_eq!(delivered.id, event_id);
+            assert!(
+                other_rx.try_recv().is_err(),
+                "membership notification should only reach matching #p subscribers"
             );
         }
 

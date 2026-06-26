@@ -23,6 +23,8 @@ import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'date_formatters.dart';
 import 'day_divider.dart';
+import 'dm_channel_labels.dart';
+import 'ephemeral_channel_display.dart';
 import 'manage_channel_sheet.dart';
 import 'members_sheet.dart';
 import 'message_actions.dart';
@@ -64,6 +66,7 @@ int? _channelReadTimestamp({
   if (events != null && events.isNotEmpty) {
     var latest = 0;
     for (final event in events) {
+      if (event.threadReference.parentId != null) continue;
       if (event.createdAt > latest) {
         latest = event.createdAt;
       }
@@ -132,6 +135,9 @@ class ChannelDetailPage extends HookConsumerWidget {
         ref
             .read(readStateProvider.notifier)
             .markContextRead(channel.id, readTimestamp);
+        ref
+            .read(channelsProvider.notifier)
+            .clearObservedUnreadCoveredByRead(channel.id, readTimestamp);
       });
     }, [channel.id, readState.isReady, readTimestamp]);
 
@@ -155,11 +161,23 @@ class ChannelDetailPage extends HookConsumerWidget {
                       crossAxisAlignment: CrossAxisAlignment.start,
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Text(
-                          resolvedChannel.displayLabel(
-                            currentPubkey: currentPubkey,
-                          ),
-                          overflow: TextOverflow.ellipsis,
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Flexible(
+                              child: Text(
+                                resolveDmChannelDisplayLabel(
+                                  resolvedChannel,
+                                  currentPubkey: currentPubkey,
+                                ),
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                            ),
+                            if (resolvedChannel.isEphemeral) ...[
+                              const SizedBox(width: Grid.quarter),
+                              _HeaderEphemeralBadge(channel: resolvedChannel),
+                            ],
+                          ],
                         ),
                         if (resolvedChannel.isStream)
                           Text(
@@ -536,10 +554,6 @@ class _MessageList extends HookConsumerWidget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// System message row
-// ---------------------------------------------------------------------------
-
 class _SystemMessageRow extends ConsumerWidget {
   final TimelineMessage message;
   final String channelId;
@@ -675,10 +689,6 @@ Widget _systemEventAvatar(
   );
 }
 
-// ---------------------------------------------------------------------------
-// Thread summary row (shown below messages that have replies)
-// ---------------------------------------------------------------------------
-
 class _ThreadSummaryRow extends ConsumerWidget {
   final ThreadSummary summary;
   final TimelineMessage message;
@@ -763,10 +773,6 @@ class _ThreadSummaryRow extends ConsumerWidget {
     );
   }
 }
-
-// ---------------------------------------------------------------------------
-// User message bubble
-// ---------------------------------------------------------------------------
 
 class _MessageBubble extends ConsumerWidget {
   final TimelineMessage message;
@@ -946,10 +952,6 @@ class _UserAvatar extends StatelessWidget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Channel management
-// ---------------------------------------------------------------------------
-
 IconData channelIcon(Channel channel) {
   if (channel.isDm) return LucideIcons.messagesSquare;
   if (channel.isPrivate) return LucideIcons.lock;
@@ -989,9 +991,27 @@ class _ReadOnlyNotice extends StatelessWidget {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Connection banner (shown inside channel detail during reconnect)
-// ---------------------------------------------------------------------------
+class _HeaderEphemeralBadge extends StatelessWidget {
+  final Channel channel;
+
+  const _HeaderEphemeralBadge({required this.channel});
+
+  @override
+  Widget build(BuildContext context) {
+    final display = ephemeralChannelDisplay(channel);
+    if (display == null) return const SizedBox.shrink();
+
+    return Tooltip(
+      message: display.tooltipLabel,
+      child: Icon(
+        LucideIcons.clockFading,
+        key: const Key('chat-ephemeral-badge'),
+        size: 16,
+        color: context.colors.onSurfaceVariant,
+      ),
+    );
+  }
+}
 
 class _DetailConnectionBanner extends StatelessWidget {
   final SessionStatus status;
@@ -1035,10 +1055,6 @@ class _DetailConnectionBanner extends StatelessWidget {
     );
   }
 }
-
-// ---------------------------------------------------------------------------
-// Typing indicator
-// ---------------------------------------------------------------------------
 
 class _TypingIndicator extends ConsumerWidget {
   final List<TypingEntry> entries;
@@ -1103,10 +1119,6 @@ class _TypingIndicator extends ConsumerWidget {
     );
   }
 }
-
-// ---------------------------------------------------------------------------
-// Members button with activity dot badge
-// ---------------------------------------------------------------------------
 
 class _MembersButton extends ConsumerWidget {
   final String channelId;
@@ -1257,11 +1269,25 @@ class _DmAppBarTitle extends ConsumerWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             mainAxisSize: MainAxisSize.min,
             children: [
-              Text(
-                channel.displayLabel(currentPubkey: currentPubkey),
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: context.textTheme.titleSmall,
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Flexible(
+                    child: Text(
+                      resolveDmChannelDisplayLabel(
+                        channel,
+                        currentPubkey: currentPubkey,
+                      ),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: context.textTheme.titleSmall,
+                    ),
+                  ),
+                  if (channel.isEphemeral) ...[
+                    const SizedBox(width: Grid.quarter),
+                    _HeaderEphemeralBadge(channel: channel),
+                  ],
+                ],
               ),
               Text(
                 presenceLabel,

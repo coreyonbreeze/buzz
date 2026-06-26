@@ -10,6 +10,12 @@ export const READ_STATE_HORIZON_SECONDS = 7 * 24 * 60 * 60;
 
 export const MAX_CONTEXTS = 10_000;
 
+// Maximum plaintext byte length for the JSON blob passed to nip44EncryptToSelf.
+// NIP-44 v2 hard-caps plaintext at 65,535 bytes; the relay enforces a 256 KB
+// content limit. 32 KB gives ample headroom for NIP-44 overhead (~1.4×
+// expansion to ~45 KB ciphertext) while keeping the blob well under both caps.
+export const READ_STATE_MAX_PLAINTEXT_BYTES = 32_768;
+
 // Context-key prefix for a per-MESSAGE read marker (LP4 v3). One grow-only
 // marker per reply id; the badge predicate reads effective("msg:<id>") live so
 // reading an ancestor never covers a descendant (Issue 2 by construction).
@@ -18,17 +24,30 @@ export const MAX_CONTEXTS = 10_000;
 export const MSG_PREFIX = "msg:";
 export const THREAD_PREFIX = "thread:";
 
+const EVENT_ID_PATTERN = /^[0-9a-f]{64}$/;
+
+export function maxReadAt(...markers: Array<number | null>): number | null {
+  return markers.reduce<number | null>((latest, marker) => {
+    if (marker === null) return latest;
+    if (latest === null || marker > latest) return marker;
+    return latest;
+  }, null);
+}
+
 export function msgContextKey(messageId: string): string {
   return `${MSG_PREFIX}${messageId}`;
 }
 
-// A well-formed per-message context key: the msg: prefix with a non-empty id
-// that does NOT itself start with thread: (guards against a thread key being
-// mistaken for, or double-prefixed into, a message key).
+// Spec-conformance helpers for well-known interoperable context keys. Runtime
+// folding/eviction remains prefix-based so opaque client-local keys still work.
+export function isThreadContextKey(value: string): value is `thread:${string}` {
+  if (!value.startsWith(THREAD_PREFIX)) return false;
+  return EVENT_ID_PATTERN.test(value.slice(THREAD_PREFIX.length));
+}
+
 export function isMsgContextKey(value: string): value is `msg:${string}` {
   if (!value.startsWith(MSG_PREFIX)) return false;
-  const id = value.slice(MSG_PREFIX.length);
-  return id.length > 0 && !id.startsWith(THREAD_PREFIX);
+  return EVENT_ID_PATTERN.test(value.slice(MSG_PREFIX.length));
 }
 
 export function localReadStateKey(pubkey: string): string {

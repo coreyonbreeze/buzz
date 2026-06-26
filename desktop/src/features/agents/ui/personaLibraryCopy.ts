@@ -14,9 +14,9 @@
  *    template"
  *
  * So every "...persona template" label here, in `CreateAgentDialog`'s opt-in
- * toggle, and in the `useSaveAsPersonaTemplate` / `saveAsPersonaTemplateDialogState`
- * save-as flow maps to the same backend `persona`. Keep new persona-template
- * copy in this file and keep the mapping above current if the vocabulary moves.
+ * toggle, and in the `saveAsPersonaTemplateDialogState` save-as flow maps to
+ * the same backend `persona`. Keep new persona-template copy in this file and
+ * keep the mapping above current if the vocabulary moves.
  */
 export const personaLibraryCopy = {
   title: "My agents",

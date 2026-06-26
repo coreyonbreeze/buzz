@@ -7,13 +7,13 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use clap::Parser;
+use clap::ValueEnum;
 use nostr::Keys;
 use thiserror::Error;
+use url::Url;
 use uuid::Uuid;
 
 use crate::filter::SubscriptionRule;
-
-// ── Constants ─────────────────────────────────────────────────────────────────
 
 /// Default idle timeout (seconds) when neither `--idle-timeout` nor the
 /// deprecated `--turn-timeout` is set.
@@ -26,8 +26,6 @@ use crate::filter::SubscriptionRule;
 /// Override via `--idle-timeout` / `BUZZ_ACP_IDLE_TIMEOUT`.
 pub(crate) const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 900;
 
-// ── Errors ────────────────────────────────────────────────────────────────────
-
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("failed to parse nostr keys: {0}")]
@@ -39,8 +37,6 @@ pub enum ConfigError {
     #[error("config file error: {0}")]
     ConfigFile(String),
 }
-
-// ── Enums ─────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
@@ -78,7 +74,7 @@ pub enum MultipleEventHandling {
 /// - `allowlist`  — owner + explicit pubkey list (`--respond-to-allowlist`).
 /// - `anyone`     — all events forwarded (no author filtering).
 /// - `nobody`     — all events dropped (proactive/heartbeat-only mode).
-#[derive(Debug, Clone, Default, PartialEq, clap::ValueEnum)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, clap::ValueEnum)]
 pub enum RespondTo {
     #[default]
     OwnerOnly,
@@ -151,8 +147,6 @@ impl std::fmt::Display for PermissionMode {
     }
 }
 
-// ── Models subcommand ─────────────────────────────────────────────────────────
-
 /// CLI args for `buzz-acp models` — query available models from an agent.
 ///
 /// This is a standalone `Parser` (not a subcommand variant) because the
@@ -181,8 +175,6 @@ pub struct ModelsArgs {
     #[arg(long)]
     pub json: bool,
 }
-
-// ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Parser)]
 #[command(
@@ -402,6 +394,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_RESPOND_TO_ALLOWLIST", value_delimiter = ',')]
     pub respond_to_allowlist: Option<Vec<String>>,
 
+    /// Comma-separated list of allowed `--respond-to` modes.
+    /// When set, the harness rejects startup if `--respond-to` is not in this list.
+    /// Modes: owner-only, allowlist, anyone, nobody.
+    /// Default: empty (all modes allowed — no restriction).
+    /// Example: `BUZZ_ACP_ALLOWED_RESPOND_TO=owner-only,allowlist`
+    #[arg(long, env = "BUZZ_ACP_ALLOWED_RESPOND_TO", value_delimiter = ',')]
+    pub allowed_respond_to: Option<Vec<String>>,
+
     /// Path to a persona pack directory. Used with --persona-name to configure
     /// the agent from a .persona.md pack instead of CLI flags.
     #[arg(long, env = "BUZZ_ACP_PERSONA_PACK")]
@@ -416,8 +416,6 @@ pub struct CliArgs {
     pub relay_observer: bool,
 }
 
-// ── Merged NIP-01 filter ──────────────────────────────────────────────────────
-
 /// Merged NIP-01 subscription filter for a single channel.
 #[derive(Debug, Clone)]
 pub struct ChannelFilter {
@@ -426,8 +424,6 @@ pub struct ChannelFilter {
     /// Whether to include `#p` tag filter for agent pubkey.
     pub require_mention: bool,
 }
-
-// ── Resolved config ───────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct Config {
@@ -473,6 +469,8 @@ pub struct Config {
     pub respond_to: RespondTo,
     /// Validated allowlist of pubkey hex strings (used when respond_to == Allowlist).
     pub respond_to_allowlist: HashSet<String>,
+    /// Allowed `respond_to` modes. Empty = all modes allowed.
+    pub allowed_respond_to: Vec<String>,
     /// Per-persona env vars to inject at agent spawn time (e.g., GOOSE_PROVIDER, GOOSE_MODEL, BUZZ_AGENT_MODEL).
     /// Populated from persona pack resolution. Empty when no pack is configured.
     pub persona_env_vars: Vec<(String, String)>,
@@ -531,6 +529,57 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
     }
 }
 
+/// Build `-c` flag pairs that allowlist the relay hostname in Codex's network sandbox.
+///
+/// Codex sandboxes MCP subprocesses (including `buzz-cli`) behind a local proxy with
+/// a domain allowlist. Without this, `buzz-cli` requests to the relay are blocked before
+/// they reach WARP or any other outbound network path.
+///
+/// Returns `["-c", "network_proxy.mode=\"full\"", "-c", "network_proxy.domains.\"<host>\"=\"allow\""]`
+/// for Codex agents, or an empty vec for non-Codex agents or when the hostname cannot
+/// be parsed from the relay URL.
+///
+/// The `network_proxy` keys map to `NetworkProxyConfigToml` in codex-acp's config schema:
+/// - `network_proxy.mode="full"` enables the managed proxy for all outbound traffic
+/// - `network_proxy.domains."<host>"="allow"` adds the relay hostname to the allowlist
+///
+/// Handles `ws://`, `wss://`, `http://`, and `https://` schemes. Port is stripped —
+/// Codex's domain allowlist matches on hostname only.
+pub fn codex_network_args(agent_command: &str, relay_url: &str) -> Vec<String> {
+    match normalize_agent_command_identity(agent_command).as_str() {
+        "codex" | "codex-acp" => {}
+        _ => return vec![],
+    }
+
+    // Use the `url` crate so ws://, wss://, http://, https:// are all handled
+    // correctly. On parse failure, skip injection rather than panicking.
+    let host = match Url::parse(relay_url) {
+        Ok(u) => match u.host_str() {
+            Some(h) => h.to_owned(),
+            None => {
+                tracing::warn!(
+                    relay_url,
+                    "codex network allowlist: no host in relay URL — skipping injection"
+                );
+                return vec![];
+            }
+        },
+        Err(e) => {
+            tracing::warn!(relay_url, error = %e, "codex network allowlist: failed to parse relay URL — skipping injection");
+            return vec![];
+        }
+    };
+
+    tracing::debug!(host, "injecting codex network allowlist for host");
+
+    vec![
+        "-c".into(),
+        "network_proxy.mode=\"full\"".into(),
+        "-c".into(),
+        format!("network_proxy.domains.\"{host}\"=\"allow\""),
+    ]
+}
+
 pub fn normalize_agent_args(command: &str, agent_args: Vec<String>) -> Vec<String> {
     let normalized = agent_args
         .into_iter()
@@ -585,7 +634,14 @@ impl Config {
         // Legacy env-var propagation is intentionally NOT done here.
         // Call `propagate_legacy_env_vars()` before the tokio runtime starts
         // (in the sync `fn main()` wrapper) — see Rust 2024 edition safety.
-        let mut args = CliArgs::parse();
+        let args = CliArgs::parse();
+        Self::from_args(args)
+    }
+
+    /// Build a `Config` from already-parsed `CliArgs`. Separated from `from_cli()` so
+    /// tests can construct `CliArgs` via `CliArgs::try_parse_from` and exercise the full
+    /// validation path without going through process args.
+    pub fn from_args(mut args: CliArgs) -> Result<Self, ConfigError> {
         let keys = Keys::parse(&args.private_key)?;
         // Best-effort zeroize: overwrite the raw private key string to reduce
         // exposure via core dumps or heap inspection (#41). Without the `zeroize`
@@ -659,7 +715,16 @@ impl Config {
             ));
         }
 
-        let agent_args = normalize_agent_args(&agent_command, args.agent_args);
+        let mut agent_args = normalize_agent_args(&agent_command, args.agent_args);
+
+        // Prepend Codex network allowlist flags so buzz-cli (an MCP subprocess)
+        // can reach the relay through Codex's sandbox proxy. No-op for non-Codex agents.
+        let network_args = codex_network_args(&agent_command, &args.relay_url);
+        if !network_args.is_empty() {
+            let mut merged = network_args;
+            merged.extend(agent_args);
+            agent_args = merged;
+        }
 
         // Finding #49b — warn on invalid UUIDs in --channels.
         if let Some(ref channels) = args.channels {
@@ -744,7 +809,6 @@ impl Config {
             )));
         }
 
-        // ── Inbound author gate validation ──────────────────────────────────
         let respond_to_allowlist = if args.respond_to == RespondTo::Allowlist {
             let raw = args.respond_to_allowlist.unwrap_or_default();
             if raw.is_empty() {
@@ -762,7 +826,31 @@ impl Config {
             HashSet::new()
         };
 
-        // ── Persona pack resolution ──────────────────────────────────────────
+        // Validate respond_to against the allowed set.
+        let allowed_respond_to = if let Some(raw) = args.allowed_respond_to {
+            // Validate each entry is a known RespondTo mode.
+            for s in &raw {
+                RespondTo::from_str(s.trim(), true).map_err(|_| {
+                    ConfigError::ConfigFile(format!(
+                        "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
+                         (valid values: owner-only, allowlist, anyone, nobody)"
+                    ))
+                })?;
+            }
+            let allowed_modes: Vec<String> = raw.iter().map(|s| s.trim().to_string()).collect();
+            if !allowed_modes.is_empty() && !allowed_modes.contains(&args.respond_to.to_string()) {
+                return Err(ConfigError::ConfigFile(format!(
+                    "respond_to '{}' is not permitted on this deployment \
+                     (BUZZ_ACP_ALLOWED_RESPOND_TO={})",
+                    args.respond_to,
+                    raw.join(",")
+                )));
+            }
+            allowed_modes
+        } else {
+            Vec::new()
+        };
+
         //
         // Precedence: CLI/env args > persona values > built-in defaults.
         // Persona fills in what's missing. Explicit flags always win.
@@ -810,7 +898,6 @@ impl Config {
         }
         let model = args.model.or(persona_model);
 
-        // ── Multiple-event-handling validation ──────────────────────────────
         if matches!(
             args.multiple_event_handling,
             MultipleEventHandling::Interrupt | MultipleEventHandling::OwnerInterrupt
@@ -855,6 +942,7 @@ impl Config {
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
+            allowed_respond_to,
             persona_env_vars,
             relay_observer: args.relay_observer,
             agent_owner: args.agent_owner.map(|s| s.trim().to_ascii_lowercase()),
@@ -873,8 +961,15 @@ impl Config {
             }
             other => format!("respond_to={other}"),
         };
+        let allowed_respond_to_detail = if self.allowed_respond_to.is_empty() {
+            String::new()
+        } else {
+            let mut modes = self.allowed_respond_to.clone();
+            modes.sort();
+            format!(" allowed_respond_to=[{}]", modes.join(","))
+        };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -896,11 +991,10 @@ impl Config {
             self.model.as_deref().unwrap_or("(agent default)"),
             self.permission_mode,
             respond_to_detail,
+            allowed_respond_to_detail,
         )
     }
 }
-
-// ── TOML config file ──────────────────────────────────────────────────────────
 
 #[derive(Debug, serde::Deserialize)]
 struct TomlConfig {
@@ -984,8 +1078,6 @@ pub fn load_rules(path: &std::path::Path) -> Result<Vec<SubscriptionRule>, Confi
 
     Ok(config.rules)
 }
-
-// ── Subscription resolution ───────────────────────────────────────────────────
 
 /// Resolve per-channel NIP-01 filters from config + discovered channels.
 pub fn resolve_channel_filters(
@@ -1181,12 +1273,11 @@ fn rule_applies_to_channel(rule: &SubscriptionRule, channel_id: Uuid) -> bool {
     }
 }
 
-// ── Tests ─────────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::filter::{ChannelScope, SubscriptionRule};
+    use clap::{Parser, ValueEnum};
 
     /// Build a minimal Config for testing without CLI parsing.
     fn test_config(mode: SubscribeMode) -> Config {
@@ -1221,6 +1312,7 @@ mod tests {
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
+            allowed_respond_to: Vec::new(),
             persona_env_vars: vec![],
             relay_observer: false,
             agent_owner: None,
@@ -1248,8 +1340,6 @@ mod tests {
             consecutive_timeouts: Arc::new(AtomicU32::new(0)),
         }
     }
-
-    // ── resolve_channel_filters: Mentions mode ───────────────────────────────
 
     #[test]
     fn test_mentions_mode_default_kinds() {
@@ -1386,7 +1476,112 @@ mod tests {
         );
     }
 
-    // ── resolve_channel_filters: All mode ────────────────────────────────────
+    // --- codex_network_args tests ---
+
+    #[test]
+    fn codex_network_args_wss_url() {
+        let args = codex_network_args("codex-acp", "wss://sprout-oss.stage.blox.sqprod.co");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"sprout-oss.stage.blox.sqprod.co\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_ws_url() {
+        let args = codex_network_args("codex-acp", "ws://localhost:3000");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"localhost\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_https_url() {
+        let args = codex_network_args("codex-acp", "https://relay.example.com/path");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"relay.example.com\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_http_url_with_port() {
+        let args = codex_network_args("codex-acp", "http://relay.example.com:8080/query");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"relay.example.com\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_bare_codex_command() {
+        // "codex" (not "codex-acp") should also get the args.
+        let args = codex_network_args("codex", "wss://relay.example.com");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"relay.example.com\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_full_path_codex_command() {
+        // Full path like /usr/local/bin/codex-acp should be normalized.
+        let args = codex_network_args("/usr/local/bin/codex-acp", "wss://relay.example.com");
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "network_proxy.mode=\"full\"",
+                "-c",
+                "network_proxy.domains.\"relay.example.com\"=\"allow\"",
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_network_args_non_codex_agent_returns_empty() {
+        assert!(codex_network_args("goose", "wss://relay.example.com").is_empty());
+        assert!(codex_network_args("claude-agent-acp", "wss://relay.example.com").is_empty());
+        assert!(codex_network_args("buzz-agent", "wss://relay.example.com").is_empty());
+    }
+
+    #[test]
+    fn codex_network_args_empty_relay_url_returns_empty() {
+        // Empty string fails Url::parse — graceful empty return.
+        assert!(codex_network_args("codex-acp", "").is_empty());
+    }
+
+    #[test]
+    fn codex_network_args_schemeless_string_returns_empty() {
+        // A bare string with no scheme fails Url::parse — graceful empty return.
+        assert!(codex_network_args("codex-acp", "not-a-url").is_empty());
+    }
 
     #[test]
     fn test_all_mode_wildcard() {
@@ -1416,8 +1611,6 @@ mod tests {
         assert_eq!(f.kinds.as_ref().unwrap(), &[9, 7]);
     }
 
-    // ── resolve_channel_filters: channels_override ───────────────────────────
-
     #[test]
     fn test_channels_override_filters_to_discovered() {
         let mut config = test_config(SubscribeMode::All);
@@ -1436,8 +1629,6 @@ mod tests {
         assert!(!result.contains_key(&ch_b));
         assert!(!result.contains_key(&ch_unknown));
     }
-
-    // ── resolve_channel_filters: Config mode ─────────────────────────────────
 
     #[test]
     fn test_config_mode_single_rule_all_channels() {
@@ -1543,8 +1734,6 @@ mod tests {
         assert!(!f.require_mention, "most permissive (false) should win");
     }
 
-    // ── rule_applies_to_channel ──────────────────────────────────────────────
-
     #[test]
     fn test_rule_applies_all() {
         let rule = make_rule("test", ChannelScope::All("all".into()), vec![], false);
@@ -1579,8 +1768,6 @@ mod tests {
         );
         assert!(!rule_applies_to_channel(&rule, Uuid::new_v4()));
     }
-
-    // ── load_rules validation ────────────────────────────────────────────────
 
     #[test]
     fn test_load_rules_valid_toml() {
@@ -1726,8 +1913,6 @@ channels = "ALL"
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── heartbeat validation ─────────────────────────────────────────────────
-
     fn validate_heartbeat_interval(secs: u64) -> Result<(), ConfigError> {
         if secs > 0 && secs < 10 {
             return Err(ConfigError::ConfigFile(
@@ -1770,8 +1955,6 @@ channels = "ALL"
         assert!(err.to_string().contains("heartbeat interval must be 0"));
     }
 
-    // ── turn-liveness validation ─────────────────────────────────────────────
-
     fn validate_turn_liveness(secs: u64) -> Result<(), ConfigError> {
         if secs > 0 && secs < 5 {
             return Err(ConfigError::ConfigFile(
@@ -1808,8 +1991,6 @@ channels = "ALL"
         assert!(err.to_string().contains("turn liveness interval must be 0"));
     }
 
-    // ── summary includes agents and heartbeat ────────────────────────────────
-
     #[test]
     fn test_summary_includes_agents_and_heartbeat() {
         let config = test_config(SubscribeMode::Mentions);
@@ -1840,8 +2021,6 @@ channels = "ALL"
         );
     }
 
-    // ── memory toggle ───────────────────────────────────────────────────────
-
     #[test]
     fn test_memory_enabled_default_true() {
         let config = test_config(SubscribeMode::Mentions);
@@ -1871,8 +2050,6 @@ channels = "ALL"
             "summary should include memory=true when enabled, got: {s}"
         );
     }
-
-    // ── permission mode ─────────────────────────────────────────────────────
 
     #[test]
     fn test_permission_mode_wire_strings() {
@@ -1975,8 +2152,6 @@ channels = "ALL"
         }
     }
 
-    // ── Idle timeout config precedence ─────────────────────────────────────
-
     /// Helper: resolve idle_timeout_secs using the same precedence logic as Config::from_args.
     /// Precedence: explicit --idle-timeout > --turn-timeout (deprecated) > `DEFAULT_IDLE_TIMEOUT_SECS`.
     fn resolve_idle_timeout(idle: Option<u64>, turn: Option<u64>) -> u64 {
@@ -2033,8 +2208,6 @@ channels = "ALL"
         );
     }
 
-    // ── RespondTo tests ────────────────────────────────────────────────────
-
     #[test]
     fn test_respond_to_default_is_owner_only() {
         assert_eq!(RespondTo::default(), RespondTo::OwnerOnly);
@@ -2090,8 +2263,6 @@ channels = "ALL"
             "should show allowlist count, got: {s}"
         );
     }
-
-    // ── validate_allowlist tests ───────────────────────────────────────────
 
     #[test]
     fn test_validate_allowlist_valid_entries() {
@@ -2165,8 +2336,6 @@ channels = "ALL"
         assert!(result.is_empty());
     }
 
-    // ── Idle timeout constant + guard (PR #935) ───────────────────────────────
-
     #[test]
     fn default_idle_timeout_is_900_seconds() {
         // Lock the constant value so accidental changes are caught.
@@ -2190,6 +2359,189 @@ channels = "ALL"
         assert!(
             idle_valid < max_turn_valid,
             "default idle (900) must be less than default max_turn (3600)"
+        );
+    }
+
+    // --- BUZZ_ACP_ALLOWED_RESPOND_TO gate ---
+
+    fn parse_allowed_respond_to(raw: &[&str]) -> Result<HashSet<RespondTo>, ConfigError> {
+        let mut set = HashSet::new();
+        for s in raw {
+            let mode = RespondTo::from_str(s.trim(), true).map_err(|_| {
+                ConfigError::ConfigFile(format!(
+                    "invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO: '{s}' \
+                     (valid values: owner-only, allowlist, anyone, nobody)"
+                ))
+            })?;
+            set.insert(mode);
+        }
+        Ok(set)
+    }
+
+    fn check_allowed_respond_to(
+        allowed_raw: &[&str],
+        respond_to: RespondTo,
+    ) -> Result<(), ConfigError> {
+        let set = parse_allowed_respond_to(allowed_raw)?;
+        if !set.is_empty() && !set.contains(&respond_to) {
+            return Err(ConfigError::ConfigFile(format!(
+                "respond_to '{}' is not permitted on this deployment \
+                 (BUZZ_ACP_ALLOWED_RESPOND_TO={})",
+                respond_to,
+                allowed_raw.join(",")
+            )));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_respond_to_rejects_disallowed_mode() {
+        let result = check_allowed_respond_to(&["owner-only", "allowlist"], RespondTo::Anyone);
+        assert!(
+            result.is_err(),
+            "anyone should be rejected when not in allowed set"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not permitted"),
+            "error should mention 'not permitted': {msg}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_accepts_allowed_mode() {
+        let result = check_allowed_respond_to(&["owner-only", "allowlist"], RespondTo::OwnerOnly);
+        assert!(result.is_ok(), "owner-only should be accepted: {result:?}");
+    }
+
+    #[test]
+    fn allowed_respond_to_empty_allows_all() {
+        // No restriction — anyone is accepted.
+        let result = check_allowed_respond_to(&[], RespondTo::Anyone);
+        assert!(
+            result.is_ok(),
+            "empty allowed set should permit any mode: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_rejects_invalid_mode_string() {
+        let result = parse_allowed_respond_to(&["owner-only", "badvalue"]);
+        assert!(result.is_err(), "invalid mode string should be rejected");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("invalid value in BUZZ_ACP_ALLOWED_RESPOND_TO"),
+            "error should name the env var: {msg}"
+        );
+        assert!(
+            msg.contains("badvalue"),
+            "error should name the bad value: {msg}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_summary_shows_restriction_when_set() {
+        let mut config = test_config(SubscribeMode::Mentions);
+        config.allowed_respond_to = vec!["owner-only".to_string(), "allowlist".to_string()];
+        let s = config.summary();
+        assert!(
+            s.contains("allowed_respond_to="),
+            "summary should include allowed_respond_to when set: {s}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_summary_omitted_when_empty() {
+        let config = test_config(SubscribeMode::Mentions);
+        let s = config.summary();
+        assert!(
+            !s.contains("allowed_respond_to="),
+            "summary should not include allowed_respond_to when empty: {s}"
+        );
+    }
+
+    // --- Integration tests: full env-var → CliArgs → Config::from_args() path ---
+    //
+    // These tests exercise the actual wiring: BUZZ_ACP_ALLOWED_RESPOND_TO in the
+    // environment causes clap to populate CliArgs::allowed_respond_to, which then
+    // flows through Config::from_args() to produce a ConfigError. If the #[arg(env)]
+    // attribute or field name were removed, these tests would fail.
+    //
+    // We pass the value via the CLI flag (`--allowed-respond-to`) rather than
+    // std::env::set_var to avoid test-parallelism races on shared env state.
+    // The env-var wiring is covered by the clap #[arg(env)] attribute itself.
+
+    // A minimal valid private key for test use (secp256k1 scalar = 1).
+    const TEST_PRIVATE_KEY: &str =
+        "0000000000000000000000000000000000000000000000000000000000000001";
+
+    #[test]
+    fn allowed_respond_to_full_path_rejects_disallowed_mode() {
+        // --allowed-respond-to=owner-only,allowlist + --respond-to=anyone → ConfigError
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "anyone",
+            "--allowed-respond-to",
+            "owner-only,allowlist",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+
+        assert!(
+            result.is_err(),
+            "from_args should reject respond_to=anyone when not in allowed set"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("not permitted"),
+            "error should mention 'not permitted': {msg}"
+        );
+        assert!(
+            msg.contains("anyone"),
+            "error should name the disallowed mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_full_path_accepts_allowed_mode() {
+        // --allowed-respond-to=owner-only,allowlist + --respond-to=owner-only → Ok
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "owner-only",
+            "--allowed-respond-to",
+            "owner-only,allowlist",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+
+        assert!(
+            result.is_ok(),
+            "from_args should accept respond_to=owner-only when in allowed set: {result:?}"
+        );
+    }
+
+    #[test]
+    fn allowed_respond_to_full_path_unset_allows_all() {
+        // No --allowed-respond-to flag → anyone is accepted.
+        let args = CliArgs::try_parse_from([
+            "buzz-acp",
+            "--private-key",
+            TEST_PRIVATE_KEY,
+            "--respond-to",
+            "anyone",
+        ])
+        .expect("clap should parse args");
+        let result = Config::from_args(args);
+
+        assert!(
+            result.is_ok(),
+            "from_args should accept any mode when allowed list is unset: {result:?}"
         );
     }
 }

@@ -6,7 +6,10 @@ import {
   useRelayAgentsQuery,
   useManagedAgentsQuery,
 } from "@/features/agents/hooks";
+import { useIsManagedAgent } from "@/features/agent-memory/hooks";
+import { useIdentityQuery } from "@/shared/api/hooks";
 import { useActiveAgentTurns } from "@/features/agents/activeAgentTurnsStore";
+import { truncatePubkey } from "@/features/profile/lib/identity";
 import { formatElapsed } from "@/features/agents/ui/agentSessionUtils";
 import { usePresenceQuery } from "@/features/presence/hooks";
 import { useUserStatusQuery } from "@/features/user-status/hooks";
@@ -54,14 +57,6 @@ function InfoBadge({ children }: { children: React.ReactNode }) {
   );
 }
 
-function truncatePubkey(pubkey: string) {
-  if (pubkey.length <= 16) {
-    return pubkey;
-  }
-
-  return `${pubkey.slice(0, 8)}…${pubkey.slice(-8)}`;
-}
-
 export function UserProfilePopover({
   children,
   pubkey,
@@ -91,8 +86,23 @@ export function UserProfilePopover({
   const managedAgent = managedAgentsQuery.data?.find(
     (a) => a.pubkey === pubkey,
   );
-  const canViewActivity = role === "bot" && Boolean(onOpenAgentSession);
   const profile = profileQuery.data;
+  // Owner signal mirrors UserProfilePanel: a declared NIP-OA owner whose agent
+  // runs elsewhere holds no local seckey, so key custody (`isOwner`) alone
+  // wrongly hides the affordance from them — and gating on bot-ness alone shows
+  // it to every viewer. Combine declared ownership with local management, same
+  // shape as the pane/sidebar/memory fixes. Every real boundary is server-side;
+  // this only decides whether to paint the "View activity log" button.
+  const isOwner = useIsManagedAgent(role === "bot" ? pubkey : null);
+  const ownerPubkey = profile?.ownerPubkey ?? null;
+  const currentPubkey = useIdentityQuery().data?.pubkey;
+  const isCurrentUserOwner =
+    currentPubkey !== undefined &&
+    ownerPubkey !== null &&
+    ownerPubkey.toLowerCase() === currentPubkey.toLowerCase();
+  const viewerIsOwner = isCurrentUserOwner || isOwner === true;
+  const canViewActivity =
+    role === "bot" && viewerIsOwner && Boolean(onOpenAgentSession);
   const presenceStatus = presenceQuery.data?.[pubkey.toLowerCase()];
   const userStatus = userStatusQuery.data?.[pubkey.toLowerCase()];
   const activeTurns = useActiveAgentTurns(role === "bot" ? pubkey : null);

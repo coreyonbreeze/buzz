@@ -17,6 +17,20 @@ export type PersonaDialogState = {
 
 type ParsedPersonaDraft = ParsePersonaFilesResult["personas"][number];
 
+/**
+ * Whether the persona dialog's save action should be enabled.
+ *
+ * A display name is the only required field. The system prompt is optional:
+ * core memory is auto-injected at runtime, so a persona need not carry its
+ * own prompt. `isPending` blocks double-submits while a save is in flight.
+ */
+export function canSubmitPersonaDialog(args: {
+  displayName: string;
+  isPending: boolean;
+}): boolean {
+  return args.displayName.trim().length > 0 && !args.isPending;
+}
+
 export function createPersonaDialogState(): PersonaDialogState {
   return {
     title: "Create persona",
@@ -79,11 +93,13 @@ function runtimeIdForAgentCommand(
 /**
  * Extract the LLM provider id from a managed agent's backend so it can carry
  * into the persona template (a databricks/anthropic agent should promote with
- * its provider, not lose it). On `main` the provider is NOT a top-level field
- * on `ManagedAgent`; it lives in the backend union: a `"provider"` backend
- * carries the provider id, while a `"local"` backend has none. Returns
- * `undefined` for local backends — the persona's `provider` is optional, so an
- * absent provider just carries as unset (auto-detect / provider-locked runtime).
+ * its provider, not lose it). The canonical provider source is the backend
+ * union, not the top-level `provider` field on `ManagedAgent`: that top-level
+ * field is a derived snapshot (output), while a `"provider"` backend carries
+ * the provider id that was the actual create input. A `"local"` backend has
+ * none. Returns `undefined` for local backends — the persona's `provider` is
+ * optional, so an absent provider just carries as unset (auto-detect /
+ * provider-locked runtime).
  */
 function providerForAgentBackend(
   backend: ManagedAgent["backend"],
