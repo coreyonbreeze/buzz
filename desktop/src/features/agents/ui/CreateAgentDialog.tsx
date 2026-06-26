@@ -1,11 +1,13 @@
 import { AlertTriangle, ChevronDown } from "lucide-react";
 import * as React from "react";
+import { toast } from "sonner";
 
 import {
   useAcpRuntimesQuery,
   useAvailableAcpRuntimes,
   useBackendProvidersQuery,
   useCreateManagedAgentMutation,
+  useCreatePersonaMutation,
   useManagedAgentPrereqsQuery,
 } from "@/features/agents/hooks";
 import { probeBackendProvider } from "@/shared/api/tauri";
@@ -13,8 +15,10 @@ import type {
   BackendProviderProbeResult,
   CreateManagedAgentInput,
   CreateManagedAgentResponse,
+  CreatePersonaInput,
   RespondToMode,
 } from "@/shared/api/types";
+import { cn } from "@/shared/lib/cn";
 import { Button } from "@/shared/ui/button";
 import {
   Dialog,
@@ -52,6 +56,7 @@ export function CreateAgentDialog({
   onOpenChange: (open: boolean) => void;
 }) {
   const createMutation = useCreateManagedAgentMutation();
+  const createPersonaMutation = useCreatePersonaMutation();
   const providersQuery = useAvailableAcpRuntimes({ enabled: open });
   const allProvidersQuery = useAcpRuntimesQuery({ enabled: open });
   const backendProvidersQuery = useBackendProvidersQuery({ enabled: open });
@@ -68,6 +73,7 @@ export function CreateAgentDialog({
   const [relayUrl, setRelayUrl] = React.useState("");
   const [spawnAfterCreate, setSpawnAfterCreate] = React.useState(true);
   const [startOnAppLaunch, setStartOnAppLaunch] = React.useState(true);
+  const [saveAsTemplate, setSaveAsTemplate] = React.useState(false);
   const [turnTimeoutSeconds, setTurnTimeoutSeconds] = React.useState("320");
   const [parallelism, setParallelism] = React.useState("24");
   const [systemPrompt, setSystemPrompt] = React.useState("");
@@ -422,6 +428,37 @@ export function CreateAgentDialog({
           };
 
       const created = await createMutation.mutateAsync(input);
+
+      // Opt-in: also persist this setup as a reusable persona template. The
+      // agent is the primary goal; the template is a byproduct, so a failed
+      // template mint must NOT fail or roll back the just-created agent — it
+      // surfaces as a non-fatal toast. "Persona template" is the UI name for a
+      // backend `persona` (kind:30175); this builds a `CreatePersonaInput`.
+      if (saveAsTemplate) {
+        const personaInput: CreatePersonaInput = {
+          displayName: name.trim(),
+          systemPrompt: systemPrompt.trim(),
+          // Carry the selected ACP runtime when one is chosen; "custom"/manual
+          // setups leave it unset and fall back to the dialog default later.
+          runtime:
+            selectedRuntimeId !== "custom" ? selectedRuntimeId : undefined,
+          model: useMesh ? meshModelId.trim() || undefined : undefined,
+          envVars,
+        };
+        try {
+          await createPersonaMutation.mutateAsync(personaInput);
+          toast.success(
+            `Saved ${personaInput.displayName} as a persona template.`,
+          );
+        } catch (error) {
+          toast.error(
+            error instanceof Error
+              ? `Agent created, but saving the persona template failed: ${error.message}`
+              : "Agent created, but saving the persona template failed.",
+          );
+        }
+      }
+
       handleOpenChange(false);
       onCreated(created);
     } catch {
@@ -649,6 +686,33 @@ export function CreateAgentDialog({
               onChange={setEnvVars}
               value={envVars}
             />
+
+            {/*
+              Opt-in: save this setup as a reusable persona template. Off by
+              default — the template is a byproduct of creating the agent, not
+              the goal. Kept as a self-contained toggle block so a later visual
+              reskin can relocate it without untangling the submit behavior.
+            */}
+            <button
+              aria-pressed={saveAsTemplate}
+              className={cn(
+                "w-full rounded-2xl border px-4 py-3 text-left transition-colors",
+                saveAsTemplate
+                  ? "border-primary bg-primary/10"
+                  : "border-border/70 bg-background/70",
+              )}
+              data-testid="create-agent-save-as-template"
+              disabled={createMutation.isPending}
+              onClick={() => setSaveAsTemplate((value) => !value)}
+              type="button"
+            >
+              <p className="text-sm font-semibold tracking-tight">
+                Save as persona template
+              </p>
+              <p className="mt-1 text-sm text-foreground/70">
+                Reuse this setup to create more agents.
+              </p>
+            </button>
 
             {meshClientError ? (
               <p className="rounded-2xl border border-destructive/30 bg-destructive/10 px-4 py-3 text-sm text-destructive">
