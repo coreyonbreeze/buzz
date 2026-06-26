@@ -1248,16 +1248,16 @@ impl Db {
         workflow::list_all_enabled_workflows(&self.pool).await
     }
 
-    /// Claim a scheduled workflow fire for a quantized schedule window.
+    /// Claim a scheduled workflow fire for an authoritative schedule instant.
     ///
-    /// Returns `true` only for the first pod to claim `(workflow_id,
-    /// scheduled_for)`; all other pods must skip creating a run.
+    /// Returns `Some` only for the first pod to claim `(community_id,
+    /// workflow_id, scheduled_for)`; all other pods must skip creating a run.
     pub async fn claim_scheduled_workflow_fire(
         &self,
         community_id: CommunityId,
         workflow_id: Uuid,
         scheduled_for: chrono::DateTime<chrono::Utc>,
-    ) -> Result<bool> {
+    ) -> Result<Option<workflow::ScheduledWorkflowFireClaim>> {
         workflow::claim_scheduled_workflow_fire(
             &self.pool,
             community_id,
@@ -1265,6 +1265,41 @@ impl Db {
             scheduled_for,
         )
         .await
+    }
+
+    /// Fetch the latest claimed schedule instant for interval trigger anchoring.
+    pub async fn latest_scheduled_workflow_fire(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        workflow::latest_scheduled_workflow_fire(&self.pool, community_id, workflow_id).await
+    }
+
+    /// Attach the workflow run id created from a won scheduled-fire claim.
+    pub async fn attach_scheduled_workflow_run(
+        &self,
+        community_id: CommunityId,
+        workflow_id: Uuid,
+        scheduled_for: chrono::DateTime<chrono::Utc>,
+        workflow_run_id: Uuid,
+    ) -> Result<bool> {
+        workflow::attach_scheduled_workflow_run(
+            &self.pool,
+            community_id,
+            workflow_id,
+            scheduled_for,
+            workflow_run_id,
+        )
+        .await
+    }
+
+    /// Delete old scheduled workflow fire claims before a retention cutoff.
+    pub async fn prune_scheduled_workflow_fires_before(
+        &self,
+        older_than: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64> {
+        workflow::prune_scheduled_workflow_fires_before(&self.pool, older_than).await
     }
 
     /// Update a workflow's name, definition, and hash.

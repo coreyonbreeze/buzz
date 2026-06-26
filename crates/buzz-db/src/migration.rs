@@ -146,6 +146,20 @@ mod tests {
             "initial schema migration should include workflow cron claim table"
         );
         assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("workflow_run_id UUID REFERENCES workflow_runs"),
+            "workflow cron claim table should optionally link to the run it created"
+        );
+        assert!(
+            migrations[0]
+                .sql
+                .as_str()
+                .contains("PRIMARY KEY (community_id, workflow_id, scheduled_for)"),
+            "workflow cron claim uniqueness must include the community label"
+        );
+        assert!(
             migrations[0].sql.as_str().contains("CREATE TABLE channels"),
             "initial schema migration should include Buzz core tables"
         );

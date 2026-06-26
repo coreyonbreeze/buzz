@@ -223,20 +223,6 @@ CREATE TABLE workflows (
 
 CREATE INDEX idx_workflows_channel_active ON workflows (channel_id, status, enabled);
 
--- Restart-safe horizontal-scaling claim table for scheduled workflow fires.
--- Each schedule tick must win this insert before creating a workflow run; this
--- replaces per-pod in-memory last-fired state as the deduplication boundary.
-CREATE TABLE scheduled_workflow_fires (
-    community_id    UUID NOT NULL REFERENCES communities(id),
-    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
-    scheduled_for   TIMESTAMPTZ NOT NULL,
-    claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    PRIMARY KEY (community_id, workflow_id, scheduled_for)
-);
-
-CREATE INDEX idx_scheduled_workflow_fires_scheduled_for
-    ON scheduled_workflow_fires (community_id, scheduled_for);
-
 -- ── Workflow runs ─────────────────────────────────────────────────────────────
 
 CREATE TABLE workflow_runs (
@@ -255,6 +241,25 @@ CREATE TABLE workflow_runs (
 
 CREATE INDEX idx_workflow_runs_workflow ON workflow_runs (workflow_id);
 CREATE INDEX idx_workflow_runs_status ON workflow_runs (status);
+
+-- Restart-safe horizontal-scaling claim table for scheduled workflow fires.
+-- Each schedule tick must win this insert before creating a workflow run; this
+-- replaces per-pod in-memory last-fired state as the deduplication boundary.
+CREATE TABLE scheduled_workflow_fires (
+    community_id    UUID NOT NULL REFERENCES communities(id),
+    workflow_id     UUID NOT NULL REFERENCES workflows(id) ON DELETE CASCADE,
+    scheduled_for   TIMESTAMPTZ NOT NULL,
+    claimed_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    workflow_run_id UUID REFERENCES workflow_runs(id) ON DELETE SET NULL,
+    PRIMARY KEY (community_id, workflow_id, scheduled_for)
+);
+
+CREATE INDEX idx_scheduled_workflow_fires_scheduled_for
+    ON scheduled_workflow_fires (community_id, scheduled_for);
+
+CREATE UNIQUE INDEX idx_scheduled_workflow_fires_run
+    ON scheduled_workflow_fires (workflow_run_id)
+    WHERE workflow_run_id IS NOT NULL;
 
 -- ── Workflow approvals ────────────────────────────────────────────────────────
 

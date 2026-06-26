@@ -213,6 +213,23 @@ pub struct WorkflowRunRecord {
     pub created_at: DateTime<Utc>,
 }
 
+/// A winning scheduled workflow fire claim.
+///
+/// The primary identity is `(community_id, workflow_id, scheduled_for)`. The
+/// database also returns `claimed_at` so the workflow scheduler can log and audit
+/// the exact claim row it won without relying on a per-pod clock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduledWorkflowFireClaim {
+    /// Community that owns this scheduled fire.
+    pub community_id: CommunityId,
+    /// Workflow definition that should run.
+    pub workflow_id: Uuid,
+    /// Authoritative schedule instant this claim represents.
+    pub scheduled_for: DateTime<Utc>,
+    /// Database timestamp for when this pod won the claim.
+    pub claimed_at: DateTime<Utc>,
+}
+
 /// A pending or resolved approval gate for a workflow step.
 #[derive(Debug, Clone)]
 pub struct ApprovalRecord {
@@ -378,31 +395,129 @@ pub async fn list_all_enabled_workflows(pool: &PgPool) -> Result<Vec<WorkflowRec
     rows.into_iter().map(row_to_workflow_record).collect()
 }
 
-/// Claim a scheduled workflow fire for a quantized schedule window.
+/// Claim a scheduled workflow fire for an authoritative schedule instant.
 ///
-/// Returns `true` only for the first pod that claims `(workflow_id,
-/// scheduled_for)`. All other pods receive `false` and must skip creating a
-/// workflow run. This is the restart-safe cross-pod dedupe boundary for cron.
+/// Returns `Some` only for the first pod that claims `(community_id,
+/// workflow_id, scheduled_for)`. All other pods receive `None` and must skip
+/// creating a workflow run. The `scheduled_for` value must come from an external
+/// schedule anchor (cron expression) or DB-authoritative interval anchor; a
+/// per-pod in-memory timestamp is not safe because different pods can compute
+/// different claim keys.
 pub async fn claim_scheduled_workflow_fire(
     pool: &PgPool,
     community_id: CommunityId,
     workflow_id: Uuid,
     scheduled_for: DateTime<Utc>,
-) -> Result<bool> {
-    let result = sqlx::query(
+) -> Result<Option<ScheduledWorkflowFireClaim>> {
+    let row = sqlx::query(
         r#"
         INSERT INTO scheduled_workflow_fires (community_id, workflow_id, scheduled_for)
         VALUES ($1, $2, $3)
         ON CONFLICT (community_id, workflow_id, scheduled_for) DO NOTHING
+        RETURNING community_id, workflow_id, scheduled_for, claimed_at
         "#,
     )
     .bind(community_id.as_uuid())
     .bind(workflow_id)
     .bind(scheduled_for)
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|row| {
+        let community_id: Uuid = row.try_get("community_id")?;
+        Ok(ScheduledWorkflowFireClaim {
+            community_id: CommunityId::from_uuid(community_id),
+            workflow_id: row.try_get("workflow_id")?,
+            scheduled_for: row.try_get("scheduled_for")?,
+            claimed_at: row.try_get("claimed_at")?,
+        })
+    })
+    .transpose()
+}
+
+/// Fetch the greatest claimed schedule instant for a workflow.
+///
+/// Interval schedulers use this as their DB-authoritative `last_fired` anchor.
+/// It makes all pods compute the same next interval instant after a successful
+/// claim, and preserves the interval clock across pod restarts. This intentionally
+/// reads from `scheduled_workflow_fires`, not `workflow_runs`, because the claim
+/// row is the source of truth for schedule deduplication.
+pub async fn latest_scheduled_workflow_fire(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+) -> Result<Option<DateTime<Utc>>> {
+    let row = sqlx::query(
+        r#"
+        SELECT MAX(scheduled_for) AS scheduled_for
+        FROM scheduled_workflow_fires
+        WHERE community_id = $1
+          AND workflow_id = $2
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(workflow_id)
+    .fetch_one(pool)
+    .await?;
+
+    row.try_get("scheduled_for").map_err(Into::into)
+}
+
+/// Link a won scheduled-fire claim to the workflow run it created.
+///
+/// This is for ops/audit forensics only; the claim row remains the dedupe
+/// boundary. If run creation succeeds, callers should attach the run id before
+/// spawning execution. If run creation fails, leaving `workflow_run_id` NULL is
+/// intentional: the schedule instant was claimed and must not duplicate later.
+pub async fn attach_scheduled_workflow_run(
+    pool: &PgPool,
+    community_id: CommunityId,
+    workflow_id: Uuid,
+    scheduled_for: DateTime<Utc>,
+    workflow_run_id: Uuid,
+) -> Result<bool> {
+    let result = sqlx::query(
+        r#"
+        UPDATE scheduled_workflow_fires
+        SET workflow_run_id = $4
+        WHERE community_id = $1
+          AND workflow_id = $2
+          AND scheduled_for = $3
+          AND workflow_run_id IS NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(workflow_id)
+    .bind(scheduled_for)
+    .bind(workflow_run_id)
     .execute(pool)
     .await?;
 
     Ok(result.rows_affected() == 1)
+}
+
+/// Delete old scheduled workflow fire claims for retention.
+///
+/// Schedule claim rows are correctness metadata, but they grow with every fire.
+/// The relay/ops janitor should retain enough history for audits and interval
+/// anchoring: the cutoff must be older than the largest interval schedule the
+/// deployment supports, or interval workflows can lose their DB-authoritative
+/// anchor after pruning.
+pub async fn prune_scheduled_workflow_fires_before(
+    pool: &PgPool,
+    older_than: DateTime<Utc>,
+) -> Result<u64> {
+    let result = sqlx::query(
+        r#"
+        DELETE FROM scheduled_workflow_fires
+        WHERE claimed_at < $1
+        "#,
+    )
+    .bind(older_than)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
 }
 
 /// Update a workflow's name, definition, and definition_hash.
