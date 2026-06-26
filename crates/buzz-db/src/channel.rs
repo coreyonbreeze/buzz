@@ -1235,6 +1235,67 @@ mod tests {
         Keys::generate().public_key().to_bytes().to_vec()
     }
 
+    async fn make_test_community(pool: &PgPool) -> Uuid {
+        let id = Uuid::new_v4();
+        let host = format!("channel-test-{}.example", id.simple());
+        sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+            .bind(id)
+            .bind(host)
+            .execute(pool)
+            .await
+            .expect("insert test community");
+        id
+    }
+
+    async fn create_test_channel(
+        pool: &PgPool,
+        name: &str,
+        channel_type: ChannelType,
+        visibility: ChannelVisibility,
+        description: Option<&str>,
+        created_by: &[u8],
+        ttl_seconds: Option<i32>,
+    ) -> Result<ChannelRecord> {
+        let id = Uuid::new_v4();
+        let community_id = make_test_community(pool).await;
+
+        sqlx::query(
+            r#"
+            INSERT INTO channels
+                (id, community_id, name, channel_type, visibility, description, created_by, ttl_seconds, ttl_deadline)
+            VALUES
+                ($1, $2, $3, $4::channel_type, $5::channel_visibility, $6, $7, $8,
+                 CASE WHEN $8 IS NOT NULL THEN NOW() + ($8 || ' seconds')::interval ELSE NULL END)
+            "#,
+        )
+        .bind(id)
+        .bind(community_id)
+        .bind(name)
+        .bind(channel_type.as_str())
+        .bind(visibility.as_str())
+        .bind(description)
+        .bind(created_by)
+        .bind(ttl_seconds)
+        .execute(pool)
+        .await
+        .expect("insert test channel");
+
+        sqlx::query(
+            r#"
+            INSERT INTO channel_members (channel_id, pubkey, role, invited_by)
+            VALUES ($1, $2, 'owner', $3)
+            "#,
+        )
+        .bind(id)
+        .bind(created_by)
+        .bind(created_by)
+        .execute(pool)
+        .await
+        .expect("insert owner membership");
+
+        get_channel(pool, id).await
+    }
+
     /// Agent owner (non-admin) can remove their own bot from a channel.
     #[tokio::test]
     #[ignore = "requires Postgres"]
@@ -1255,7 +1316,7 @@ mod tests {
         ensure_user(&pool, &channel_owner_pk)
             .await
             .expect("ensure channel owner");
-        let channel = create_channel(
+        let channel = create_test_channel(
             &pool,
             "test-bot-remove",
             ChannelType::Stream,
@@ -1298,7 +1359,7 @@ mod tests {
         let owner_pk = random_pubkey();
         ensure_user(&pool, &owner_pk).await.expect("ensure owner");
 
-        let channel = create_channel(
+        let channel = create_test_channel(
             &pool,
             "test-unarchive-renews-ttl",
             ChannelType::Stream,
@@ -1365,7 +1426,7 @@ mod tests {
         ensure_user(&pool, &channel_owner_pk)
             .await
             .expect("ensure channel owner");
-        let channel = create_channel(
+        let channel = create_test_channel(
             &pool,
             "test-bot-no-remove",
             ChannelType::Stream,
