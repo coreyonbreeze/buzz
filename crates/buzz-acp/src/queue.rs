@@ -962,6 +962,7 @@ fn resolve_reply_anchor(
 /// replies; in the channel branch a `Some` anchor means a human-facing
 /// top-level mention whose reply should open a new thread rooted at the
 /// triggering event.
+#[allow(clippy::too_many_arguments)]
 fn format_context_hints(
     channel_id: Uuid,
     channel_info: Option<&PromptChannelInfo>,
