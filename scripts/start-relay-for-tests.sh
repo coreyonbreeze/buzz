@@ -90,6 +90,8 @@ export PGPASSWORD=buzz_dev
 export PGDATABASE=buzz
 
 ./bin/pgschema apply --file schema/schema.sql --auto-approve
+docker exec -i -e PGPASSWORD="${PGPASSWORD}" buzz-postgres \
+  psql -U "${PGUSER}" -d "${PGDATABASE}" -v ON_ERROR_STOP=1 < scripts/attach-schema-partitions.sql
 ok "Schema applied"
 
 # ── Seed the deployment community ────────────────────────────────────────────

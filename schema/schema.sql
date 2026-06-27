@@ -203,7 +203,14 @@ CREATE TABLE events (
     -- community-leading btree filters BitmapAnd-ed with the GIN probe, so the
     -- GIN index itself stays the minimal `GIN (search_tsv)` (Max's caveat:
     -- avoid btree_gin unless EXPLAIN proves it buys something).
-    search_tsv  TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
+    -- Privacy: encrypted/private routing wrappers must never be discoverable
+    -- through NIP-50 full-text search. NULL tsvector never matches `@@`.
+    -- Keep in sync with migrations/0001_initial_schema.sql.
+    search_tsv  TSVECTOR GENERATED ALWAYS AS (
+        CASE WHEN kind IN (1059, 30300, 30622) THEN NULL::tsvector
+             ELSE to_tsvector('simple', content)
+        END
+    ) STORED,
     sig         BYTEA NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     channel_id  UUID,
