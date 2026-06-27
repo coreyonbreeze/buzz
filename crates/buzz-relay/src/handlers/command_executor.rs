@@ -18,6 +18,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use buzz_core::kind::*;
+use buzz_core::tenant::TenantContext;
 use buzz_db::workflow::{ApprovalStatus, RunStatus};
 use buzz_workflow::executor::TriggerContext;
 
@@ -32,6 +33,7 @@ use super::side_effects::{
 
 /// Route a command-kind event to the appropriate handler.
 pub async fn handle_command(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: Event,
     auth: IngestAuth,
@@ -39,17 +41,21 @@ pub async fn handle_command(
     // Ensure the authenticated user exists in the users table (foreign key requirement).
     // The old REST handlers did this via extract_auth_context; command executor must do it explicitly.
     let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
-    if let Err(e) = state.db.ensure_user(&pubkey_bytes).await {
+    if let Err(e) = state
+        .db
+        .ensure_user(tenant.community(), &pubkey_bytes)
+        .await
+    {
         tracing::warn!("command_executor: ensure_user failed: {e}");
     }
 
     let kind = event.kind.as_u16() as u32;
     match kind {
-        KIND_DM_OPEN => handle_dm_open(state, &event, &auth).await,
-        KIND_DM_ADD_MEMBER => handle_dm_add_member(state, &event, &auth).await,
-        KIND_DM_HIDE => handle_dm_hide(state, &event, &auth).await,
-        KIND_WORKFLOW_DEF => handle_workflow_def(state, &event, &auth).await,
-        KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(state, &event, &auth).await,
+        KIND_DM_OPEN => handle_dm_open(tenant, state, &event, &auth).await,
+        KIND_DM_ADD_MEMBER => handle_dm_add_member(tenant, state, &event, &auth).await,
+        KIND_DM_HIDE => handle_dm_hide(tenant, state, &event, &auth).await,
+        KIND_WORKFLOW_DEF => handle_workflow_def(tenant, state, &event, &auth).await,
+        KIND_WORKFLOW_TRIGGER => handle_workflow_trigger(tenant, state, &event, &auth).await,
         KIND_APPROVAL_GRANT => handle_approval_grant(state, &event, &auth).await,
         KIND_APPROVAL_DENY => handle_approval_deny(state, &event, &auth).await,
         _ => Err(IngestError::Rejected(format!(
@@ -227,6 +233,7 @@ fn compute_definition_hash(json_str: &str) -> Vec<u8> {
 }
 
 async fn handle_dm_open(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -292,11 +299,12 @@ async fn handle_dm_open(
     if was_created {
         // Invalidate caches for all participants
         for pk in &all_bytes {
-            state.invalidate_membership(channel.id, pk);
+            state.invalidate_membership(tenant, channel.id, pk);
         }
 
         let participant_hexes: Vec<String> = all_bytes.iter().map(hex::encode).collect();
         if let Err(e) = emit_system_message(
+            tenant,
             state,
             channel.id,
             serde_json::json!({
@@ -310,12 +318,13 @@ async fn handle_dm_open(
             warn!("DM open: system message failed: {e}");
         }
 
-        if let Err(e) = emit_group_discovery_events(state, channel.id).await {
+        if let Err(e) = emit_group_discovery_events(tenant, state, channel.id).await {
             warn!(channel = %channel.id, "DM open: discovery emission failed: {e}");
         }
 
         for participant in &all_bytes {
             if let Err(e) = emit_membership_notification(
+                tenant,
                 state,
                 channel.id,
                 participant,
@@ -330,7 +339,7 @@ async fn handle_dm_open(
     } else {
         // Re-open of an existing DM cleared the caller's hidden_at; refresh
         // their NIP-DV snapshot so the DM reappears in the sidebar.
-        if let Err(e) = publish_dm_visibility_snapshot(state, &self_bytes).await {
+        if let Err(e) = publish_dm_visibility_snapshot(tenant, state, &self_bytes).await {
             warn!("DM re-open: visibility snapshot failed: {e}");
         }
     }
@@ -350,6 +359,7 @@ async fn handle_dm_open(
 }
 
 async fn handle_dm_add_member(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -371,7 +381,7 @@ async fn handle_dm_add_member(
 
     // 2. Validate caller is member of existing DM
     let is_member = state
-        .is_member_cached(channel_id, &self_bytes)
+        .is_member_cached(tenant.community(), channel_id, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?;
     if !is_member {
@@ -383,7 +393,7 @@ async fn handle_dm_add_member(
     // 3. Validate channel is type "dm"
     let existing_channel = state
         .db
-        .get_channel(channel_id)
+        .get_channel(tenant.community(), channel_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: DM not found".into()))?;
     if existing_channel.channel_type != "dm" {
@@ -393,7 +403,7 @@ async fn handle_dm_add_member(
     // 4. Get existing members, merge with new
     let existing_members = state
         .db
-        .get_members(channel_id)
+        .get_members(tenant.community(), channel_id)
         .await
         .map_err(|e| IngestError::Internal(format!("error: get members: {e}")))?;
 
@@ -442,15 +452,16 @@ async fn handle_dm_add_member(
     // 7. Cache invalidation + notifications for new DM (post-commit, best-effort)
     if was_created {
         for pk in &all_bytes {
-            state.invalidate_membership(new_channel.id, pk);
+            state.invalidate_membership(tenant, new_channel.id, pk);
         }
 
-        if let Err(e) = emit_group_discovery_events(state, new_channel.id).await {
+        if let Err(e) = emit_group_discovery_events(tenant, state, new_channel.id).await {
             warn!(channel = %new_channel.id, "DM add_member: discovery emission failed: {e}");
         }
 
         for participant_bytes in &all_bytes {
             if let Err(e) = emit_membership_notification(
+                tenant,
                 state,
                 new_channel.id,
                 participant_bytes,
@@ -478,6 +489,7 @@ async fn handle_dm_add_member(
 }
 
 async fn handle_dm_hide(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -492,7 +504,7 @@ async fn handle_dm_hide(
 
     // 2. Validate caller is member of the DM
     let is_member = state
-        .is_member_cached(channel_id, &self_bytes)
+        .is_member_cached(tenant.community(), channel_id, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?;
     if !is_member {
@@ -504,7 +516,7 @@ async fn handle_dm_hide(
     // 3. Validate channel is type "dm"
     let channel = state
         .db
-        .get_channel(channel_id)
+        .get_channel(tenant.community(), channel_id)
         .await
         .map_err(|_| IngestError::Rejected("invalid: DM not found".into()))?;
     if channel.channel_type != "dm" {
@@ -537,7 +549,7 @@ async fn handle_dm_hide(
 
     // 5. Side effect (post-commit, best-effort): refresh the caller's NIP-DV
     // visibility snapshot so clients can filter this DM out of the sidebar.
-    if let Err(e) = publish_dm_visibility_snapshot(state, &self_bytes).await {
+    if let Err(e) = publish_dm_visibility_snapshot(tenant, state, &self_bytes).await {
         warn!("DM hide: visibility snapshot failed: {e}");
     }
 
@@ -550,6 +562,7 @@ async fn handle_dm_hide(
 }
 
 async fn handle_workflow_def(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -570,7 +583,7 @@ async fn handle_workflow_def(
 
     // 2. Validate caller has channel access (minimum: is a member)
     let is_member = state
-        .is_member_cached(channel_id, &self_bytes)
+        .is_member_cached(tenant.community(), channel_id, &self_bytes)
         .await
         .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?;
     if !is_member {
@@ -656,6 +669,7 @@ async fn handle_workflow_def(
 }
 
 async fn handle_workflow_trigger(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     event: &Event,
     auth: &IngestAuth,
@@ -681,7 +695,7 @@ async fn handle_workflow_trigger(
     // 3. Validate caller has channel access (if workflow is channel-scoped)
     if let Some(channel_id) = workflow.channel_id {
         let is_member = state
-            .is_member_cached(channel_id, &self_bytes)
+            .is_member_cached(tenant.community(), channel_id, &self_bytes)
             .await
             .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?;
         if !is_member {

@@ -1095,36 +1095,68 @@ async fn finalize_push(state: &Arc<AppState>, ctx: PushContext) -> Response {
             actor_pubkey_hex: &hex::encode(ctx.pusher.to_bytes()),
         };
         match build_ref_state_event(&inputs, &state.relay_keypair) {
-            Ok(event) => match state.db.insert_event(&event, None).await {
-                Ok((stored, true)) => {
-                    // Routed through the guarded send path for uniformity; the
-                    // access gate no-ops for this globally-scoped
-                    // (channel_id = None) ref-state event.
-                    crate::handlers::event::fan_out_event_to_local_subscribers(state, &stored)
-                        .await;
-                    info!(
-                        owner = %ctx.owner,
-                        repo = %ctx.repo_id,
-                        manifest = %success.manifest_key,
-                        "kind:30618 published (derived after CAS)"
-                    );
+            Ok(event) => {
+                // Relay-signed kind:30618 belongs to the deployment's own
+                // community, resolved fail-closed from the configured relay
+                // host (the git transport has no inbound `Host` to bind).
+                let tenant = match crate::tenant::bind_deployment_community(
+                    &state.db,
+                    &state.config.relay_url,
+                )
+                .await
+                {
+                    Ok(ctx) => Some(ctx),
+                    Err(e) => {
+                        warn!(
+                            error = ?e,
+                            owner = %ctx.owner,
+                            repo = %ctx.repo_id,
+                            "kind:30618 publish skipped: relay host not mapped to a community"
+                        );
+                        None
+                    }
+                };
+                if let Some(tenant) = tenant {
+                    match state
+                        .db
+                        .insert_event(tenant.community(), &event, None)
+                        .await
+                    {
+                        Ok((stored, true)) => {
+                            // Routed through the guarded send path for uniformity;
+                            // the access gate no-ops for this globally-scoped
+                            // (channel_id = None) ref-state event.
+                            crate::handlers::event::fan_out_event_to_local_subscribers(
+                                state,
+                                tenant.community(),
+                                &stored,
+                            )
+                            .await;
+                            info!(
+                                owner = %ctx.owner,
+                                repo = %ctx.repo_id,
+                                manifest = %success.manifest_key,
+                                "kind:30618 published (derived after CAS)"
+                            );
+                        }
+                        Ok((_, false)) => {
+                            info!(
+                                owner = %ctx.owner,
+                                repo = %ctx.repo_id,
+                                "kind:30618 deduplicated by relay db"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                owner = %ctx.owner,
+                                repo = %ctx.repo_id,
+                                error = %e,
+                                "kind:30618 insert failed; push remains durable in object store"
+                            );
+                        }
+                    }
                 }
-                Ok((_, false)) => {
-                    info!(
-                        owner = %ctx.owner,
-                        repo = %ctx.repo_id,
-                        "kind:30618 deduplicated by relay db"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        owner = %ctx.owner,
-                        repo = %ctx.repo_id,
-                        error = %e,
-                        "kind:30618 insert failed; push remains durable in object store"
-                    );
-                }
-            },
+            }
             Err(e) => {
                 warn!(
                     owner = %ctx.owner,

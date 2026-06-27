@@ -152,10 +152,18 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
             if let Some(owner) = nip_oa_owner {
                 // Ensure both agent and owner have users rows (BYO agents may not,
                 // and agent_owner_pubkey has a FK constraint to users.pubkey).
-                if let Err(e) = state.db.ensure_user(pubkey.as_bytes()).await {
+                if let Err(e) = state
+                    .db
+                    .ensure_user(conn.tenant.community(), pubkey.as_bytes())
+                    .await
+                {
                     warn!(conn_id = %conn_id, error = %e, "ensure_user(agent) failed during NIP-OA backfill");
                 }
-                if let Err(e) = state.db.ensure_user(owner.as_bytes()).await {
+                if let Err(e) = state
+                    .db
+                    .ensure_user(conn.tenant.community(), owner.as_bytes())
+                    .await
+                {
                     warn!(conn_id = %conn_id, error = %e, "ensure_user(owner) failed during NIP-OA backfill");
                 }
 
@@ -164,7 +172,7 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                 // Returns Ok(true) if written, Ok(false) if already owned by someone else.
                 match state
                     .db
-                    .set_agent_owner(pubkey.as_bytes(), owner.as_bytes())
+                    .set_agent_owner(conn.tenant.community(), pubkey.as_bytes(), owner.as_bytes())
                     .await
                 {
                     Ok(true) => {
@@ -179,7 +187,11 @@ pub async fn handle_auth(event: nostr::Event, conn: Arc<ConnectionState>, state:
                         // owner matches the existing DB record before trusting it.
                         match state
                             .db
-                            .is_agent_owner(pubkey.as_bytes(), owner.as_bytes())
+                            .is_agent_owner(
+                                conn.tenant.community(),
+                                pubkey.as_bytes(),
+                                owner.as_bytes(),
+                            )
                             .await
                         {
                             Ok(true) => {

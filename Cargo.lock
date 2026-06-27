@@ -754,7 +754,7 @@ dependencies = [
  "sqlx",
  "tokio",
  "tracing",
- "uuid",
+ "url",
 ]
 
 [[package]]

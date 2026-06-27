@@ -80,6 +80,54 @@ pub async fn bind_community<R: HostResolver>(
     }
 }
 
+/// Resolve the deployment's own community from the configured relay URL host.
+///
+/// For server-internal paths that have no inbound request `Host` header — the
+/// git Smart-HTTP transport, the localhost pre-receive hook callback, the
+/// workflow execution sink, and startup tasks — the tenant cannot come from a
+/// connection. A relay deployment serves a single canonical host (its
+/// `relay_url`), so we resolve that host through the same fail-closed
+/// [`bind_community`] path. This is deliberately NOT a default/fallback
+/// community: an unmapped `relay_url` host returns the same [`BindError`] as
+/// any other unmapped host.
+pub async fn bind_deployment_community<R: HostResolver>(
+    resolver: &R,
+    relay_url: &str,
+) -> Result<TenantContext, BindError<R::Error>> {
+    let raw_host = url::Url::parse(
+        &relay_url
+            .replace("ws://", "http://")
+            .replace("wss://", "https://"),
+    )
+    .ok()
+    .and_then(|u| u.host_str().map(|h| h.to_string()))
+    .unwrap_or_default();
+    bind_community(resolver, &raw_host).await
+}
+
+/// Production [`HostResolver`]: the relay resolves hosts against the durable
+/// `communities` host map in Postgres.
+///
+/// This is the *only* place the relay couples the row-zero seam to buzz-db. The
+/// trait keeps `bind_community` and every call site database-free and testable;
+/// this impl is the thin adapter from buzz-db's `lookup_community_by_host`
+/// (which returns a `CommunityRecord`) to the seam's `CommunityId`. A lookup
+/// that succeeds but finds no row is `Ok(None)` — fail-closed, never a default
+/// tenant; a lookup that *fails* (DB unreachable) is `Err`, also fail-closed.
+impl HostResolver for buzz_db::Db {
+    type Error = buzz_db::DbError;
+
+    async fn resolve_host(
+        &self,
+        normalized_host: &str,
+    ) -> Result<Option<CommunityId>, Self::Error> {
+        Ok(self
+            .lookup_community_by_host(normalized_host)
+            .await?
+            .map(|record| record.id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

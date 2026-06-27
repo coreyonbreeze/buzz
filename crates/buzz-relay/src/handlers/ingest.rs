@@ -34,7 +34,9 @@ use buzz_core::kind::{
     KIND_WORKFLOW_TRIGGER, RELAY_ADMIN_ADD_MEMBER, RELAY_ADMIN_CHANGE_ROLE,
     RELAY_ADMIN_REMOVE_MEMBER,
 };
+use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
+use buzz_core::CommunityId;
 use nostr::Event;
 
 use crate::state::AppState;
@@ -267,6 +269,7 @@ pub(crate) enum ReactionChannelResult {
 
 /// Derive channel_id from the target event for NIP-25 reactions.
 pub(crate) async fn derive_reaction_channel(
+    community_id: CommunityId,
     db: &buzz_db::Db,
     event: &Event,
 ) -> ReactionChannelResult {
@@ -292,7 +295,7 @@ pub(crate) async fn derive_reaction_channel(
         _ => return ReactionChannelResult::NoTarget,
     };
 
-    match db.get_event_by_id(&id_bytes).await {
+    match db.get_event_by_id(community_id, &id_bytes).await {
         Ok(Some(target)) => match target.channel_id {
             Some(ch_id) => ReactionChannelResult::Channel(ch_id),
             None => ReactionChannelResult::NoChannel,
@@ -412,11 +415,15 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
 ///
 /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
 pub(crate) async fn check_channel_membership(
+    tenant: &TenantContext,
     state: &AppState,
     ch_id: Uuid,
     pubkey_bytes: &[u8],
 ) -> Result<(), String> {
-    match state.is_member_cached(ch_id, pubkey_bytes).await {
+    match state
+        .is_member_cached(tenant.community(), ch_id, pubkey_bytes)
+        .await
+    {
         Ok(true) => return Ok(()),
         Ok(false) => {}
         Err(e) => return Err(format!("error: database error: {e}")),
@@ -424,7 +431,7 @@ pub(crate) async fn check_channel_membership(
     // Not a member — check if channel is open.
     let is_open = state
         .db
-        .get_channel(ch_id)
+        .get_channel(tenant.community(), ch_id)
         .await
         .map(|ch| ch.visibility == "open")
         .unwrap_or(false);
@@ -475,6 +482,7 @@ impl ThreadMetadataOwned {
 
 /// Resolve NIP-10 thread ancestry from e-tags.
 pub(crate) async fn resolve_nip10_thread_meta(
+    community_id: CommunityId,
     event: &Event,
     channel_id: Uuid,
     state: &AppState,
@@ -511,8 +519,10 @@ pub(crate) async fn resolve_nip10_thread_meta(
         hex::decode(&parent_hex).map_err(|_| "invalid parent event ID hex".to_string())?;
 
     let (parent_event_result, parent_meta_result) = tokio::join!(
-        state.db.get_event_by_id(&parent_bytes),
-        state.db.get_thread_metadata_by_event(&parent_bytes),
+        state.db.get_event_by_id(community_id, &parent_bytes),
+        state
+            .db
+            .get_thread_metadata_by_event(community_id, &parent_bytes),
     );
 
     let parent_event = parent_event_result
@@ -543,7 +553,10 @@ pub(crate) async fn resolve_nip10_thread_meta(
             if client_root_bytes != effective_root {
                 return Err("root tag does not match thread ancestry".to_string());
             }
-            let root_ts = if let Ok(Some(root_ev)) = state.db.get_event_by_id(&effective_root).await
+            let root_ts = if let Ok(Some(root_ev)) = state
+                .db
+                .get_event_by_id(community_id, &effective_root)
+                .await
             {
                 chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
                     .unwrap_or(parent_created)
@@ -586,7 +599,9 @@ pub(crate) async fn resolve_nip10_thread_meta(
             }
             let depth = if parent_root == parent_bytes { 1 } else { 2 };
             let root_created = if parent_root != parent_bytes {
-                if let Ok(Some(root_ev)) = state.db.get_event_by_id(&parent_root).await {
+                if let Ok(Some(root_ev)) =
+                    state.db.get_event_by_id(community_id, &parent_root).await
+                {
                     chrono::DateTime::from_timestamp(root_ev.event.created_at.as_secs() as i64, 0)
                         .unwrap_or(parent_created)
                 } else {
@@ -662,7 +677,11 @@ pub(crate) fn effective_message_author(event: &Event, relay_pubkey: &nostr::Publ
 }
 
 /// Validate kind:40003 edit ownership — event.pubkey must match target's effective author.
-async fn validate_edit_ownership(event: &Event, state: &AppState) -> Result<(), String> {
+async fn validate_edit_ownership(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), String> {
     let target_hex = event
         .tags
         .iter()
@@ -685,7 +704,7 @@ async fn validate_edit_ownership(event: &Event, state: &AppState) -> Result<(), 
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(&target_bytes)
+        .get_event_by_id(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "edit target event not found".to_string())?;
@@ -711,7 +730,11 @@ async fn validate_edit_ownership(event: &Event, state: &AppState) -> Result<(), 
 }
 
 /// Validate kind:45002 vote targets a forum post (45001) or comment (45003).
-async fn validate_forum_vote_target(event: &Event, state: &AppState) -> Result<(), String> {
+async fn validate_forum_vote_target(
+    community_id: CommunityId,
+    event: &Event,
+    state: &AppState,
+) -> Result<(), String> {
     let target_hex = event
         .tags
         .iter()
@@ -734,7 +757,7 @@ async fn validate_forum_vote_target(event: &Event, state: &AppState) -> Result<(
         hex::decode(&target_hex).map_err(|_| "invalid target event ID".to_string())?;
     let target_event = state
         .db
-        .get_event_by_id(&target_bytes)
+        .get_event_by_id(community_id, &target_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?
         .ok_or_else(|| "vote target event not found".to_string())?;
@@ -1117,6 +1140,7 @@ fn validate_event_reminder(event: &Event) -> Result<(), &'static str> {
 /// transport-specific response format.
 pub async fn ingest_event(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     event: Event,
     auth: IngestAuth,
 ) -> Result<IngestResult, IngestError> {
@@ -1226,11 +1250,11 @@ pub async fn ingest_event(
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
-        return super::command_executor::handle_command(state, event, auth).await;
+        return super::command_executor::handle_command(tenant, state, event, auth).await;
     }
 
     let mut channel_id = if kind_u32 == KIND_REACTION {
-        match derive_reaction_channel(&state.db, &event).await {
+        match derive_reaction_channel(tenant.community(), &state.db, &event).await {
             ReactionChannelResult::Channel(ch_id) => Some(ch_id),
             ReactionChannelResult::NoChannel => None,
             ReactionChannelResult::NotFound => {
@@ -1274,7 +1298,11 @@ pub async fn ingest_event(
                 let target_bytes = hex::decode(&hex).map_err(|_| {
                     IngestError::Rejected("invalid: malformed deletion target id".into())
                 })?;
-                match state.db.get_event_by_id(&target_bytes).await {
+                match state
+                    .db
+                    .get_event_by_id(tenant.community(), &target_bytes)
+                    .await
+                {
                     Ok(Some(target)) => target.channel_id,
                     Ok(None) => None, // target not found — validate_standard_deletion will catch this
                     Err(e) => {
@@ -1320,7 +1348,7 @@ pub async fn ingest_event(
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || auth.has_proxy_scope();
         if !skip_membership {
-            check_channel_membership(state, ch_id, &pubkey_bytes)
+            check_channel_membership(tenant, state, ch_id, &pubkey_bytes)
                 .await
                 .map_err(IngestError::Rejected)?;
         }
@@ -1328,7 +1356,7 @@ pub async fn ingest_event(
 
     // Handled directly — these mutate relay_members and do NOT get stored.
     if is_relay_admin_kind(event.kind.as_u16() as u32) {
-        crate::handlers::relay_admin::handle_relay_admin_event(state, &event)
+        crate::handlers::relay_admin::handle_relay_admin_event(tenant, state, &event)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
         return Ok(IngestResult {
@@ -1404,11 +1432,14 @@ pub async fn ingest_event(
 
         // Publish NIP-43 announcements — fire-and-forget.
         if let Err(e) =
-            crate::handlers::side_effects::publish_nip43_member_removed(state, &sender_hex).await
+            crate::handlers::side_effects::publish_nip43_member_removed(tenant, state, &sender_hex)
+                .await
         {
             warn!(error = %e, "failed to publish NIP-43 member removed event");
         }
-        if let Err(e) = crate::handlers::side_effects::publish_nip43_membership_list(state).await {
+        if let Err(e) =
+            crate::handlers::side_effects::publish_nip43_membership_list(tenant, state).await
+        {
             warn!(error = %e, "failed to publish NIP-43 membership list");
         }
 
@@ -1422,7 +1453,7 @@ pub async fn ingest_event(
     }
 
     if crate::handlers::side_effects::is_admin_kind(kind_u32) {
-        crate::handlers::side_effects::validate_admin_event(kind_u32, &event, state)
+        crate::handlers::side_effects::validate_admin_event(tenant, kind_u32, &event, state)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
@@ -1432,13 +1463,13 @@ pub async fn ingest_event(
     // NIP-43 admin commands above — the request itself falls through to normal
     // storage so the delta's `["e", request_id]` audit reference resolves.
     if is_identity_archive_request_kind(kind_u32) {
-        crate::handlers::identity_archive::handle_identity_archive_event(state, &event)
+        crate::handlers::identity_archive::handle_identity_archive_event(tenant, state, &event)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     if kind_u32 == KIND_DELETION {
-        crate::handlers::side_effects::validate_standard_deletion_event(&event, state)
+        crate::handlers::side_effects::validate_standard_deletion_event(tenant, &event, state)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
@@ -1452,7 +1483,7 @@ pub async fn ingest_event(
             });
 
         if !is_unarchive {
-            if let Ok(channel) = state.db.get_channel(ch_id).await {
+            if let Ok(channel) = state.db.get_channel(tenant.community(), ch_id).await {
                 if channel.archived_at.is_some() {
                     return Err(IngestError::Rejected("invalid: channel is archived".into()));
                 }
@@ -1477,13 +1508,13 @@ pub async fn ingest_event(
     }
 
     if kind_u32 == KIND_STREAM_MESSAGE_EDIT {
-        validate_edit_ownership(&event, state)
+        validate_edit_ownership(tenant.community(), &event, state)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     if kind_u32 == KIND_FORUM_VOTE {
-        validate_forum_vote_target(&event, state)
+        validate_forum_vote_target(tenant.community(), &event, state)
             .await
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
@@ -1579,6 +1610,7 @@ pub async fn ingest_event(
             let (_, was_created) = state
                 .db
                 .create_channel_with_id(
+                    tenant.community(),
                     client_uuid,
                     &name,
                     channel_type,
@@ -1609,7 +1641,7 @@ pub async fn ingest_event(
             ));
         }
         if let Some(ch_id) = channel_id {
-            match state.db.get_channel(ch_id).await {
+            match state.db.get_channel(tenant.community(), ch_id).await {
                 Ok(ch) if ch.visibility == "private" => {
                     return Err(IngestError::Rejected(
                         "restricted: channel is private".into(),
@@ -1639,7 +1671,7 @@ pub async fn ingest_event(
 
     let thread_meta = if requires_h_channel_scope(kind_u32) {
         if let Some(ch_id) = channel_id {
-            resolve_nip10_thread_meta(&event, ch_id, state)
+            resolve_nip10_thread_meta(tenant.community(), &event, ch_id, state)
                 .await
                 .map_err(|msg| IngestError::Rejected(format!("invalid: {msg}")))?
         } else {
@@ -1693,7 +1725,7 @@ pub async fn ingest_event(
 
         let target_event = state
             .db
-            .get_event_by_id(&target_id)
+            .get_event_by_id(tenant.community(), &target_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
             .ok_or_else(|| {
@@ -1743,7 +1775,12 @@ pub async fn ingest_event(
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         let (stored_event, was_inserted) = match state
             .db
-            .insert_event_with_thread_metadata(&event, channel_id, thread_params)
+            .insert_event_with_thread_metadata(
+                tenant.community(),
+                &event,
+                channel_id,
+                thread_params,
+            )
             .await
         {
             Ok(result) => result,
@@ -1778,7 +1815,7 @@ pub async fn ingest_event(
         }
 
         let pubkey_hex = auth.pubkey().to_hex();
-        dispatch_persistent_event(state, &stored_event, kind_u32, &pubkey_hex).await;
+        dispatch_persistent_event(tenant, state, &stored_event, kind_u32, &pubkey_hex).await;
 
         info!(event_id = %event_id_hex, kind = kind_u32, "Event ingested via pipeline");
         return Ok(IngestResult {
@@ -1793,7 +1830,7 @@ pub async fn ingest_event(
         // channel_id is None for global kinds (0, 1, 3) due to step 5b above.
         state
             .db
-            .replace_addressable_event(&event, channel_id)
+            .replace_addressable_event(tenant.community(), &event, channel_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
     } else if is_parameterized_replaceable(kind_u32) {
@@ -1808,14 +1845,19 @@ pub async fn ingest_event(
         }
         state
             .db
-            .replace_parameterized_event(&event, &d_tag, channel_id)
+            .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
             .await
             .map_err(|e| IngestError::Internal(format!("error: {e}")))?
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state
             .db
-            .insert_event_with_thread_metadata(&event, channel_id, thread_params)
+            .insert_event_with_thread_metadata(
+                tenant.community(),
+                &event,
+                channel_id,
+                thread_params,
+            )
             .await
         {
             Ok(result) => result,
@@ -1823,10 +1865,14 @@ pub async fn ingest_event(
                 // Compensate: if we pre-created a channel for kind:9007,
                 // soft-delete it so no orphaned channel row remains.
                 if let Some(ch_id) = pre_created_channel {
-                    if let Err(re) = state.db.soft_delete_channel(ch_id).await {
+                    if let Err(re) = state
+                        .db
+                        .soft_delete_channel(tenant.community(), ch_id)
+                        .await
+                    {
                         warn!(event_id = %event_id_hex, "channel compensation failed: {re}");
                     }
-                    state.invalidate_channel_deleted();
+                    state.invalidate_channel_deleted(tenant);
                 }
                 return Err(match e {
                     buzz_db::DbError::AuthEventRejected => {
@@ -1850,7 +1896,7 @@ pub async fn ingest_event(
     // Skip kind:9007 (create) — the deadline was just set during creation.
     if let Some(ch_id) = channel_id {
         if kind_u32 != KIND_NIP29_CREATE_GROUP {
-            if let Err(e) = state.db.bump_ttl_deadline(ch_id).await {
+            if let Err(e) = state.db.bump_ttl_deadline(tenant.community(), ch_id).await {
                 warn!(channel = %ch_id, "TTL deadline bump failed: {e}");
             }
         }
@@ -1858,14 +1904,15 @@ pub async fn ingest_event(
 
     if crate::handlers::side_effects::is_side_effect_kind(kind_u32) {
         if let Err(e) =
-            crate::handlers::side_effects::handle_side_effects(kind_u32, &event, state).await
+            crate::handlers::side_effects::handle_side_effects(tenant, kind_u32, &event, state)
+                .await
         {
             warn!(event_id = %event_id_hex, kind = kind_u32, "Side effect failed: {e}");
         }
     }
 
     let pubkey_hex = auth.pubkey().to_hex();
-    dispatch_persistent_event(state, &stored_event, kind_u32, &pubkey_hex).await;
+    dispatch_persistent_event(tenant, state, &stored_event, kind_u32, &pubkey_hex).await;
 
     info!(event_id = %event_id_hex, kind = kind_u32, "Event ingested via pipeline");
 

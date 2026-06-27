@@ -163,6 +163,23 @@ pub async fn submit_event(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Row zero: bind this HTTP request to its community from the request host
+    // before any tenant-scoped write, identical to the WS door in `router.rs`.
+    // Unmapped host or lookup failure fails closed with a generic 404 — never a
+    // default tenant, never echoing the host.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
     let url = canonical_url(&state.config.relay_url, "/events");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
@@ -193,7 +210,7 @@ pub async fn submit_event(
     {
         let event_id = event.id.to_hex();
         return match crate::handlers::mesh_signaling::handle_mesh_event_http(
-            &state, &pubkey, &event,
+            &state, &tenant, &pubkey, &event,
         )
         .await
         {
@@ -212,7 +229,7 @@ pub async fn submit_event(
         auth_method: crate::handlers::ingest::HttpAuthMethod::Nip98,
     };
 
-    match crate::handlers::ingest::ingest_event(&state, event, auth).await {
+    match crate::handlers::ingest::ingest_event(&state, &tenant, event, auth).await {
         Ok(result) => Ok(Json(serde_json::json!({
             "event_id": result.event_id,
             "accepted": result.accepted,
@@ -234,6 +251,24 @@ pub async fn query_events(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Row zero: bind this HTTP request to its community from the request host
+    // before any tenant-scoped read, identical to the WS door in `router.rs`.
+    // An unmapped host or lookup failure fails closed with a generic 404 — never
+    // a default tenant, never echoing the host (so an unauthenticated caller
+    // cannot probe which communities exist on this deployment).
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
     let url = canonical_url(&state.config.relay_url, "/query");
     let (pubkey, event_id_bytes) = verify_bridge_auth(
         &headers,
@@ -282,7 +317,7 @@ pub async fn query_events(
 
     // Get channels this user can access — same enforcement as WS REQ handler.
     let accessible_channels = state
-        .get_accessible_channel_ids_cached(&pubkey_bytes)
+        .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
@@ -291,13 +326,14 @@ pub async fn query_events(
             &state,
             &filters,
             &accessible_channels,
+            &tenant,
             &authed_pubkey_hex,
             &pubkey_bytes,
         )
         .await;
     }
 
-    if let Some(presence_events) = synthesize_presence(&state, &filters).await {
+    if let Some(presence_events) = synthesize_presence(&state, &tenant, &filters).await {
         return Ok(Json(Value::Array(presence_events)));
     }
 
@@ -403,7 +439,7 @@ pub async fn query_events(
             .min(BRIDGE_THREAD_MAX_LIMIT as usize) as u32;
         let thread_replies = state
             .db
-            .get_thread_replies(&root_bytes, Some(depth), limit, None)
+            .get_thread_replies(tenant.community(), &root_bytes, Some(depth), limit, None)
             .await
             .map_err(|e| internal_error(&format!("thread query error: {e}")))?;
 
@@ -430,9 +466,13 @@ pub async fn query_events(
             }
         }
 
-        let mut query =
-            crate::handlers::req::build_event_query_from_filter(filter, &pubkey_bytes, &state)
-                .await;
+        let mut query = crate::handlers::req::build_event_query_from_filter(
+            filter,
+            &pubkey_bytes,
+            &state,
+            tenant.community(),
+        )
+        .await;
 
         if let Some(bid) = extract_before_id(raw) {
             if query.until.is_none() {
@@ -501,6 +541,23 @@ pub async fn count_events(
     let auth_tag = headers.get("x-auth-tag").and_then(|v| v.to_str().ok());
     super::relay_members::enforce_relay_membership(&state, &pubkey_bytes, auth_tag).await?;
 
+    // Row zero: bind this HTTP request to its community from the request host
+    // before any tenant-scoped read, identical to the WS door in `router.rs`
+    // and `query_events`/`submit_event` above. Fail-closed; never a default
+    // tenant, never echoing the host.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
     let filters: Vec<nostr::Filter> = serde_json::from_slice(&body)
         .map_err(|e| api_error(StatusCode::BAD_REQUEST, &format!("invalid filters: {e}")))?;
 
@@ -527,7 +584,7 @@ pub async fn count_events(
 
     // Get channels this user can access.
     let accessible_channels = state
-        .get_accessible_channel_ids_cached(&pubkey_bytes)
+        .get_accessible_channel_ids_cached(tenant.community(), &pubkey_bytes)
         .await
         .map_err(|e| internal_error(&format!("channel access lookup: {e}")))?;
 
@@ -542,9 +599,13 @@ pub async fn count_events(
                 continue; // Skip filters targeting inaccessible channels.
             }
             // Channel is accessible — count with pushability check.
-            let query =
-                crate::handlers::req::build_event_query_from_filter(filter, &pubkey_bytes, &state)
-                    .await;
+            let query = crate::handlers::req::build_event_query_from_filter(
+                filter,
+                &pubkey_bytes,
+                &state,
+                tenant.community(),
+            )
+            .await;
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
                 !authors.is_empty()
                     && authors
@@ -587,9 +648,13 @@ pub async fn count_events(
         } else {
             // No channel filter — use SQL-level channel_ids pushdown to count
             // only events in accessible channels (+ global events).
-            let mut query =
-                crate::handlers::req::build_event_query_from_filter(filter, &pubkey_bytes, &state)
-                    .await;
+            let mut query = crate::handlers::req::build_event_query_from_filter(
+                filter,
+                &pubkey_bytes,
+                &state,
+                tenant.community(),
+            )
+            .await;
             query.channel_ids = Some(accessible_channels.to_vec());
 
             let author_is_self = filter.authors.as_ref().is_some_and(|authors| {
@@ -669,21 +734,24 @@ fn search_hit_accepted(
     true
 }
 
-/// Handle search filters by routing to Typesense, then fetching full events from DB.
-/// Returns first page of results (no pagination for bridge MVP).
+/// Handle search filters by routing to Postgres FTS, then fetching full events
+/// from DB. Returns first page of results (no pagination for bridge MVP).
 async fn handle_bridge_search(
     state: &AppState,
     filters: &[nostr::Filter],
     accessible_channels: &[uuid::Uuid],
+    tenant: &buzz_core::tenant::TenantContext,
     reader_pubkey_hex: &str,
     pubkey_bytes: &[u8],
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
-    // Bridge always includes global (non-channel) events — same as WS with full scopes.
+    // Bridge always includes global (channel-less) events — same as WS with
+    // full scopes. `None` means no accessible channels and no global access →
+    // empty result set (the caller short-circuits exactly as the WS door EOSEs).
     let channel_scope = match crate::handlers::req::build_search_channel_scope_filter(
         accessible_channels,
         true, // include_global
     ) {
-        Some(f) => f,
+        Some(scope) => scope,
         None => return Ok(Json(Value::Array(Vec::new()))),
     };
 
@@ -701,50 +769,49 @@ async fn handle_bridge_search(
             continue;
         }
 
-        // Build Typesense filter — push channel scope + NIP-01 constraints.
+        // Scope by channel — push the #h tag (intersected with accessible
+        // channels) if present, else the community-wide scope.
         let h_tag = nostr::SingleLetterTag::lowercase(nostr::Alphabet::H);
         let filter_channel_scope =
             if let Some(vs) = filter.generic_tags.get(&h_tag).filter(|vs| !vs.is_empty()) {
-                let valid: Vec<String> = vs
+                let valid: Vec<uuid::Uuid> = vs
                     .iter()
                     .filter_map(|v| v.parse::<uuid::Uuid>().ok())
                     .filter(|id| accessible_channels.contains(id))
-                    .map(|id| id.to_string())
                     .collect();
                 if valid.is_empty() {
                     continue; // All #h values inaccessible — skip filter.
                 }
-                format!("channel_id:=[{}]", valid.join(","))
+                buzz_search::ChannelScope::Channels(valid)
             } else {
                 channel_scope.clone()
             };
 
-        let mut filter_parts = vec![filter_channel_scope];
-        if let Some(ref kinds) = filter.kinds {
-            if !kinds.is_empty() {
-                let kind_vals: Vec<String> = kinds.iter().map(|k| k.as_u16().to_string()).collect();
-                filter_parts.push(format!("kind:=[{}]", kind_vals.join(",")));
+        let kinds = filter.kinds.as_ref().and_then(|ks| {
+            if ks.is_empty() {
+                None
+            } else {
+                Some(ks.iter().map(|k| k.as_u16() as i32).collect::<Vec<_>>())
             }
-        }
-        if let Some(ref authors) = filter.authors {
-            if !authors.is_empty() {
-                let author_vals: Vec<String> = authors.iter().map(|a| a.to_hex()).collect();
-                filter_parts.push(format!("pubkey:=[{}]", author_vals.join(",")));
+        });
+        let authors = filter.authors.as_ref().and_then(|au| {
+            if au.is_empty() {
+                None
+            } else {
+                Some(au.iter().map(|a| a.to_bytes().to_vec()).collect::<Vec<_>>())
             }
-        }
-        if let Some(since) = filter.since {
-            filter_parts.push(format!("created_at:>={}", since.as_secs()));
-        }
-        if let Some(until) = filter.until {
-            filter_parts.push(format!("created_at:<={}", until.as_secs()));
-        }
-
-        let filter_by = filter_parts.join(" && ");
+        });
+        let since = filter.since.map(|s| s.as_secs() as i64);
+        let until = filter.until.map(|u| u.as_secs() as i64);
 
         let search_query = buzz_search::SearchQuery {
+            community: tenant.community(),
             q: search_text,
-            filter_by: Some(filter_by),
-            sort_by: None, // Typesense default = relevance
+            channel_scope: filter_channel_scope,
+            kinds,
+            authors,
+            since,
+            until,
             page: 1,
             per_page: limit,
         };
@@ -755,13 +822,9 @@ async fn handle_bridge_search(
             .await
             .map_err(|e| internal_error(&format!("search error: {e}")))?;
 
-        // Fetch full events from DB by ID.
-        let hit_ids: Vec<Vec<u8>> = search_result
-            .hits
-            .into_iter()
-            .filter_map(|h| hex::decode(&h.event_id).ok())
-            .filter(|bytes| bytes.len() == 32)
-            .collect();
+        // Fetch full events from DB by ID. Hit ids are already raw 32-byte
+        // arrays from the FTS layer — no hex decode.
+        let hit_ids: Vec<[u8; 32]> = search_result.hits.into_iter().map(|h| h.event_id).collect();
 
         if hit_ids.is_empty() {
             continue;
@@ -770,22 +833,18 @@ async fn handle_bridge_search(
         let id_refs: Vec<&[u8]> = hit_ids.iter().map(|b| b.as_slice()).collect();
         let stored_events = state
             .db
-            .get_events_by_ids(&id_refs)
+            .get_events_by_ids(tenant.community(), &id_refs)
             .await
             .map_err(|e| internal_error(&format!("search fetch error: {e}")))?;
 
-        // Build lookup map to preserve Typesense relevance ordering.
+        // Build lookup map to preserve FTS relevance ordering.
         let event_map: std::collections::HashMap<[u8; 32], &buzz_core::StoredEvent> = stored_events
             .iter()
             .map(|ev| (ev.event.id.to_bytes(), ev))
             .collect();
 
-        for hit_id in &hit_ids {
-            let id_array: [u8; 32] = match hit_id.as_slice().try_into() {
-                Ok(a) => a,
-                Err(_) => continue,
-            };
-            let stored = match event_map.get(&id_array) {
+        for id_array in &hit_ids {
+            let stored = match event_map.get(id_array) {
                 Some(ev) => ev,
                 None => continue,
             };
@@ -796,7 +855,7 @@ async fn handle_bridge_search(
                 continue;
             }
             // Dedup across filters.
-            if !seen_ids.insert(id_array) {
+            if !seen_ids.insert(*id_array) {
                 continue;
             }
             if let Ok(v) = serde_json::to_value(&stored.event) {
@@ -957,7 +1016,11 @@ pub async fn workflow_webhook(
 /// stored, and kind:40902 snapshots are relay-generated on demand).
 ///
 /// Returns `Some(events)` if handled, `None` to fall through to normal query.
-async fn synthesize_presence(state: &AppState, filters: &[nostr::Filter]) -> Option<Vec<Value>> {
+async fn synthesize_presence(
+    state: &AppState,
+    tenant: &buzz_core::tenant::TenantContext,
+    filters: &[nostr::Filter],
+) -> Option<Vec<Value>> {
     use buzz_core::kind::{KIND_PRESENCE_SNAPSHOT, KIND_PRESENCE_UPDATE};
 
     // Only intercept if every filter targets kind:20001 or 40902 with authors.
@@ -987,7 +1050,7 @@ async fn synthesize_presence(state: &AppState, filters: &[nostr::Filter]) -> Opt
     // Look up Redis.
     let presence_map = state
         .pubsub
-        .get_presence_bulk(&all_pubkeys)
+        .get_presence_bulk(tenant, &all_pubkeys)
         .await
         .unwrap_or_default();
 

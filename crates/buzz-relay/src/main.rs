@@ -8,7 +8,7 @@ use buzz_audit::AuditService;
 use buzz_auth::AuthService;
 use buzz_db::{Db, DbConfig};
 use buzz_pubsub::PubSubManager;
-use buzz_search::{SearchConfig, SearchService};
+use buzz_search::SearchService;
 
 use buzz_relay::config::Config;
 use buzz_relay::metrics as relay_metrics;
@@ -162,9 +162,9 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("Audit DB connection failed: {e}"))?;
     let audit = AuditService::new(audit_pool);
-    if let Err(e) = audit.ensure_schema().await {
-        error!("Failed to ensure audit schema: {e}");
-    }
+    // Audit schema is provisioned by the sqlx migrations at startup (the
+    // `audit_log` DDL is part of the migrated schema), so there is no runtime
+    // schema-ensure step.
     info!("Audit service ready");
 
     let redis_pool = {
@@ -194,15 +194,16 @@ async fn main() -> anyhow::Result<()> {
 
     let auth = AuthService::new(config.auth.clone());
 
-    let search_config = SearchConfig {
-        url: config.typesense_url.clone(),
-        api_key: config.typesense_key.clone(),
-        collection: std::env::var("TYPESENSE_COLLECTION").unwrap_or_else(|_| "events".to_string()),
-    };
-    let search = SearchService::new(search_config);
-    if let Err(e) = search.ensure_collection().await {
-        error!("Typesense collection setup failed (non-fatal): {e}");
-    }
+    // Postgres FTS: the searchable row IS the persisted event row (its
+    // `tsvector` column is populated by the `insert_event` write), so there is
+    // no external collection to provision — the search service just queries the
+    // same Postgres over its own pool.
+    let search_pool = sqlx::postgres::PgPoolOptions::new()
+        .connect(&config.database_url)
+        .await
+        .map_err(|e| anyhow::anyhow!("Search DB connection failed: {e}"))?;
+    let search = SearchService::new(search_pool);
+    info!("Search service ready (Postgres FTS)");
 
     let workflow_config = buzz_workflow::WorkflowConfig::default();
     let workflow_engine = Arc::new(WorkflowEngine::new(db.clone(), workflow_config));
@@ -295,9 +296,37 @@ async fn main() -> anyhow::Result<()> {
     if config.require_relay_membership {
         let startup_state = Arc::clone(&state);
         tokio::spawn(async move {
-            if let Err(e) =
-                buzz_relay::handlers::side_effects::publish_nip43_membership_list(&startup_state)
-                    .await
+            // Resolve the deployment's community from the configured relay URL
+            // host (single-community per deployment), failing closed if the host
+            // isn't mapped — the membership list is community-scoped now, so the
+            // relay-signed startup publish must carry a resolved tenant.
+            let raw_host = url::Url::parse(
+                &startup_state
+                    .config
+                    .relay_url
+                    .replace("ws://", "http://")
+                    .replace("wss://", "https://"),
+            )
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+            let tenant = match buzz_relay::tenant::bind_community(&startup_state.db, &raw_host)
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "initial NIP-43 membership list skipped: relay host is not mapped to a community"
+                    );
+                    return;
+                }
+            };
+            if let Err(e) = buzz_relay::handlers::side_effects::publish_nip43_membership_list(
+                &tenant,
+                &startup_state,
+            )
+            .await
             {
                 tracing::warn!(error = %e, "failed to publish initial NIP-43 membership list on startup");
             } else {
@@ -313,14 +342,43 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("BUZZ_RECONCILE_CHANNELS").is_ok() {
         let reconcile_state = Arc::clone(&state);
         tokio::spawn(async move {
+            // Resolve the deployment's community from the configured relay URL
+            // host (dev/CI runs single-community), failing closed if the host
+            // isn't mapped — the reconciler is community-scoped now, so there is
+            // no global "all channels" sweep.
+            let raw_host = url::Url::parse(
+                &reconcile_state
+                    .config
+                    .relay_url
+                    .replace("ws://", "http://")
+                    .replace("wss://", "https://"),
+            )
+            .ok()
+            .and_then(|u| u.host_str().map(|h| h.to_string()))
+            .unwrap_or_default();
+            let tenant = match buzz_relay::tenant::bind_community(&reconcile_state.db, &raw_host)
+                .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "channel reconciliation skipped: relay host is not mapped to a community"
+                    );
+                    return;
+                }
+            };
             // Try immediately, then retry every 5s for up to 2 minutes.
             // Handles CI pattern: relay starts → seed script inserts data → reconciliation.
             for attempt in 0..24u32 {
                 if attempt > 0 {
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
-                match buzz_relay::handlers::side_effects::reconcile_channel_events(&reconcile_state)
-                    .await
+                match buzz_relay::handlers::side_effects::reconcile_channel_events(
+                    &tenant,
+                    &reconcile_state,
+                )
+                .await
                 {
                     Ok(()) => {}
                     Err(e) => {
@@ -374,11 +432,21 @@ async fn main() -> anyhow::Result<()> {
 
                 info!(count = expired.len(), "Ephemeral reaper archived channels");
 
-                for channel_id in &expired {
+                for channel in &expired {
+                    // Per-row tenant: the reaper crosses communities, so each
+                    // archived channel carries its own server-resolved
+                    // `(community, host)` from the DB RETURNING. Build the
+                    // `TenantContext` from that row — never a default tenant.
+                    let tenant = buzz_core::tenant::TenantContext::resolved(
+                        channel.community_id,
+                        channel.host.clone(),
+                    );
+                    let channel_id = channel.channel_id;
                     // Emit a system message so members see why the channel was archived.
                     if let Err(e) = buzz_relay::handlers::side_effects::emit_system_message(
+                        &tenant,
                         &reaper_state,
-                        *channel_id,
+                        channel_id,
                         serde_json::json!({ "type": "channel_auto_archived" }),
                     )
                     .await
@@ -388,8 +456,9 @@ async fn main() -> anyhow::Result<()> {
 
                     // Update NIP-29 discovery events so clients see the archived state.
                     if let Err(e) = buzz_relay::handlers::side_effects::emit_group_discovery_events(
+                        &tenant,
                         &reaper_state,
-                        *channel_id,
+                        channel_id,
                     )
                     .await
                     {
@@ -402,7 +471,7 @@ async fn main() -> anyhow::Result<()> {
                     // by the archived=true skip in discover_channels on reconnect.
                     buzz_relay::handlers::side_effects::evict_all_channel_subscriptions(
                         &reaper_state,
-                        *channel_id,
+                        channel_id,
                     )
                     .await;
                 }
@@ -431,6 +500,31 @@ async fn main() -> anyhow::Result<()> {
                 batch_limit = scheduler_batch_limit,
                 "NIP-ER reminder scheduler started"
             );
+            // Resolve the deployment's community once — the scheduler is a
+            // background sweep with no inbound connection. Author-private
+            // reminders (kind:30300) publish to the deployment community's
+            // global Redis topic; the per-recipient author-only delivery gate
+            // (`filter_fanout_by_access`) is the actual isolation boundary, not
+            // the topic. NOTE: `DueReminder` does not yet carry a per-row
+            // `community_id`/`host`, so a multi-community deployment would route
+            // every community's reminders onto one community's topic. That is a
+            // buzz-db follow-up (enrich the `query_due_reminders` SELECT like the
+            // reaper's `ReapedEphemeralChannel`), tracked for Mari's lane.
+            let scheduler_tenant = match buzz_relay::tenant::bind_deployment_community(
+                &scheduler_state.db,
+                &scheduler_state.config.relay_url,
+            )
+            .await
+            {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    error!(
+                        error = ?e,
+                        "reminder scheduler exiting: relay host is not mapped to a community"
+                    );
+                    return;
+                }
+            };
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(scheduler_interval_secs)).await;
 
@@ -460,7 +554,11 @@ async fn main() -> anyhow::Result<()> {
                     // next tick is harmless (subscribers dedup by event ID).
                     if let Err(e) = scheduler_state
                         .pubsub
-                        .publish_event(uuid::Uuid::nil(), &reminder_to_event(&reminder))
+                        .publish_event(
+                            &scheduler_tenant,
+                            buzz_pubsub::EventTopic::Global,
+                            &reminder_to_event(&reminder),
+                        )
                         .await
                     {
                         error!(
@@ -528,8 +626,12 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             loop {
                 match rx.recv().await {
-                    Ok(invalidation) => {
-                        state_for_cache.apply_cache_invalidation(invalidation);
+                    Ok(scoped) => {
+                        // The local moka caches key on globally-unique UUIDs /
+                        // pubkeys, so applying the tenant-local op by key is
+                        // correct regardless of community; the `community_id`
+                        // scope rides the Redis topic, not the moka key.
+                        state_for_cache.apply_cache_invalidation(scoped.invalidation);
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                         metrics::counter!("buzz_cache_invalidation_lag_total").increment(n);

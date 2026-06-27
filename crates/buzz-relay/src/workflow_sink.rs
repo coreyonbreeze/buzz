@@ -57,6 +57,19 @@ impl ActionSink for RelayActionSink {
                 .upgrade()
                 .ok_or_else(|| ActionSinkError::Database("relay is shutting down".into()))?;
 
+            // Resolve the deployment's own community from the configured relay
+            // host — a workflow execution has no inbound connection to bind. The
+            // relay-signed kind:9 message belongs to that community. Fail closed
+            // if the host isn't mapped (never a default tenant).
+            let tenant =
+                crate::tenant::bind_deployment_community(&state.db, &state.config.relay_url)
+                    .await
+                    .map_err(|e| {
+                        ActionSinkError::Database(format!(
+                            "relay host not mapped to a community: {e:?}"
+                        ))
+                    })?;
+
             // 1. Validate content is not empty/whitespace-only
             if text.trim().is_empty() {
                 return Err(ActionSinkError::EmptyContent);
@@ -69,7 +82,7 @@ impl ActionSink for RelayActionSink {
 
             let channel = state
                 .db
-                .get_channel(channel_uuid)
+                .get_channel(tenant.community(), channel_uuid)
                 .await
                 .map_err(|e| match &e {
                     buzz_db::DbError::ChannelNotFound(_) | buzz_db::DbError::NotFound(_) => {
@@ -90,7 +103,7 @@ impl ActionSink for RelayActionSink {
             let author_pubkey_bytes = author_pubkey.to_bytes().to_vec();
             let author_pubkey_hex = author_pubkey.to_hex();
             let is_member = state
-                .is_member_cached(channel_uuid, &author_pubkey_bytes)
+                .is_member_cached(tenant.community(), channel_uuid, &author_pubkey_bytes)
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
             if !is_member && channel.visibility != "open" {
@@ -151,16 +164,26 @@ impl ActionSink for RelayActionSink {
 
             let (stored_event, was_inserted) = state
                 .db
-                .insert_event_with_thread_metadata(&event, Some(channel_uuid), thread_meta)
+                .insert_event_with_thread_metadata(
+                    tenant.community(),
+                    &event,
+                    Some(channel_uuid),
+                    thread_meta,
+                )
                 .await
                 .map_err(|e| ActionSinkError::Database(e.to_string()))?;
 
             // 5. Post-persist side effects (fan-out, search, audit)
             //    Only if actually inserted (idempotency guard).
             if was_inserted {
-                let _ =
-                    dispatch_persistent_event(&state, &stored_event, kind_u32, &author_pubkey_hex)
-                        .await;
+                let _ = dispatch_persistent_event(
+                    &tenant,
+                    &state,
+                    &stored_event,
+                    kind_u32,
+                    &author_pubkey_hex,
+                )
+                .await;
             }
 
             Ok(event_id_hex)

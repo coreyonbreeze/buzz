@@ -26,6 +26,7 @@ use buzz_core::event::StoredEvent;
 use buzz_core::kind::{
     event_kind_u32, KIND_MESH_CALL_ME_NOW, KIND_MESH_CONNECT_REQUEST, KIND_MESH_STATUS_REPORT,
 };
+use buzz_core::tenant::TenantContext;
 use nostr::{EventBuilder, Kind, Tag};
 
 use crate::api::relay_members::{check_relay_membership, MembershipDecision};
@@ -72,6 +73,7 @@ pub(crate) fn connect_request_rate_limited(state: &AppState, pubkey: &nostr::Pub
 /// maps `Err` to HTTP 400.
 pub async fn handle_mesh_event_http(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     auth_pubkey: &nostr::PublicKey,
     event: &nostr::Event,
 ) -> Result<(), String> {
@@ -87,12 +89,14 @@ pub async fn handle_mesh_event_http(
 
     let pubkey_hex = auth_pubkey.to_hex();
     match event_kind_u32(event) {
-        k if k == KIND_MESH_STATUS_REPORT => handle_status_report(state, &pubkey_hex, event).await,
+        k if k == KIND_MESH_STATUS_REPORT => {
+            handle_status_report(state, tenant, &pubkey_hex, event).await
+        }
         k if k == KIND_MESH_CONNECT_REQUEST => {
             if connect_request_rate_limited(state, auth_pubkey) {
                 return Err("rate-limited: mesh connect request rate exceeded (20/sec)".to_string());
             }
-            handle_connect_request(state, &pubkey_hex, event).await
+            handle_connect_request(state, tenant, &pubkey_hex, event).await
         }
         k => Err(format!("invalid: kind {k} is not a mesh signaling kind")),
     }
@@ -210,6 +214,7 @@ pub const CALL_ME_NOW_TTL_SECS: u64 = 60;
 /// suitable for an OK(false) reply (reason is for the requester, not secret).
 pub async fn handle_connect_request(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     requester_pubkey_hex: &str,
     event: &nostr::Event,
 ) -> Result<(), String> {
@@ -260,8 +265,8 @@ pub async fn handle_connect_request(
         expires_at,
     )?;
 
-    publish_channelless_ephemeral(state, &to_requester).await;
-    publish_channelless_ephemeral(state, &to_target).await;
+    publish_channelless_ephemeral(state, tenant, &to_requester).await;
+    publish_channelless_ephemeral(state, tenant, &to_target).await;
     Ok(())
 }
 
@@ -309,16 +314,25 @@ fn build_call_me_now(
 /// endpoint addrs). This matches presence/typing being broadly observable and is
 /// intentional for v1. A conn-scoped private delivery channel would be needed to
 /// hide it.
-async fn publish_channelless_ephemeral(state: &Arc<AppState>, event: &nostr::Event) {
+async fn publish_channelless_ephemeral(
+    state: &Arc<AppState>,
+    tenant: &TenantContext,
+    event: &nostr::Event,
+) {
     state.mark_local_event(&event.id);
-    if let Err(e) = state.pubsub.publish_event(uuid::Uuid::nil(), event).await {
+    if let Err(e) = state
+        .pubsub
+        .publish_event(tenant, buzz_pubsub::EventTopic::Global, event)
+        .await
+    {
         state.local_event_ids.invalidate(&event.id.to_bytes());
         tracing::warn!(event_id = %event.id, "mesh call-me-now global publish failed: {e}");
     }
     let stored = StoredEvent::new(event.clone(), None);
     // Routed through the guarded send path for uniformity; the access gate
     // no-ops for this globally-scoped (channel_id = None) call-me-now event.
-    crate::handlers::event::fan_out_event_to_local_subscribers(state, &stored).await;
+    crate::handlers::event::fan_out_event_to_local_subscribers(state, tenant.community(), &stored)
+        .await;
 }
 
 /// Handle a verified KIND_MESH_STATUS_REPORT (24620) from an authenticated relay
@@ -329,6 +343,7 @@ async fn publish_channelless_ephemeral(state: &Arc<AppState>, event: &nostr::Eve
 /// already enforced (the reporter is authenticated on a member-gated WS).
 pub async fn handle_status_report(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
     reporter_pubkey_hex: &str,
     event: &nostr::Event,
 ) -> Result<(), String> {
@@ -348,6 +363,7 @@ pub async fn handle_status_report(
         .map_err(|e| format!("invalid: mesh status report content is not JSON ({e})"))?;
     crate::mesh_status_publisher::publish_mesh_status_from_payload(
         state,
+        tenant,
         reporter_pubkey_hex,
         &payload,
     )
@@ -489,6 +505,13 @@ mod tests {
         config
     }
 
+    /// Synthetic tenant for the in-memory mesh signaling tests. These exercise
+    /// the sub-registry fan-out path (lazy PG pool, dead Redis), so they never
+    /// touch the `communities` FK — a nil-community tenant is sufficient.
+    fn test_tenant() -> TenantContext {
+        TenantContext::resolved(buzz_core::CommunityId::from_uuid(uuid::Uuid::nil()), "test")
+    }
+
     async fn test_state() -> std::sync::Arc<AppState> {
         let config = test_config();
         let pool = sqlx::PgPool::connect_lazy(&config.database_url).expect("lazy pg pool");
@@ -501,13 +524,9 @@ mod tests {
                 .await
                 .expect("pubsub manager"),
         );
-        let audit = buzz_audit::AuditService::new(pool);
+        let audit = buzz_audit::AuditService::new(pool.clone());
         let auth = buzz_auth::AuthService::new(config.auth.clone());
-        let search = buzz_search::SearchService::new(buzz_search::SearchConfig {
-            url: config.typesense_url.clone(),
-            api_key: config.typesense_key.clone(),
-            collection: "events".to_string(),
-        });
+        let search = buzz_search::SearchService::new(pool.clone());
         let workflow_engine = std::sync::Arc::new(buzz_workflow::WorkflowEngine::new(
             db.clone(),
             buzz_workflow::WorkflowConfig::default(),
@@ -591,9 +610,14 @@ mod tests {
         let (_target_conn, mut target_rx) =
             register_call_me_now_sub(&state, &target_hex, "mesh_target");
 
-        handle_connect_request(&state, &requester_hex, &connect_request_event(&target_hex))
-            .await
-            .expect("open relay admits both peers and emits pair");
+        handle_connect_request(
+            &state,
+            &test_tenant(),
+            &requester_hex,
+            &connect_request_event(&target_hex),
+        )
+        .await
+        .expect("open relay admits both peers and emits pair");
 
         let requester_event = event_from_ws_message(
             requester_rx
@@ -661,6 +685,7 @@ mod tests {
 
         let err = handle_connect_request(
             &state,
+            &test_tenant(),
             &requester_hex,
             &connect_request_event(&requester_hex),
         )
@@ -703,6 +728,7 @@ mod tests {
 
         handle_mesh_event_http(
             &state,
+            &test_tenant(),
             &requester.public_key(),
             &signed_connect_request(&requester, &target_hex),
         )
@@ -722,6 +748,7 @@ mod tests {
 
         let err = handle_mesh_event_http(
             &state,
+            &test_tenant(),
             &other.public_key(),
             &signed_connect_request(&signer, &target_hex),
         )
@@ -739,7 +766,7 @@ mod tests {
         // Tamper after signing.
         event.content = "{}".to_string();
 
-        let err = handle_mesh_event_http(&state, &keys.public_key(), &event)
+        let err = handle_mesh_event_http(&state, &test_tenant(), &keys.public_key(), &event)
             .await
             .expect_err("tampered event must be rejected");
         assert!(err.starts_with("invalid:"), "unexpected error: {err}");
@@ -753,7 +780,7 @@ mod tests {
             .sign_with_keys(&keys)
             .unwrap();
 
-        let err = handle_mesh_event_http(&state, &keys.public_key(), &event)
+        let err = handle_mesh_event_http(&state, &test_tenant(), &keys.public_key(), &event)
             .await
             .expect_err("only 24620/24621 route through the mesh HTTP door");
         assert!(

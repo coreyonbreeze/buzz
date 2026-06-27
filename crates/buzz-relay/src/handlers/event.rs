@@ -13,7 +13,10 @@ use buzz_core::observer::{
     content_looks_like_nip44, OBSERVER_AGENT_TAG, OBSERVER_FRAME_CONTROL, OBSERVER_FRAME_TAG,
     OBSERVER_FRAME_TELEMETRY,
 };
+use buzz_core::tenant::TenantContext;
 use buzz_core::verification::verify_event;
+use buzz_core::CommunityId;
+use buzz_pubsub::EventTopic;
 use nostr::{Event, PublicKey};
 
 use crate::connection::{AuthState, ConnectionState};
@@ -58,6 +61,7 @@ fn bounded_kind_label(kind: u32) -> String {
 /// delivered here.
 pub async fn filter_fanout_by_access(
     state: &AppState,
+    community_id: CommunityId,
     stored_event: &StoredEvent,
     matches: Vec<(crate::subscription::ConnId, crate::subscription::SubId)>,
 ) -> Vec<(crate::subscription::ConnId, crate::subscription::SubId)> {
@@ -85,7 +89,10 @@ pub async fn filter_fanout_by_access(
     let Some(channel_id) = stored_event.channel_id else {
         return matches;
     };
-    match state.channel_visibility_cached(channel_id).await {
+    match state
+        .channel_visibility_cached(community_id, channel_id)
+        .await
+    {
         Ok(v) if v != "private" => return matches,
         Ok(_) => {}
         Err(e) => {
@@ -101,7 +108,10 @@ pub async fn filter_fanout_by_access(
         let Some(pubkey) = state.conn_manager.pubkey_for_conn(conn_id) else {
             continue;
         };
-        match state.is_member_cached(channel_id, &pubkey).await {
+        match state
+            .is_member_cached(community_id, channel_id, &pubkey)
+            .await
+        {
             Ok(true) => allowed.push((conn_id, sub_id)),
             Ok(false) => {}
             Err(e) => {
@@ -129,9 +139,13 @@ pub async fn filter_fanout_by_access(
 /// layers an additional per-recipient DM-visibility-owner gate on top, the
 /// latter skips local echoes — both are equivalent to this helper plus their
 /// own extra step.
-pub(crate) async fn fan_out_event_to_local_subscribers(state: &AppState, stored: &StoredEvent) {
+pub(crate) async fn fan_out_event_to_local_subscribers(
+    state: &AppState,
+    community_id: CommunityId,
+    stored: &StoredEvent,
+) {
     let matches = state.sub_registry.fan_out(stored);
-    let matches = filter_fanout_by_access(state, stored, matches).await;
+    let matches = filter_fanout_by_access(state, community_id, stored, matches).await;
     metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
     if matches.is_empty() {
         return;
@@ -162,14 +176,15 @@ pub(crate) async fn fan_out_event_to_local_subscribers(state: &AppState, stored:
 
 /// Fan out one event received from Redis pub/sub to this relay's local subscribers.
 pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pubsub::ChannelEvent) {
-    // Nil UUID is the sentinel for channel-less global events (see
-    // `handle_ephemeral_event`'s global branch). Convert back to None so
-    // `fan_out()` uses the global subscriber index.
-    let channel_id = if channel_event.channel_id.is_nil() {
-        None
-    } else {
-        Some(channel_event.channel_id)
+    // The Redis topic carries the tenant-local routing scope explicitly:
+    // `Channel(id)` for a per-channel event, `Global` for a channel-less one.
+    // Convert back to the `Option<Uuid>` channel id `fan_out()` indexes on —
+    // `Global` selects the global subscriber index.
+    let channel_id = match channel_event.topic {
+        buzz_pubsub::EventTopic::Channel(id) => Some(id),
+        buzz_pubsub::EventTopic::Global => None,
     };
+    let community_id = channel_event.community_id;
     let stored = StoredEvent::new(channel_event.event, channel_id);
 
     // Skip events that were already fanned out in-process (local echo). The
@@ -182,7 +197,7 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
     }
 
     let matches = state.sub_registry.fan_out(&stored);
-    let matches = filter_fanout_by_access(state, &stored, matches).await;
+    let matches = filter_fanout_by_access(state, community_id, &stored, matches).await;
     metrics::counter!("buzz_multinode_fanout_total").increment(1);
     if matches.is_empty() {
         return;
@@ -213,6 +228,7 @@ pub async fn fan_out_pubsub_event(state: &Arc<AppState>, channel_event: buzz_pub
 
 /// Publish a stored event to subscribers and kick off async side effects.
 pub(crate) async fn dispatch_persistent_event(
+    tenant: &TenantContext,
     state: &Arc<AppState>,
     stored_event: &StoredEvent,
     kind_u32: u32,
@@ -220,11 +236,14 @@ pub(crate) async fn dispatch_persistent_event(
 ) -> usize {
     let event_id_hex = stored_event.event.id.to_hex();
 
-    let pubsub_channel = stored_event.channel_id.unwrap_or(uuid::Uuid::nil());
+    let topic = match stored_event.channel_id {
+        Some(channel_id) => EventTopic::Channel(channel_id),
+        None => EventTopic::Global,
+    };
     state.mark_local_event(&stored_event.event.id);
     if let Err(e) = state
         .pubsub
-        .publish_event(pubsub_channel, &stored_event.event)
+        .publish_event(tenant, topic, &stored_event.event)
         .await
     {
         state
@@ -234,7 +253,7 @@ pub(crate) async fn dispatch_persistent_event(
     }
 
     let matches = state.sub_registry.fan_out(stored_event);
-    let matches = filter_fanout_by_access(state, stored_event, matches).await;
+    let matches = filter_fanout_by_access(state, tenant.community(), stored_event, matches).await;
     metrics::histogram!("buzz_fanout_recipients").record(matches.len() as f64);
     debug!(
         event_id = %event_id_hex,
@@ -284,20 +303,11 @@ pub(crate) async fn dispatch_persistent_event(
         );
     }
 
-    // Skip search indexing for NIP-17 gift wraps (ciphertext), NIP-DV
-    // visibility snapshots (per-viewer private hide state, owner-gated reads),
-    // and author-only kinds (ciphertext not useful in search, defense in depth).
-    if kind_u32 != KIND_GIFT_WRAP
-        && kind_u32 != buzz_core::kind::KIND_DM_VISIBILITY
-        && !AUTHOR_ONLY_KINDS.contains(&kind_u32)
-        && state
-            .search_index_tx
-            .try_send(stored_event.clone())
-            .is_err()
-    {
-        metrics::counter!("buzz_search_index_errors_total").increment(1);
-        warn!(event_id = %event_id_hex, "Search index channel full — dropping event");
-    }
+    // Search indexing is no longer a separate worker step: under Postgres FTS
+    // the searchable row IS the persisted event row (the `insert_event` write
+    // populates the FTS column via a generated `tsvector`), so there is no
+    // out-of-band index to feed. The old Typesense `index_event` worker and its
+    // `search_index_tx` mpsc are gone with the Typesense backend.
 
     // Audit via bounded channel (capacity 1000). Uses .send().await so entries
     // are never silently dropped — backpressure propagates to the event handler
@@ -307,12 +317,20 @@ pub(crate) async fn dispatch_persistent_event(
     // accumulate unbounded in-memory state. DB write failures in the worker are
     // logged but not retried (same as the previous per-event tokio::spawn).
     let audit_entry = buzz_audit::NewAuditEntry {
-        event_id: event_id_hex.clone(),
-        event_kind: kind_u32,
-        actor_pubkey: actor_pubkey_hex.to_string(),
+        community_id: tenant.community(),
         action: buzz_audit::AuditAction::EventCreated,
-        channel_id: stored_event.channel_id,
-        metadata: serde_json::Value::Null,
+        // Record the *actor* the caller resolved (authenticated principal for
+        // ingest, triggering user for workflow posts), not `stored_event.event
+        // .pubkey`. For relay-signed events (workflow sink, side-effect emits)
+        // the claimed author is the relay key, so deriving from the event would
+        // erase the human behind the action from the audit trail. This mirrors
+        // the pre-rewrite semantics, ported to the raw-bytes column.
+        actor_pubkey: hex::decode(actor_pubkey_hex).ok(),
+        object_id: Some(event_id_hex.clone()),
+        detail: serde_json::json!({
+            "event_kind": kind_u32,
+            "channel_id": stored_event.channel_id,
+        }),
     };
     if let Err(e) = state.audit_tx.send(audit_entry).await {
         error!(event_id = %event_id_hex, "Audit channel closed — entry lost: {e}");
@@ -477,7 +495,7 @@ pub async fn handle_event(event: Event, conn: Arc<ConnectionState>, state: Arc<A
         conn_id,
     };
 
-    match super::ingest::ingest_event(&state, event, ingest_auth).await {
+    match super::ingest::ingest_event(&state, &conn.tenant, event, ingest_auth).await {
         Ok(result) => {
             if result.accepted {
                 metrics::counter!("buzz_events_stored_total", "kind" => kind_str).increment(1);
@@ -562,9 +580,15 @@ async fn handle_ephemeral_event(
         };
 
         if status == "offline" {
-            let _ = state.pubsub.clear_presence(&auth_pubkey).await;
+            let _ = state
+                .pubsub
+                .clear_presence(&conn.tenant, &auth_pubkey)
+                .await;
         } else {
-            let _ = state.pubsub.set_presence(&auth_pubkey, &status).await;
+            let _ = state
+                .pubsub
+                .set_presence(&conn.tenant, &auth_pubkey, &status)
+                .await;
         }
 
         // Presence is a channel-less ephemeral event. After updating Redis
@@ -578,7 +602,14 @@ async fn handle_ephemeral_event(
     // 30621 is the durable, relay-owned record.
     if event_kind_u32(&event) == KIND_MESH_STATUS_REPORT {
         let reporter_hex = auth_pubkey.to_hex();
-        match super::mesh_signaling::handle_status_report(&state, &reporter_hex, &event).await {
+        match super::mesh_signaling::handle_status_report(
+            &state,
+            &conn.tenant,
+            &reporter_hex,
+            &event,
+        )
+        .await
+        {
             Ok(()) => {
                 conn.send(RelayMessage::ok(event_id_hex, true, ""));
             }
@@ -607,7 +638,14 @@ async fn handle_ephemeral_event(
             return;
         }
         let requester_hex = auth_pubkey.to_hex();
-        match super::mesh_signaling::handle_connect_request(&state, &requester_hex, &event).await {
+        match super::mesh_signaling::handle_connect_request(
+            &state,
+            &conn.tenant,
+            &requester_hex,
+            &event,
+        )
+        .await
+        {
             Ok(()) => {
                 conn.send(RelayMessage::ok(event_id_hex, true, ""));
             }
@@ -621,7 +659,8 @@ async fn handle_ephemeral_event(
     // Check channel membership before publishing other ephemeral events.
     if let Some(ch_id) = super::ingest::extract_channel_id(&event) {
         if let Err(msg) =
-            super::ingest::check_channel_membership(&state, ch_id, &pubkey_bytes).await
+            super::ingest::check_channel_membership(&conn.tenant, &state, ch_id, &pubkey_bytes)
+                .await
         {
             conn.send(RelayMessage::ok(event_id_hex, false, &msg));
             return;
@@ -631,7 +670,11 @@ async fn handle_ephemeral_event(
         // the event comes back through the Redis subscriber loop.
         state.mark_local_event(&event.id);
 
-        if let Err(e) = state.pubsub.publish_event(ch_id, &event).await {
+        if let Err(e) = state
+            .pubsub
+            .publish_event(&conn.tenant, EventTopic::Channel(ch_id), &event)
+            .await
+        {
             state.local_event_ids.invalidate(&event.id.to_bytes());
             warn!(conn_id = %conn_id, event_id = %event_id_hex, "Ephemeral publish failed: {e}");
         }
@@ -641,7 +684,7 @@ async fn handle_ephemeral_event(
         // receive this private-channel ephemeral event.
         // Pass the channel_id so fan_out() uses the channel-kind index.
         let stored_event = StoredEvent::new(event.clone(), Some(ch_id));
-        fan_out_event_to_local_subscribers(&state, &stored_event).await;
+        fan_out_event_to_local_subscribers(&state, conn.tenant.community(), &stored_event).await;
     } else {
         // Channel-less ephemeral events (e.g., NIP-AB pairing kind:24134).
         //
@@ -653,7 +696,11 @@ async fn handle_ephemeral_event(
         // and converted back to `None` so `fan_out()` uses the global index.
         state.mark_local_event(&event.id);
 
-        if let Err(e) = state.pubsub.publish_event(uuid::Uuid::nil(), &event).await {
+        if let Err(e) = state
+            .pubsub
+            .publish_event(&conn.tenant, EventTopic::Global, &event)
+            .await
+        {
             state.local_event_ids.invalidate(&event.id.to_bytes());
             warn!(conn_id = %conn_id, event_id = %event_id_hex, "Ephemeral global publish failed: {e}");
         }
@@ -663,7 +710,7 @@ async fn handle_ephemeral_event(
         // filter_fanout_by_access no-ops for channel-less events except the
         // author-only-kind gate.
         let stored_event = StoredEvent::new(event.clone(), None);
-        fan_out_event_to_local_subscribers(&state, &stored_event).await;
+        fan_out_event_to_local_subscribers(&state, conn.tenant.community(), &stored_event).await;
     }
 
     conn.send(RelayMessage::ok(event_id_hex, true, ""));
@@ -762,7 +809,10 @@ async fn handle_agent_observer_event(
         match state.observer_owner_cache.get(&cache_key) {
             Some(cached) => cached,
             None => {
-                let result = state.db.is_agent_owner(&agent_bytes, &owner_bytes).await;
+                let result = state
+                    .db
+                    .is_agent_owner(conn.tenant.community(), &agent_bytes, &owner_bytes)
+                    .await;
                 match result {
                     Ok(v) => {
                         state.observer_owner_cache.insert(cache_key, v);
@@ -819,7 +869,11 @@ async fn handle_agent_observer_event(
     }
 
     state.mark_local_event(&event.id);
-    if let Err(e) = state.pubsub.publish_event(uuid::Uuid::nil(), &event).await {
+    if let Err(e) = state
+        .pubsub
+        .publish_event(&conn.tenant, EventTopic::Global, &event)
+        .await
+    {
         state.local_event_ids.invalidate(&event.id.to_bytes());
         warn!(conn_id = %conn_id, event_id = %event_id_hex, "Agent observer publish failed: {e}");
     }
@@ -832,7 +886,7 @@ async fn handle_agent_observer_event(
         direction = ?route.direction,
         "Agent observer fan-out"
     );
-    fan_out_event_to_local_subscribers(&state, &stored_event).await;
+    fan_out_event_to_local_subscribers(&state, conn.tenant.community(), &stored_event).await;
 
     conn.send(RelayMessage::ok(event_id_hex, true, ""));
 }
@@ -1022,7 +1076,7 @@ mod tests {
 
         use axum::extract::ws::Message;
         use buzz_core::kind::{KIND_MEMBER_ADDED_NOTIFICATION, KIND_PRESENCE_UPDATE};
-        use buzz_pubsub::ChannelEvent;
+        use buzz_pubsub::{ChannelEvent, EventTopic};
         use nostr::{EventBuilder, Filter, Keys, Kind};
         use tokio::sync::{mpsc, Mutex};
         use tokio_util::sync::CancellationToken;
@@ -1122,7 +1176,8 @@ mod tests {
             fan_out_pubsub_event(
                 &state,
                 ChannelEvent {
-                    channel_id: Uuid::nil(),
+                    community_id: buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                    topic: EventTopic::Global,
                     event,
                 },
             )
@@ -1143,7 +1198,8 @@ mod tests {
             fan_out_pubsub_event(
                 &state,
                 ChannelEvent {
-                    channel_id: Uuid::nil(),
+                    community_id: buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                    topic: EventTopic::Global,
                     event,
                 },
             )
@@ -1170,7 +1226,8 @@ mod tests {
             fan_out_pubsub_event(
                 &state,
                 ChannelEvent {
-                    channel_id: Uuid::nil(),
+                    community_id: buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                    topic: EventTopic::Global,
                     event,
                 },
             )
@@ -1230,6 +1287,25 @@ mod tests {
             let (_receiver_conn, mut receiver_rx) =
                 register_presence_sub(&receiver, "receiver-presence");
 
+            // Under the community-scoped bus, Redis delivery is demand-driven:
+            // a relay only PSUBSCRIBEs `buzz:{community}:global` after it retains
+            // interest in that topic. Both relays share one explicit tenant and
+            // retain Global before publishing — origin too, so the echo-
+            // suppression assertion still exercises `mark_local_event` against a
+            // relay that *is* subscribed (the case that matters).
+            let tenant = buzz_core::tenant::TenantContext::resolved(
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                "test",
+            );
+            origin
+                .pubsub
+                .retain_topic(&tenant, EventTopic::Global)
+                .await;
+            receiver
+                .pubsub
+                .retain_topic(&tenant, EventTopic::Global)
+                .await;
+
             // Match buzz-pubsub's own Redis round-trip test: give PSUBSCRIBE a
             // bounded moment to attach before publishing the single test event.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1239,7 +1315,7 @@ mod tests {
             origin.mark_local_event(&event.id);
             origin
                 .pubsub
-                .publish_event(Uuid::nil(), &event)
+                .publish_event(&tenant, EventTopic::Global, &event)
                 .await
                 .expect("publish presence through Redis");
 
@@ -1267,6 +1343,89 @@ mod tests {
             receiver_subscriber.abort();
             origin_fanout.abort();
             receiver_fanout.abort();
+        }
+
+        /// Regression guard: the `EventCreated` audit entry must record the
+        /// caller-resolved *actor*, not the stored event's claimed author. For
+        /// relay-signed events (workflow posts, side-effect emits) the event
+        /// author is the relay key, while the actor is the human who triggered
+        /// the action — deriving the audit actor from `event.pubkey` would erase
+        /// that human from the trail. This test signs the event with one key and
+        /// passes a *different* actor hex, then asserts `audit_log.actor_pubkey`
+        /// is the actor, not the signer.
+        #[tokio::test]
+        async fn audit_records_caller_actor_not_relay_signer_for_relay_signed_event() {
+            use buzz_core::event::StoredEvent;
+            use buzz_core::tenant::{CommunityId, TenantContext};
+
+            let Some((state, audit_shutdown, pool)) = super::fanout_access::audit_state().await
+            else {
+                eprintln!("skipping audit-actor provenance test: Postgres/Redis unavailable");
+                return;
+            };
+
+            // Seed a community so the audit_log FK is satisfiable.
+            let community_uuid = Uuid::new_v4();
+            let host = format!("audit-actor-test-{}.example", community_uuid.simple());
+            sqlx::query("INSERT INTO communities (id, host) VALUES ($1, $2)")
+                .bind(community_uuid)
+                .bind(&host)
+                .execute(&pool)
+                .await
+                .expect("seed community");
+            let tenant = TenantContext::resolved(CommunityId::from_uuid(community_uuid), host);
+
+            // Relay-signed event tagged buzz:workflow so workflow triggering is
+            // skipped; the signer is the RELAY key, distinct from the actor.
+            let signer = &state.relay_keypair;
+            let actor = Keys::generate();
+            let actor_hex = actor.public_key().to_hex();
+            assert_ne!(
+                signer.public_key().to_hex(),
+                actor_hex,
+                "test precondition: relay signer must differ from actor"
+            );
+            let event = EventBuilder::new(Kind::from(KIND_PRESENCE_UPDATE as u16), "online")
+                .tags([nostr::Tag::parse(["buzz:workflow", "true"]).expect("workflow tag")])
+                .sign_with_keys(signer)
+                .expect("sign relay event");
+            let event_id_hex = event.id.to_hex();
+            let stored = StoredEvent::new(event, None);
+
+            super::super::dispatch_persistent_event(
+                &tenant,
+                &state,
+                &stored,
+                KIND_PRESENCE_UPDATE,
+                &actor_hex,
+            )
+            .await;
+
+            // Flush the audit worker so the row is committed before we read it.
+            audit_shutdown
+                .drain(std::time::Duration::from_secs(5))
+                .await;
+
+            let actor_bytes: Vec<u8> = sqlx::query_scalar(
+                "SELECT actor_pubkey FROM audit_log \
+                 WHERE community_id = $1 AND object_id = $2",
+            )
+            .bind(community_uuid)
+            .bind(&event_id_hex)
+            .fetch_one(&pool)
+            .await
+            .expect("audit row written");
+
+            assert_eq!(
+                actor_bytes,
+                actor.public_key().to_bytes().to_vec(),
+                "audit must record the caller-supplied actor"
+            );
+            assert_ne!(
+                actor_bytes,
+                signer.public_key().to_bytes().to_vec(),
+                "audit must NOT record the relay signer as the actor"
+            );
         }
     }
 
@@ -1304,13 +1463,9 @@ mod tests {
                     .await
                     .expect("pubsub manager"),
             );
-            let audit = buzz_audit::AuditService::new(pool);
+            let audit = buzz_audit::AuditService::new(pool.clone());
             let auth = buzz_auth::AuthService::new(config.auth.clone());
-            let search = buzz_search::SearchService::new(buzz_search::SearchConfig {
-                url: config.typesense_url.clone(),
-                api_key: config.typesense_key.clone(),
-                collection: "events".to_string(),
-            });
+            let search = buzz_search::SearchService::new(pool.clone());
             let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
                 db.clone(),
                 buzz_workflow::WorkflowConfig::default(),
@@ -1334,6 +1489,54 @@ mod tests {
 
         pub(super) async fn test_state() -> Arc<AppState> {
             test_state_with_redis_url("redis://127.0.0.1:1").await
+        }
+
+        /// Real-PG, real-Redis state that hands back the audit shutdown handle so
+        /// a test can drain queued audit entries before asserting on `audit_log`.
+        /// `None` when Postgres or Redis is unavailable (test skips).
+        pub(super) async fn audit_state() -> Option<(
+            Arc<AppState>,
+            crate::state::AuditShutdownHandle,
+            sqlx::PgPool,
+        )> {
+            let mut config = test_config();
+            config.redis_url = "redis://127.0.0.1:6379".to_string();
+            let pool = sqlx::PgPool::connect(&config.database_url).await.ok()?;
+            // Require a real Redis so dispatch's publish_event doesn't error-log.
+            let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
+                .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+                .ok()?;
+            redis::cmd("PING")
+                .query_async::<String>(&mut redis_pool.get().await.ok()?)
+                .await
+                .ok()?;
+            let db = buzz_db::Db::from_pool(pool.clone());
+            let pubsub = Arc::new(
+                buzz_pubsub::PubSubManager::new(&config.redis_url, redis_pool.clone())
+                    .await
+                    .ok()?,
+            );
+            let audit = buzz_audit::AuditService::new(pool.clone());
+            let auth = buzz_auth::AuthService::new(config.auth.clone());
+            let search = buzz_search::SearchService::new(pool.clone());
+            let workflow_engine = Arc::new(buzz_workflow::WorkflowEngine::new(
+                db.clone(),
+                buzz_workflow::WorkflowConfig::default(),
+            ));
+            let media_storage = buzz_media::MediaStorage::new(&config.media).ok()?;
+            let (state, audit_shutdown) = AppState::new(
+                config,
+                db,
+                redis_pool,
+                audit,
+                pubsub,
+                auth,
+                search,
+                workflow_engine,
+                Keys::generate(),
+                media_storage,
+            );
+            Some((Arc::new(state), audit_shutdown, pool))
         }
 
         fn register_conn(state: &AppState, pubkey: Option<Vec<u8>>) -> Uuid {
@@ -1365,7 +1568,13 @@ mod tests {
             let state = test_state().await;
             let conn = register_conn(&state, Some(vec![1u8; 32]));
             let matches = vec![(conn, "s".to_string())];
-            let out = filter_fanout_by_access(&state, &channel_event(None), matches.clone()).await;
+            let out = filter_fanout_by_access(
+                &state,
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                &channel_event(None),
+                matches.clone(),
+            )
+            .await;
             assert_eq!(out, matches);
         }
 
@@ -1380,9 +1589,13 @@ mod tests {
             // private channel; on open it must pass untouched.
             let conn = register_conn(&state, None);
             let matches = vec![(conn, "s".to_string())];
-            let out =
-                filter_fanout_by_access(&state, &channel_event(Some(channel_id)), matches.clone())
-                    .await;
+            let out = filter_fanout_by_access(
+                &state,
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                &channel_event(Some(channel_id)),
+                matches.clone(),
+            )
+            .await;
             assert_eq!(out, matches);
         }
 
@@ -1412,8 +1625,13 @@ mod tests {
                 (non_member, "n".to_string()),
                 (unauthed, "u".to_string()),
             ];
-            let out =
-                filter_fanout_by_access(&state, &channel_event(Some(channel_id)), matches).await;
+            let out = filter_fanout_by_access(
+                &state,
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                &channel_event(Some(channel_id)),
+                matches,
+            )
+            .await;
             assert_eq!(out, vec![(member, "m".to_string())]);
         }
 
@@ -1445,7 +1663,13 @@ mod tests {
                 (other_conn, "o".to_string()),
                 (unauthed_conn, "u".to_string()),
             ];
-            let out = filter_fanout_by_access(&state, &stored, matches).await;
+            let out = filter_fanout_by_access(
+                &state,
+                buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+                &stored,
+                matches,
+            )
+            .await;
 
             // Only the author's subscription survives; the non-author and the
             // unauthenticated connection are both dropped.

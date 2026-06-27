@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     extract::{Query, State},
-    http::HeaderValue,
+    http::{HeaderMap, HeaderValue},
     response::{IntoResponse, Json, Response},
 };
 use hex;
@@ -23,15 +23,30 @@ pub struct Nip05Query {
 /// No authentication required — public discovery endpoint.
 pub async fn nostr_nip05(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Query(params): Query<Nip05Query>,
 ) -> Response {
-    let json = match params.name {
-        None => serde_json::json!({ "names": {}, "relays": {} }),
-        Some(n) => {
+    // Row zero: bind this public request to its community from the request host
+    // before the tenant-scoped lookup, identical to the bridge/WS doors. An
+    // unmapped host falls through to the empty `{names,relays}` response — never
+    // a default tenant, never echoing which communities exist on this deployment.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let json = match (
+        params.name,
+        crate::tenant::bind_community(&state.db, raw_host).await,
+    ) {
+        (Some(n), Ok(tenant)) => {
             let name = n.to_lowercase();
             // Extract domain from relay_url (e.g. "ws://buzz.block.xyz" → "buzz.block.xyz")
             let domain = extract_domain(&state.config.relay_url);
-            match state.db.get_user_by_nip05(&name, &domain).await {
+            match state
+                .db
+                .get_user_by_nip05(tenant.community(), &name, &domain)
+                .await
+            {
                 Ok(Some(user)) => {
                     let hex_pubkey = hex::encode(&user.pubkey);
                     let relay_url = state.config.relay_url.clone();
@@ -43,6 +58,7 @@ pub async fn nostr_nip05(
                 _ => serde_json::json!({ "names": {}, "relays": {} }),
             }
         }
+        _ => serde_json::json!({ "names": {}, "relays": {} }),
     };
 
     let mut response = Json(json).into_response();

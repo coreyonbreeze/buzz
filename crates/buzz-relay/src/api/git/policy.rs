@@ -238,13 +238,25 @@ pub async fn hook_policy_check(
             return (StatusCode::FORBIDDEN, "invalid repo owner").into_response();
         }
     };
+    // Resolve the deployment's own community from the configured relay host —
+    // the localhost hook callback has no inbound `Host` to bind. Fail closed if
+    // the host isn't mapped (never a default tenant).
+    let tenant = match crate::tenant::bind_deployment_community(&state.db, &state.config.relay_url)
+        .await
+    {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            error!(repo = %req.repo_id, error = ?e, "hook callback: relay host not mapped to a community");
+            return (StatusCode::FORBIDDEN, "internal error").into_response();
+        }
+    };
     let query = EventQuery {
         kinds: Some(vec![30617]),
         pubkey: Some(owner_bytes),
         d_tag: Some(req.repo_id.clone()),
         global_only: true,
         limit: Some(1),
-        ..Default::default()
+        ..EventQuery::for_community(tenant.community())
     };
     let repo_event = match state.db.query_events(&query).await {
         Ok(mut events) => {
@@ -292,7 +304,7 @@ pub async fn hook_policy_check(
         .and_then(|id| Uuid::parse_str(id).ok());
 
     if let Some(ch_id) = channel_id {
-        match state.db.get_channel(ch_id).await {
+        match state.db.get_channel(tenant.community(), ch_id).await {
             Ok(ch) if ch.archived_at.is_some() => {
                 return (StatusCode::FORBIDDEN, "channel is archived (read-only)").into_response();
             }
@@ -321,7 +333,11 @@ pub async fn hook_policy_check(
                         return (StatusCode::FORBIDDEN, "invalid pusher pubkey").into_response();
                     }
                 };
-                match state.db.get_member_role(ch_id, &pusher_bytes).await {
+                match state
+                    .db
+                    .get_member_role(tenant.community(), ch_id, &pusher_bytes)
+                    .await
+                {
                     Ok(Some(role_str)) => match role_str.parse::<MemberRole>() {
                         Ok(role) => role,
                         Err(_) => {

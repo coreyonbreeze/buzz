@@ -17,6 +17,7 @@ use axum::{
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_auth::Scope;
+use buzz_core::tenant::TenantContext;
 use buzz_media::{BlobDescriptor, MediaError};
 use sha2::{Digest, Sha256};
 
@@ -32,6 +33,10 @@ pub(crate) struct AuthenticatedUpload {
     auth_event: nostr::Event,
     #[allow(dead_code)] // scopes validated in extractor; stored for future per-scope handler logic
     scopes: Vec<Scope>,
+    /// Community resolved from the request host at extraction time (row zero for
+    /// this HTTP door), identical to the WS door in `router.rs` and the bridge
+    /// door in `bridge.rs`. Server-resolved, never client-supplied.
+    tenant: TenantContext,
 }
 
 impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
@@ -94,7 +99,25 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         .await
         .map_err(|_| MediaError::RelayMembershipRequired)?;
 
-        Ok(AuthenticatedUpload { auth_event, scopes })
+        // 6. Row zero: bind this upload to its community from the request host,
+        // identical to the WS door in `router.rs` and the bridge door in
+        // `bridge.rs`. Fail-closed: an unmapped host or lookup failure is a
+        // generic `NotFound` (404) — never a default tenant, never echoing the
+        // host, so an unauthenticated caller cannot probe which communities
+        // exist on this deployment.
+        let raw_host = headers
+            .get(header::HOST)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        let tenant = crate::tenant::bind_community(&state.db, raw_host)
+            .await
+            .map_err(|_| MediaError::NotFound)?;
+
+        Ok(AuthenticatedUpload {
+            auth_event,
+            scopes,
+            tenant,
+        })
     }
 }
 
@@ -193,16 +216,14 @@ pub async fn upload_blob(
 
     // Audit via bounded channel — same pattern as event audit.
     let desc = descriptor.clone();
-    let uploader = auth.auth_event.pubkey.to_hex();
     if let Err(e) = state
         .audit_tx
         .send(NewAuditEntry {
-            event_id: desc.sha256.clone(),
-            event_kind: buzz_core::kind::KIND_MEDIA_UPLOAD,
-            actor_pubkey: uploader,
+            community_id: auth.tenant.community(),
             action: AuditAction::MediaUploaded,
-            channel_id: None,
-            metadata: serde_json::json!({
+            actor_pubkey: Some(auth.auth_event.pubkey.to_bytes().to_vec()),
+            object_id: Some(desc.sha256.clone()),
+            detail: serde_json::json!({
                 "sha256": desc.sha256,
                 "size": desc.size,
                 "mime": desc.mime_type,

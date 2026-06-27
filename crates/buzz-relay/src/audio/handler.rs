@@ -16,6 +16,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message as WsMessage, WebSocket};
+use axum::http::{HeaderMap, StatusCode};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
     response::IntoResponse,
@@ -30,9 +31,11 @@ use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use buzz_auth::generate_challenge;
+use buzz_core::tenant::TenantContext;
 use buzz_db::channel::MemberRole;
 
 use buzz_core::StoredEvent;
+use buzz_pubsub::EventTopic;
 
 use crate::audio::room::PeerCtrl;
 use crate::state::AppState;
@@ -56,9 +59,29 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
 pub async fn ws_audio_handler(
     State(state): State<Arc<AppState>>,
     Path(channel_id): Path<Uuid>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_audio_connection(socket, state, channel_id))
+    // Row zero: bind this huddle-audio connection to its community from the
+    // request host BEFORE the WebSocket upgrade, identical to the main relay
+    // door. An unmapped host or lookup failure fails closed with a generic 404
+    // — never a default tenant — so an unauthenticated caller cannot probe
+    // which communities exist on this deployment.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = match crate::tenant::bind_community(&state.db, raw_host).await {
+        Ok(ctx) => ctx,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+                .into_response();
+        }
+    };
+    ws.on_upgrade(move |socket| handle_audio_connection(socket, state, tenant, channel_id))
 }
 
 /// Highest huddle audio protocol version this relay understands. Clients are
@@ -84,7 +107,12 @@ fn default_protocol_version() -> u8 {
     1
 }
 
-async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channel_id: Uuid) {
+async fn handle_audio_connection(
+    socket: WebSocket,
+    state: Arc<AppState>,
+    tenant: TenantContext,
+    channel_id: Uuid,
+) {
     let (mut ws_send, mut ws_recv) = socket.split();
 
     let challenge = generate_challenge();
@@ -171,7 +199,15 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
         return;
     }
 
-    if let Err(e) = ensure_membership(&state, channel_id, &pubkey_bytes, parent_channel_id).await {
+    if let Err(e) = ensure_membership(
+        &state,
+        &tenant,
+        channel_id,
+        &pubkey_bytes,
+        parent_channel_id,
+    )
+    .await
+    {
         warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
         let _ = ws_send
             .send(WsMessage::Text(
@@ -220,7 +256,7 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
     // get_or_create (the old room was already cleaned up). This DB check
     // catches that case. The room-level ended flag (checked inside add_peer)
     // handles the same-room case.
-    match state.db.get_channel(channel_id).await {
+    match state.db.get_channel(tenant.community(), channel_id).await {
         Ok(ch) if ch.archived_at.is_some() => {
             debug!(channel_id = %channel_id, "channel archived before room join");
             let _ = ws_send
@@ -346,6 +382,7 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
     let parent_id_for_event = parent_channel_id.unwrap_or(channel_id);
     emit_participant_event(
         &state,
+        &tenant,
         Kind::Custom(48101),
         channel_id,
         parent_id_for_event,
@@ -412,6 +449,7 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
 
     emit_participant_event(
         &state,
+        &tenant,
         Kind::Custom(48102),
         channel_id,
         parent_id_for_event,
@@ -422,7 +460,11 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
     if should_auto_end {
         info!(channel_id = %channel_id, "audio room empty — auto-ending huddle");
 
-        match state.db.archive_channel(channel_id).await {
+        match state
+            .db
+            .archive_channel(tenant.community(), channel_id)
+            .await
+        {
             Err(e) => {
                 warn!(channel_id = %channel_id, "auto-archive failed, huddle stays alive: {e}");
                 room.clear_ended();
@@ -432,6 +474,7 @@ async fn handle_audio_connection(socket: WebSocket, state: Arc<AppState>, channe
 
                 emit_participant_event(
                     &state,
+                    &tenant,
                     Kind::Custom(48103),
                     channel_id,
                     parent_id_for_event,
@@ -650,6 +693,7 @@ async fn heartbeat_loop(
 
 async fn ensure_membership(
     state: &AppState,
+    tenant: &TenantContext,
     channel_id: Uuid,
     pubkey_bytes: &[u8],
     parent_channel_id: Option<Uuid>,
@@ -658,7 +702,7 @@ async fn ensure_membership(
     // This ensures auto-ended huddles can't be rejoined by existing members.
     let channel = state
         .db
-        .get_channel(channel_id)
+        .get_channel(tenant.community(), channel_id)
         .await
         .map_err(|e| format!("db error: {e}"))?;
 
@@ -668,7 +712,7 @@ async fn ensure_membership(
 
     // Fast path: already a member.
     let is_member = state
-        .is_member_cached(channel_id, pubkey_bytes)
+        .is_member_cached(tenant.community(), channel_id, pubkey_bytes)
         .await
         .map_err(|e| format!("db error: {e}"))?;
 
@@ -692,7 +736,7 @@ async fn ensure_membership(
     if channel.ttl_seconds.is_some() {
         if let Some(parent_id) = parent_channel_id {
             let parent_member = state
-                .is_member_cached(parent_id, pubkey_bytes)
+                .is_member_cached(tenant.community(), parent_id, pubkey_bytes)
                 .await
                 .map_err(|e| format!("db error: {e}"))?;
 
@@ -700,6 +744,7 @@ async fn ensure_membership(
                 state
                     .db
                     .add_member(
+                        tenant.community(),
                         channel_id,
                         pubkey_bytes,
                         MemberRole::Member,
@@ -707,7 +752,7 @@ async fn ensure_membership(
                     )
                     .await
                     .map_err(|e| format!("auto-add failed: {e}"))?;
-                state.invalidate_membership(channel_id, pubkey_bytes);
+                state.invalidate_membership(tenant, channel_id, pubkey_bytes);
 
                 return Ok(());
             }
@@ -719,6 +764,7 @@ async fn ensure_membership(
 
 async fn emit_participant_event(
     state: &AppState,
+    tenant: &TenantContext,
     kind: Kind,
     channel_id: Uuid,
     parent_channel_id: Uuid,
@@ -758,7 +804,11 @@ async fn emit_participant_event(
     // 1. Persist to DB so late-joining clients can reconstruct huddle state
     //    from historical queries. Without this, lifecycle events only exist
     //    for the duration of the Redis pub/sub delivery and are lost forever.
-    let stored = match state.db.insert_event(&event, Some(parent_channel_id)).await {
+    let stored = match state
+        .db
+        .insert_event(tenant.community(), &event, Some(parent_channel_id))
+        .await
+    {
         Ok((stored, true)) => stored,
         Ok((_, false)) => {
             // Duplicate — already persisted (e.g. concurrent emit). Skip fan-out
@@ -793,10 +843,15 @@ async fn emit_participant_event(
     //    path so a stale subscription on a removed/non-member connection cannot
     //    receive this channel's audio lifecycle event (same gate as
     //    dispatch_persistent_event in the ingest handler).
-    crate::handlers::event::fan_out_event_to_local_subscribers(state, &stored).await;
+    crate::handlers::event::fan_out_event_to_local_subscribers(state, tenant.community(), &stored)
+        .await;
 
     // 4. Cross-node broadcast via Redis pub/sub.
-    if let Err(e) = state.pubsub.publish_event(parent_channel_id, &event).await {
+    if let Err(e) = state
+        .pubsub
+        .publish_event(tenant, EventTopic::Channel(parent_channel_id), &event)
+        .await
+    {
         state.local_event_ids.invalidate(&event.id.to_bytes());
         warn!(
             event_id = %event_id_hex,
