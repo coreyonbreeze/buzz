@@ -809,31 +809,47 @@ impl Db {
     /// Atomically claim a due reminder for delivery (cross-pod dedup).
     pub async fn claim_due_reminder(
         &self,
+        community_id: CommunityId,
         event_id: &[u8],
         event_created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<bool> {
-        event::claim_due_reminder(&self.pool, event_id, event_created_at).await
+        event::claim_due_reminder(&self.pool, community_id, event_id, event_created_at).await
     }
 
     /// Atomically claim a due reminder using a caller-supplied delivery stamp.
     pub async fn claim_due_reminder_with_stamp(
         &self,
+        community_id: CommunityId,
         event_id: &[u8],
         event_created_at: chrono::DateTime<chrono::Utc>,
         delivery_stamp: i64,
     ) -> Result<bool> {
-        event::claim_due_reminder_with_stamp(&self.pool, event_id, event_created_at, delivery_stamp)
-            .await
+        event::claim_due_reminder_with_stamp(
+            &self.pool,
+            community_id,
+            event_id,
+            event_created_at,
+            delivery_stamp,
+        )
+        .await
     }
 
     /// Release a claimed due reminder after a publish failure.
     pub async fn release_due_reminder(
         &self,
+        community_id: CommunityId,
         event_id: &[u8],
         event_created_at: chrono::DateTime<chrono::Utc>,
         delivery_stamp: i64,
     ) -> Result<bool> {
-        event::release_due_reminder(&self.pool, event_id, event_created_at, delivery_stamp).await
+        event::release_due_reminder(
+            &self.pool,
+            community_id,
+            event_id,
+            event_created_at,
+            delivery_stamp,
+        )
+        .await
     }
 
     /// Ensure a user record exists (upsert).

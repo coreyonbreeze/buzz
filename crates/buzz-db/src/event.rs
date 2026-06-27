@@ -1173,18 +1173,33 @@ pub async fn query_due_reminders(
 /// idempotency.
 pub async fn claim_due_reminder(
     pool: &PgPool,
+    community_id: CommunityId,
     event_id: &[u8],
     event_created_at: DateTime<Utc>,
 ) -> Result<bool> {
-    claim_due_reminder_with_stamp(pool, event_id, event_created_at, Utc::now().timestamp()).await
+    claim_due_reminder_with_stamp(
+        pool,
+        community_id,
+        event_id,
+        event_created_at,
+        Utc::now().timestamp(),
+    )
+    .await
 }
 
 /// Atomically claim a due reminder using a caller-supplied delivery stamp.
 ///
 /// The same stamp should be passed to [`release_due_reminder`] if the publish
 /// side effect fails, so rollback can compare-and-clear only this pod's claim.
+///
+/// Scoped by `community_id`: `events` is keyed `(community_id, created_at, id)`,
+/// and the same Nostr event id (hence the same `id`/`created_at` pair) is
+/// allowed across communities. Without the community predicate a claim for
+/// `A/X` would also mark `B/X` delivered. The caller already holds the owning
+/// community on the `DueReminder` row.
 pub async fn claim_due_reminder_with_stamp(
     pool: &PgPool,
+    community_id: CommunityId,
     event_id: &[u8],
     event_created_at: DateTime<Utc>,
     delivery_stamp: i64,
@@ -1193,10 +1208,11 @@ pub async fn claim_due_reminder_with_stamp(
         r#"
         UPDATE events
         SET delivered_at = $1
-        WHERE created_at = $2 AND id = $3 AND delivered_at IS NULL
+        WHERE community_id = $2 AND created_at = $3 AND id = $4 AND delivered_at IS NULL
         "#,
     )
     .bind(delivery_stamp)
+    .bind(community_id.as_uuid())
     .bind(event_created_at)
     .bind(event_id)
     .execute(pool)
@@ -1210,8 +1226,12 @@ pub async fn claim_due_reminder_with_stamp(
 /// The `delivery_stamp` must be the exact value written by the claiming pod;
 /// that compare-and-clear prevents one pod from rolling back another pod's
 /// later claim after a retry/race.
+///
+/// Scoped by `community_id` for the same reason as the claim: a release for
+/// `A/X` must not clear `B/X` even when their `id`/`created_at`/stamp coincide.
 pub async fn release_due_reminder(
     pool: &PgPool,
+    community_id: CommunityId,
     event_id: &[u8],
     event_created_at: DateTime<Utc>,
     delivery_stamp: i64,
@@ -1220,11 +1240,13 @@ pub async fn release_due_reminder(
         r#"
         UPDATE events
         SET delivered_at = NULL
-        WHERE created_at = $1
-          AND id = $2
-          AND delivered_at = $3
+        WHERE community_id = $1
+          AND created_at = $2
+          AND id = $3
+          AND delivered_at = $4
         "#,
     )
+    .bind(community_id.as_uuid())
     .bind(event_created_at)
     .bind(event_id)
     .bind(delivery_stamp)
@@ -1530,10 +1552,10 @@ mod tests {
         // Two pods, two distinct per-attempt stamps, same reminder.
         let stamp_p1: i64 = 0x1111_1111_1111_1111;
         let stamp_p2: i64 = 0x2222_2222_2222_2222;
-        let won_p1 = claim_due_reminder_with_stamp(&pool, &id, created_at, stamp_p1)
+        let won_p1 = claim_due_reminder_with_stamp(&pool, community, &id, created_at, stamp_p1)
             .await
             .expect("p1 claim");
-        let won_p2 = claim_due_reminder_with_stamp(&pool, &id, created_at, stamp_p2)
+        let won_p2 = claim_due_reminder_with_stamp(&pool, community, &id, created_at, stamp_p2)
             .await
             .expect("p2 claim");
 
@@ -1571,7 +1593,7 @@ mod tests {
         let stamp: i64 = 0x3333_3333_3333_3333;
 
         assert!(
-            claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+            claim_due_reminder_with_stamp(&pool, community, &id, created_at, stamp)
                 .await
                 .expect("claim"),
             "first claim wins"
@@ -1580,13 +1602,13 @@ mod tests {
         // A release with the *wrong* stamp must be a no-op (does not clear
         // another pod's claim).
         assert!(
-            !release_due_reminder(&pool, &id, created_at, stamp ^ 0xFFFF)
+            !release_due_reminder(&pool, community, &id, created_at, stamp ^ 0xFFFF)
                 .await
                 .expect("wrong-stamp release"),
             "release with a non-matching stamp must not clear the claim"
         );
         assert!(
-            !claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+            !claim_due_reminder_with_stamp(&pool, community, &id, created_at, stamp)
                 .await
                 .expect("re-claim after no-op release"),
             "reminder must still be claimed after a no-op release"
@@ -1595,16 +1617,92 @@ mod tests {
         // The matching-stamp release rolls the claim back; the reminder is
         // redeliverable and a subsequent claim wins again.
         assert!(
-            release_due_reminder(&pool, &id, created_at, stamp)
+            release_due_reminder(&pool, community, &id, created_at, stamp)
                 .await
                 .expect("matching-stamp release"),
             "release with the claiming stamp must clear the claim"
         );
         assert!(
-            claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+            claim_due_reminder_with_stamp(&pool, community, &id, created_at, stamp)
                 .await
                 .expect("re-claim after release"),
             "released reminder must be reclaimable for retry"
+        );
+    }
+
+    /// Cross-community confinement: the same Nostr reminder event (identical
+    /// `id` and `created_at`) inserted into communities A and B must claim and
+    /// release independently. A claim/release for `A/X` must never touch `B/X`.
+    ///
+    /// This is the primitive the scheduler's exactly-once-publish proof rests
+    /// on: `events` is keyed `(community_id, created_at, id)`, so without the
+    /// community predicate a claim for A would mark B delivered (suppressing
+    /// B's reminder) and a matching-stamp release for A would clear B.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn reminder_claim_and_release_are_confined_to_their_community() {
+        let pool = setup_pool().await;
+        let community_a = CommunityId::from_uuid(make_test_community(&pool).await);
+        let community_b = CommunityId::from_uuid(make_test_community(&pool).await);
+
+        // One signed event, inserted into both communities — same id/created_at.
+        let not_before = Utc::now().timestamp() - 1;
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_EVENT_REMINDER as u16), "due")
+            .tags([
+                Tag::parse(["d", "due-reminder-cross-community"]).unwrap(),
+                Tag::parse(["not_before", &not_before.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign reminder");
+        insert_event(&pool, community_a, &event, None)
+            .await
+            .expect("insert A/X");
+        insert_event(&pool, community_b, &event, None)
+            .await
+            .expect("insert B/X");
+
+        let id = event.id.as_bytes().to_vec();
+        let created_at = event.created_at.as_secs() as i64;
+        let created_at = chrono::DateTime::from_timestamp(created_at, 0).expect("created_at");
+        let stamp: i64 = 0x4444_4444_4444_4444;
+
+        // Claim A/X. B/X must remain claimable — A's claim did not mark B.
+        assert!(
+            claim_due_reminder_with_stamp(&pool, community_a, &id, created_at, stamp)
+                .await
+                .expect("claim A"),
+            "A/X claim wins"
+        );
+        assert!(
+            claim_due_reminder_with_stamp(&pool, community_b, &id, created_at, stamp)
+                .await
+                .expect("claim B"),
+            "B/X must still be claimable after A/X is claimed — \
+             a claim for A must not mark B delivered"
+        );
+
+        // Both are now claimed under the same stamp. A matching-stamp release
+        // for A/X must clear only A/X; B/X must stay claimed.
+        assert!(
+            release_due_reminder(&pool, community_a, &id, created_at, stamp)
+                .await
+                .expect("release A"),
+            "A/X release with the claiming stamp clears A/X"
+        );
+        assert!(
+            !claim_due_reminder_with_stamp(&pool, community_b, &id, created_at, stamp)
+                .await
+                .expect("re-claim B after A release"),
+            "B/X must remain claimed after A/X is released — \
+             a release for A must not clear B"
+        );
+        // And A/X is genuinely redeliverable (the release was real, not a no-op).
+        assert!(
+            claim_due_reminder_with_stamp(&pool, community_a, &id, created_at, stamp)
+                .await
+                .expect("re-claim A after release"),
+            "A/X must be reclaimable after its own release"
         );
     }
 }

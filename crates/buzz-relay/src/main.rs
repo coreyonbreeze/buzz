@@ -584,6 +584,7 @@ async fn main() -> anyhow::Result<()> {
                     match scheduler_state
                         .db
                         .claim_due_reminder_with_stamp(
+                            reminder.community_id,
                             &reminder.id,
                             reminder.created_at,
                             delivery_stamp,
@@ -620,6 +621,7 @@ async fn main() -> anyhow::Result<()> {
                         if let Err(release_err) = scheduler_state
                             .db
                             .release_due_reminder(
+                                reminder.community_id,
                                 &reminder.id,
                                 reminder.created_at,
                                 delivery_stamp,
