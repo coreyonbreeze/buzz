@@ -515,14 +515,45 @@ async fn main() -> anyhow::Result<()> {
                 info!(count = due.len(), "Reminder scheduler: due reminders found");
 
                 for reminder in due {
-                    // Publish first, then claim. If publish fails the reminder
-                    // stays unclaimed and will be retried next tick. If claim
-                    // fails after a successful publish, duplicate fan-out on the
-                    // next tick is harmless (subscribers dedup by event ID).
+                    // Claim before side effect (§5c: claim-before-publish). A
+                    // unique per-attempt stamp lets a failed publish roll back
+                    // exactly this pod's claim via compare-and-clear, without a
+                    // racing pod's later claim being clobbered. `delivered_at`
+                    // is only ever read as a NULL/non-NULL sentinel (the
+                    // due-reminder query guard and the partial index), never as
+                    // a wall-clock value, so an opaque stamp is safe to store.
                     let reminder_tenant = buzz_core::tenant::TenantContext::resolved(
                         reminder.community_id,
                         reminder.host.clone(),
                     );
+                    let delivery_stamp = chrono::Utc::now()
+                        .timestamp_nanos_opt()
+                        .unwrap_or_else(|| chrono::Utc::now().timestamp())
+                        ^ rand::random::<i64>();
+
+                    match scheduler_state
+                        .db
+                        .claim_due_reminder_with_stamp(
+                            &reminder.id,
+                            reminder.created_at,
+                            delivery_stamp,
+                        )
+                        .await
+                    {
+                        Ok(true) => {} // We won the claim — proceed to publish.
+                        Ok(false) => continue, // Another pod claimed it; no side effect here.
+                        Err(e) => {
+                            warn!(
+                                event_id = hex::encode(&reminder.id),
+                                "Reminder scheduler: claim failed, skipping publish: {e}"
+                            );
+                            continue;
+                        }
+                    }
+
+                    // Publish the single side effect. On failure, release our
+                    // claim so the next tick (this pod or another) can retry —
+                    // the stamp guard ensures we only clear our own claim.
                     if let Err(e) = scheduler_state
                         .pubsub
                         .publish_event(
@@ -534,23 +565,21 @@ async fn main() -> anyhow::Result<()> {
                     {
                         error!(
                             event_id = hex::encode(&reminder.id),
-                            "Reminder scheduler: Redis publish failed, skipping claim: {e}"
+                            "Reminder scheduler: Redis publish failed after claim, releasing: {e}"
                         );
-                        continue;
-                    }
-
-                    // Atomic cross-pod claim — only the winner marks it delivered.
-                    match scheduler_state
-                        .db
-                        .claim_due_reminder(&reminder.id, reminder.created_at)
-                        .await
-                    {
-                        Ok(true) => {}
-                        Ok(false) => {} // Another pod claimed it; duplicate publish is harmless.
-                        Err(e) => {
+                        if let Err(release_err) = scheduler_state
+                            .db
+                            .release_due_reminder(
+                                &reminder.id,
+                                reminder.created_at,
+                                delivery_stamp,
+                            )
+                            .await
+                        {
                             warn!(
                                 event_id = hex::encode(&reminder.id),
-                                "Reminder scheduler: claim failed after publish (duplicate delivery possible): {e}"
+                                "Reminder scheduler: release after failed publish errored \
+                                 (reminder stays claimed, will not retry): {release_err}"
                             );
                         }
                     }
