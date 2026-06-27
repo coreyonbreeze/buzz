@@ -195,6 +195,15 @@ CREATE TABLE events (
     kind        INT NOT NULL,
     tags        JSONB NOT NULL,
     content     TEXT NOT NULL,
+    -- Full-text search vector (Typesense → Postgres FTS). Generated/STORED so
+    -- it is a single source of truth — no sidecar indexer to keep coherent
+    -- (Quinn option A, Lane-0 call). 'simple' config = no stemming/stopwords,
+    -- matching the existing substring-ish search semantics; the search lane can
+    -- revisit the config behind evidence. Tenant scoping is by the
+    -- community-leading btree filters BitmapAnd-ed with the GIN probe, so the
+    -- GIN index itself stays the minimal `GIN (search_tsv)` (Max's caveat:
+    -- avoid btree_gin unless EXPLAIN proves it buys something).
+    search_tsv  TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED,
     sig         BYTEA NOT NULL,
     received_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     channel_id  UUID,
@@ -242,6 +251,11 @@ CREATE INDEX idx_events_parameterized
     WHERE d_tag IS NOT NULL AND deleted_at IS NULL;
 CREATE INDEX idx_events_not_before ON events (community_id, not_before)
     WHERE not_before IS NOT NULL AND deleted_at IS NULL AND delivered_at IS NULL;
+-- Full-text search. Minimal GIN over the generated tsvector; community scoping
+-- is supplied by the community-leading btree filters above (BitmapAnd), so this
+-- stays a single-column GIN. The search lane confirms the final spelling with
+-- EXPLAIN before its work lands (Quinn option A; Max's index-spelling caveat).
+CREATE INDEX idx_events_search_tsv ON events USING GIN (search_tsv);
 
 -- ── Event mentions ────────────────────────────────────────────────────────────
 -- Conformance: "Channel-less global events and DMs" (#p fan-out). The join to
