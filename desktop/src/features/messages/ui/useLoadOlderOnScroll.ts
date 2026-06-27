@@ -50,28 +50,28 @@ type UseLoadOlderOnScrollOptions = {
  * the captured anchor row isn't resolvable). Resolved off the virtualizer's
  * live measurement each frame so the loop chases the offset as prepended rows
  * grow `getTotalSize()`.
- *   - `abandonedToBottom`: the user jumped to bottom mid-prepend → the last
- *     row's END offset (the true floor), not the stale mid-history anchor.
+ *   - `abandonedToBottom`: the user jumped to bottom mid-prepend → the
+ *     scroll container's true floor, not the stale mid-history anchor.
  *   - otherwise: the captured first-visible row's START offset minus the gap
  *     that was above it, holding the reader's eye-line across the prepend.
  */
 function resolveTarget({
   instance,
   abandonedToBottom,
-  lastIndex,
+  container,
   newIndex,
   anchorTop,
 }: {
   instance: ListVirtualizer | null;
   abandonedToBottom: boolean;
-  lastIndex: number;
+  container: HTMLDivElement | null;
   newIndex: number | undefined;
   anchorTop: number;
 }): number | undefined {
   if (!instance) return undefined;
   if (abandonedToBottom) {
-    if (lastIndex < 0) return undefined;
-    return instance.getOffsetForIndex(lastIndex, "end")?.[0];
+    if (!container) return undefined;
+    return Math.max(0, container.scrollHeight - container.clientHeight);
   }
   if (newIndex === undefined) return undefined;
   const start = instance.getOffsetForIndex(newIndex, "start");
@@ -225,9 +225,10 @@ export function useLoadOlderOnScroll({
                   (after?.liveMessageCount ?? previousCount) > previousCount;
                 // Resolve this frame's target offset. Two cases, one mechanism:
                 //   - Abandon: the user jumped to bottom while this loop owned
-                //     scroll. Hold the BOTTOM (last row's end offset), not the
+                //     scroll. Hold the scroll container's true floor, not the
                 //     captured mid-history anchor — that old offset sits short of
-                //     the true floor and would strand the view there, since the
+                //     the floor once padding/spacers are included and would strand
+                //     the view there, since the
                 //     ResizeObserver re-pin is ceded to this loop for the whole
                 //     window.
                 //   - Normal: hold the captured first-visible row at its viewport
@@ -248,7 +249,7 @@ export function useLoadOlderOnScroll({
                 const target = resolveTarget({
                   instance: grew ? instance : null,
                   abandonedToBottom,
-                  lastIndex: (after?.liveMessageCount ?? previousCount) - 1,
+                  container,
                   newIndex,
                   anchorTop,
                 });
