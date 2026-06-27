@@ -5,7 +5,7 @@
 # Tests relay-level membership enforcement and admin commands.
 #
 # Prerequisites:
-#   - Docker services running (postgres, redis, typesense)
+#   - Docker services running (postgres, redis, minio)
 #   - Relay built: cargo build --release --bin buzz-relay
 #   - nak available on PATH (for event signing)
 #

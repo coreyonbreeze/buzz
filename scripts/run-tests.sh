@@ -47,8 +47,6 @@ else
   export PGPASSWORD=buzz_dev
   export PGDATABASE=buzz
   export REDIS_URL="redis://localhost:6379"
-  export TYPESENSE_API_KEY="buzz_dev_key"
-  export TYPESENSE_URL="http://localhost:8108"
 fi
 
 # ---- Track results ----------------------------------------------------------

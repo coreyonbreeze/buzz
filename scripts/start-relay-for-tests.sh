@@ -55,7 +55,7 @@ err()   { echo -e "${RED}[relay-test]${NC} $*" >&2; }
 cd "${REPO_ROOT}"
 
 log "Starting docker compose services..."
-docker compose up -d postgres redis typesense minio minio-init
+docker compose up -d postgres redis minio minio-init
 
 # ── Wait for services to be healthy ──────────────────────────────────────────
 
@@ -78,7 +78,6 @@ wait_healthy() {
 
 wait_healthy "Postgres" "buzz-postgres"
 wait_healthy "Redis" "buzz-redis"
-wait_healthy "Typesense" "buzz-typesense"
 wait_healthy "MinIO" "buzz-minio"
 
 # ── Apply database schema ────────────────────────────────────────────────────
@@ -129,8 +128,6 @@ log "Starting relay..."
 nohup env \
   DATABASE_URL=postgres://buzz:buzz_dev@localhost:5432/buzz \
   REDIS_URL=redis://localhost:6379 \
-  TYPESENSE_URL=http://localhost:8108 \
-  TYPESENSE_API_KEY=buzz_dev_key \
   RELAY_URL=ws://localhost:3000 \
   BUZZ_BIND_ADDR=0.0.0.0:3000 \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
