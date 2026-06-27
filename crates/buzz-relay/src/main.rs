@@ -300,18 +300,11 @@ async fn main() -> anyhow::Result<()> {
             // host (single-community per deployment), failing closed if the host
             // isn't mapped — the membership list is community-scoped now, so the
             // relay-signed startup publish must carry a resolved tenant.
-            let raw_host = url::Url::parse(
-                &startup_state
-                    .config
-                    .relay_url
-                    .replace("ws://", "http://")
-                    .replace("wss://", "https://"),
+            let tenant = match buzz_relay::tenant::bind_deployment_community(
+                &startup_state.db,
+                &startup_state.config.relay_url,
             )
-            .ok()
-            .and_then(|u| u.host_str().map(|h| h.to_string()))
-            .unwrap_or_default();
-            let tenant = match buzz_relay::tenant::bind_community(&startup_state.db, &raw_host)
-                .await
+            .await
             {
                 Ok(ctx) => ctx,
                 Err(e) => {
