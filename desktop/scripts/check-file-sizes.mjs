@@ -147,7 +147,7 @@ const overrides = new Map([
   // continued-agent-conversations: channel task-tab state, deep-link task
   // routing, and side-panel suppression sit at the channel orchestration seam.
   // latest main rebase threads additional header routing through this seam.
-  ["src/features/channels/ui/ChannelScreen.tsx", 1027],
+  ["src/features/channels/ui/ChannelScreen.tsx", 1040],
   // continued-agent-conversations: composer notice banner for read-only agent
   // conversations.
   ["src/features/messages/ui/MessageComposer.tsx", 1010],
