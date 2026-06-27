@@ -130,16 +130,6 @@ spec:
                   name: {{ include "buzz.envSecretName" . }}
                   key: REDIS_URL
                   optional: {{ and (eq (.Values.replicaCount | int) 1) (not .Values.redis.enabled) (not .Values.externalRedis.url) }}
-            - name: TYPESENSE_URL
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "buzz.envSecretName" . }}
-                  key: TYPESENSE_URL
-            - name: TYPESENSE_API_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "buzz.envSecretName" . }}
-                  key: TYPESENSE_API_KEY
             - name: BUZZ_S3_ACCESS_KEY
               valueFrom:
                 secretKeyRef:

@@ -8,14 +8,12 @@ templates:
   - templates/service.yaml
   - templates/pvc-git.yaml
 tests:
-  - it: renders cleanly in production profile (external pg/redis/typesense)
+  - it: renders cleanly in production profile (external pg/redis)
     set:
       relayUrl: wss://buzz.example.com
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       externalPostgresql.url: postgres://u:p@h:5432/d
       externalRedis.url: redis://h:6379
-      typesense.url: http://ts:8108
-      typesense.apiKey: k
       s3.endpoint: http://minio:9000
       s3.accessKey: a
       s3.secretKey: s
@@ -39,8 +37,6 @@ tests:
       ownerPubkey: "0000000000000000000000000000000000000000000000000000000000000000"
       externalPostgresql.url: postgres://u:p@h:5432/d
       externalRedis.url: redis://h:6379
-      typesense.url: http://ts:8108
-      typesense.apiKey: k
       s3.endpoint: http://minio:9000
       s3.accessKey: a
       s3.secretKey: s
