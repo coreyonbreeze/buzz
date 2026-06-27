@@ -429,11 +429,28 @@ impl WorkflowEngine {
                         // a process bounce can't double-fire within an interval.
                         let last = match self.last_fired.get(&(community_id, workflow.id)) {
                             Some(t) => Some(*t),
-                            None => self
+                            None => match self
                                 .db
                                 .latest_scheduled_workflow_fire(community_id, workflow.id)
                                 .await
-                                .unwrap_or(None),
+                            {
+                                Ok(anchor) => anchor,
+                                Err(e) => {
+                                    // Fail closed: a missing anchor reads as
+                                    // last_fired = now in interval_should_fire,
+                                    // so this tick is suppressed and the next
+                                    // tick retries. Surface the read failure so
+                                    // a persistently-unreadable anchor is visible
+                                    // rather than silently stalling the schedule.
+                                    tracing::warn!(
+                                        community_id = %community_id,
+                                        workflow_id = %workflow.id,
+                                        "Cron tick: failed to read interval restart anchor, \
+                                         suppressing this tick: {e}"
+                                    );
+                                    None
+                                }
+                            },
                         };
                         if !interval_should_fire(dur, last, now, workflow.id) {
                             continue;

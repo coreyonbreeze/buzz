@@ -1753,6 +1753,72 @@ mod tests {
         );
     }
 
+    /// `attach_scheduled_workflow_run` links a won claim to the run it created.
+    /// This is the regression for the missing `scheduled_workflow_fires.
+    /// workflow_run_id` column: before the schema added it, the UPDATE failed at
+    /// runtime with `column "workflow_run_id" does not exist`, so the audit link
+    /// silently never populated and the scheduler warned on every fire. This test
+    /// proves the column is present, the attach writes it, and the
+    /// `workflow_run_id IS NULL` guard makes a second attach a no-op. It is RED
+    /// without the migration column.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn attach_links_run_to_claim_and_is_idempotent() {
+        let pool = setup_pool().await;
+
+        let community = make_community(&pool).await;
+        let (workflow_id, _) = make_workflow_in(&pool, community).await;
+        let scheduled_for = Utc.with_ymd_and_hms(2026, 6, 27, 0, 2, 0).unwrap();
+
+        // Win the claim for this instant.
+        claim_scheduled_workflow_fire(&pool, community, workflow_id, scheduled_for)
+            .await
+            .expect("claim ok")
+            .expect("claim wins");
+
+        // Create the run the won claim is responsible for, then attach it.
+        let run_id = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create run ok");
+
+        let attached =
+            attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, run_id)
+                .await
+                .expect("attach ok");
+        assert!(attached, "first attach must update the claim row");
+
+        // The column is populated with the run id.
+        let linked: Option<Uuid> = sqlx::query_scalar(
+            "SELECT workflow_run_id FROM scheduled_workflow_fires \
+             WHERE community_id = $1 AND workflow_id = $2 AND scheduled_for = $3",
+        )
+        .bind(community.as_uuid())
+        .bind(workflow_id)
+        .bind(scheduled_for)
+        .fetch_one(&pool)
+        .await
+        .expect("row exists");
+        assert_eq!(
+            linked,
+            Some(run_id),
+            "the claim row must now point at the run it created"
+        );
+
+        // A second attach is a no-op: the `workflow_run_id IS NULL` guard means
+        // an already-linked claim is never re-pointed to a different run.
+        let other_run = create_workflow_run(&pool, community, workflow_id, None, None)
+            .await
+            .expect("create second run ok");
+        let reattached =
+            attach_scheduled_workflow_run(&pool, community, workflow_id, scheduled_for, other_run)
+                .await
+                .expect("second attach ok");
+        assert!(
+            !reattached,
+            "attach must not overwrite an already-linked claim row"
+        );
+    }
+
     /// Documents the retention-vs-interval coupling Sami flagged for §5c:
     /// pruning every claim below the workflow's interval makes
     /// `latest_scheduled_workflow_fire` return `None`, which re-introduces the
