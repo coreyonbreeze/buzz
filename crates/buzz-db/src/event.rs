@@ -1500,4 +1500,111 @@ mod tests {
             row.id == event_b.id.as_bytes() && row.community_id == community_b && row.host == host_b
         }));
     }
+
+    /// Two pods race to claim the same due reminder: exactly one wins. The
+    /// scheduler publishes only on a winning claim (`Ok(true)`) and `continue`s
+    /// on the loser (`Ok(false)`), so a single winning claim *is* the proof of
+    /// exactly one publish side effect across N pods.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn claim_due_reminder_is_won_by_exactly_one_of_two_racing_pods() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let not_before = Utc::now().timestamp() - 1;
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_EVENT_REMINDER as u16), "due")
+            .tags([
+                Tag::parse(["d", "due-reminder-claim-race"]).unwrap(),
+                Tag::parse(["not_before", &not_before.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign reminder");
+        insert_event(&pool, community, &event, None)
+            .await
+            .expect("insert reminder");
+
+        let id = event.id.as_bytes().to_vec();
+        let created_at = event.created_at.as_secs() as i64;
+        let created_at = chrono::DateTime::from_timestamp(created_at, 0).expect("created_at");
+
+        // Two pods, two distinct per-attempt stamps, same reminder.
+        let stamp_p1: i64 = 0x1111_1111_1111_1111;
+        let stamp_p2: i64 = 0x2222_2222_2222_2222;
+        let won_p1 = claim_due_reminder_with_stamp(&pool, &id, created_at, stamp_p1)
+            .await
+            .expect("p1 claim");
+        let won_p2 = claim_due_reminder_with_stamp(&pool, &id, created_at, stamp_p2)
+            .await
+            .expect("p2 claim");
+
+        assert!(
+            won_p1 ^ won_p2,
+            "exactly one pod must win the claim (p1={won_p1}, p2={won_p2}) — \
+             the loser never reaches the publish side effect"
+        );
+    }
+
+    /// A failed publish releases the claim so the reminder is redeliverable,
+    /// and the compare-and-clear stamp guard prevents one pod from rolling back
+    /// another pod's claim.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn release_due_reminder_rolls_back_only_the_matching_stamp() {
+        let pool = setup_pool().await;
+        let community = CommunityId::from_uuid(make_test_community(&pool).await);
+        let not_before = Utc::now().timestamp() - 1;
+        let keys = Keys::generate();
+        let event = EventBuilder::new(Kind::Custom(KIND_EVENT_REMINDER as u16), "due")
+            .tags([
+                Tag::parse(["d", "due-reminder-release"]).unwrap(),
+                Tag::parse(["not_before", &not_before.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .expect("sign reminder");
+        insert_event(&pool, community, &event, None)
+            .await
+            .expect("insert reminder");
+
+        let id = event.id.as_bytes().to_vec();
+        let created_at = event.created_at.as_secs() as i64;
+        let created_at = chrono::DateTime::from_timestamp(created_at, 0).expect("created_at");
+        let stamp: i64 = 0x3333_3333_3333_3333;
+
+        assert!(
+            claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+                .await
+                .expect("claim"),
+            "first claim wins"
+        );
+
+        // A release with the *wrong* stamp must be a no-op (does not clear
+        // another pod's claim).
+        assert!(
+            !release_due_reminder(&pool, &id, created_at, stamp ^ 0xFFFF)
+                .await
+                .expect("wrong-stamp release"),
+            "release with a non-matching stamp must not clear the claim"
+        );
+        assert!(
+            !claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+                .await
+                .expect("re-claim after no-op release"),
+            "reminder must still be claimed after a no-op release"
+        );
+
+        // The matching-stamp release rolls the claim back; the reminder is
+        // redeliverable and a subsequent claim wins again.
+        assert!(
+            release_due_reminder(&pool, &id, created_at, stamp)
+                .await
+                .expect("matching-stamp release"),
+            "release with the claiming stamp must clear the claim"
+        );
+        assert!(
+            claim_due_reminder_with_stamp(&pool, &id, created_at, stamp)
+                .await
+                .expect("re-claim after release"),
+            "released reminder must be reclaimable for retry"
+        );
+    }
 }
