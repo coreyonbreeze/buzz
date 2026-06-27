@@ -1046,6 +1046,7 @@ dependencies = [
  "base64",
  "buzz-audit",
  "buzz-auth",
+ "buzz-conformance",
  "buzz-core",
  "buzz-db",
  "buzz-media",

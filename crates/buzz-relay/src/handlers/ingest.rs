@@ -43,6 +43,11 @@ use crate::state::AppState;
 
 use super::event::dispatch_persistent_event;
 
+use crate::conformance::{
+    self as conf, channel_label, claimed_community_from_event, emit, msg_id_label,
+    state_for_request, EmitGuard, TraceAction, Verdict,
+};
+
 /// How the HTTP caller authenticated (for [`IngestAuth::Http`]).
 #[derive(Debug, Clone)]
 pub enum HttpAuthMethod {
@@ -1138,8 +1143,54 @@ fn validate_event_reminder(event: &Event) -> Result<(), &'static str> {
 /// Shared by WebSocket and HTTP transports. The caller constructs [`IngestAuth`]
 /// from their transport-specific auth mechanism and maps the result to their
 /// transport-specific response format.
+///
+/// Builds a [`crate::conformance::EmitGuard`] around the actual ingest
+/// logic so the trace seam has fail-closed coverage: any exit path that
+/// doesn't emit a Write*/SanitizedError action will be caught by the
+/// guard's Drop → `ImplBug` → CoverageBreach. The wrapper also maps
+/// `IngestError` → SanitizedError in one place, sparing every individual
+/// `return Err(...)` from having to emit explicitly. See
+/// `crates/buzz-relay/src/conformance/mod.rs` and
+/// `docs/spec/MultiTenantRelay.tla`.
 pub async fn ingest_event(
     state: &Arc<AppState>,
+    tenant: &TenantContext,
+    event: Event,
+    auth: IngestAuth,
+) -> Result<IngestResult, IngestError> {
+    let abstract_state = state_for_request(tenant, auth.pubkey());
+    let (_guard, tracer) = EmitGuard::arm(
+        state.tracer.clone(),
+        abstract_state.clone(),
+        "ingest_event_exited_without_trace",
+    );
+
+    let result = ingest_event_inner(state, &tracer, tenant, event, auth).await;
+
+    // Map terminal error variants onto the closed SanitizedReason
+    // alphabet (spec line 778). The inner fn's success path emits
+    // WriteInsert/WriteInsertGlobal/WriteDuplicate explicitly at its
+    // dispatch points — so on Ok we don't emit here.
+    if let Err(err) = &result {
+        let reason = conf::sanitized_reason_for(err);
+        emit(
+            &tracer,
+            TraceAction::SanitizedError { reason },
+            abstract_state.clone(),
+        );
+    }
+
+    // _guard drops here. If `tracer` received no records during the
+    // request (a panic before the first emit, or a future new exit
+    // path that forgets to emit), Drop records an ImplBug step on
+    // the underlying tracer — the checker treats that as
+    // CoverageBreach.
+    result
+}
+
+async fn ingest_event_inner(
+    state: &Arc<AppState>,
+    tracer: &Arc<dyn buzz_conformance::Tracer>,
     tenant: &TenantContext,
     event: Event,
     auth: IngestAuth,
@@ -1348,9 +1399,31 @@ pub async fn ingest_event(
             || kind_u32 == KIND_NIP29_CREATE_GROUP
             || auth.has_proxy_scope();
         if !skip_membership {
-            check_channel_membership(tenant, state, ch_id, &pubkey_bytes)
-                .await
-                .map_err(IngestError::Rejected)?;
+            // Spec AuthCheck (line 794): emit the verdict at the actual
+            // call site. claimed_community comes from the event's h tag
+            // (recorded separately to bite M2 / M8 — claim or A-host
+            // driving a B-channel verdict — at the checker). The verdict
+            // basis is `tenant.community()` server-resolved, confirmed
+            // at `check_channel_membership`'s `is_member_cached(tenant
+            // .community(), …)` call (see crates/buzz-relay/src/handlers
+            // /ingest.rs:424).
+            let auth_result = check_channel_membership(tenant, state, ch_id, &pubkey_bytes).await;
+            let claimed = claimed_community_from_event(&event);
+            let verdict = if auth_result.is_ok() {
+                Verdict::Allow
+            } else {
+                Verdict::Deny
+            };
+            emit(
+                tracer,
+                TraceAction::AuthCheck {
+                    channel: channel_label(ch_id),
+                    claimed_community: claimed,
+                    verdict,
+                },
+                state_for_request(tenant, auth.pubkey()),
+            );
+            auth_result.map_err(IngestError::Rejected)?;
         }
     }
 
@@ -1815,6 +1888,26 @@ pub async fn ingest_event(
         }
 
         let pubkey_hex = auth.pubkey().to_hex();
+        // Spec WriteInsert (line 514) / WriteDuplicate (line 606): emit
+        // the abstract write action. The persist API returns
+        // `was_inserted` (true → Insert, false → Duplicate). This branch
+        // is the reaction path; channel_id is always Some here, so
+        // WriteInsertGlobal does not apply.
+        let claimed = claimed_community_from_event(&event);
+        let action = if was_inserted {
+            TraceAction::WriteInsert {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                channel: channel_label(channel_id.expect("reaction path has channel")),
+                claimed_community: claimed,
+            }
+        } else {
+            TraceAction::WriteDuplicate {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                channel: channel_label(channel_id.expect("reaction path has channel")),
+                claimed_community: claimed,
+            }
+        };
+        emit(tracer, action, state_for_request(tenant, auth.pubkey()));
         dispatch_persistent_event(tenant, state, &stored_event, kind_u32, &pubkey_hex).await;
 
         info!(event_id = %event_id_hex, kind = kind_u32, "Event ingested via pipeline");
@@ -1912,6 +2005,35 @@ pub async fn ingest_event(
     }
 
     let pubkey_hex = auth.pubkey().to_hex();
+    // Spec WriteInsert (line 514) / WriteInsertGlobal (line 559) /
+    // WriteDuplicate (line 606): emit the abstract write at the trailing
+    // dispatch site. `channel_id.is_some()` distinguishes channel-bearing
+    // (Insert/Duplicate) from channel-less (InsertGlobal); `was_inserted`
+    // distinguishes accepted-new (Insert/Global) from no-op-on-conflict
+    // (Duplicate). The WriteInsertGlobal duplicate case is not modeled
+    // separately in the spec (channel-less duplicates collapse to the
+    // same observation shape as channel-less inserts at this seam);
+    // see docs/spec/MultiTenantRelay.tla lines 559-595.
+    {
+        let claimed = claimed_community_from_event(&event);
+        let action = match (channel_id, was_inserted) {
+            (Some(ch), true) => TraceAction::WriteInsert {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                channel: channel_label(ch),
+                claimed_community: claimed,
+            },
+            (Some(ch), false) => TraceAction::WriteDuplicate {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                channel: channel_label(ch),
+                claimed_community: claimed,
+            },
+            (None, _) => TraceAction::WriteInsertGlobal {
+                msg_id: msg_id_label(event.id.as_bytes()),
+                claimed_community: claimed,
+            },
+        };
+        emit(tracer, action, state_for_request(tenant, auth.pubkey()));
+    }
     dispatch_persistent_event(tenant, state, &stored_event, kind_u32, &pubkey_hex).await;
 
     info!(event_id = %event_id_hex, kind = kind_u32, "Event ingested via pipeline");

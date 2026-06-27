@@ -245,6 +245,12 @@ pub(crate) async fn dispatch_persistent_event(
     kind_u32: u32,
     actor_pubkey_hex: &str,
 ) -> usize {
+    // No `crate::conformance` emit here — the spec doesn't have a
+    // separate fan-out action. Acceptance was already recorded at the
+    // ingest seam (`crates/buzz-relay/src/handlers/ingest.rs`'s
+    // WriteInsert/WriteInsertGlobal/WriteDuplicate emit). The fan-out
+    // surfaces as `ReadMessageRows` observations on the subscriber side
+    // (read seam in req.rs, emitted by the held-back read-seam diff).
     let event_id_hex = stored_event.event.id.to_hex();
 
     let topic = match stored_event.channel_id {

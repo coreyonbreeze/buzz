@@ -278,6 +278,13 @@ pub struct AppState {
     /// Prevents repeated DB lookups from bursty observer traffic.
     #[allow(clippy::type_complexity)]
     pub observer_owner_cache: Arc<moka::sync::Cache<(Vec<u8>, Vec<u8>), bool>>,
+
+    /// Runtime conformance tracer. Production binds [`crate::conformance::NoopTracer`]
+    /// (zero cost). Conformance tests bind [`crate::conformance::JsonlTracer`] to
+    /// record traces for replay against `docs/spec/MultiTenantRelay.tla`.
+    /// See `crates/buzz-conformance/` and `crate::conformance` for the
+    /// schema, emitter helpers, and the independent checker.
+    pub tracer: Arc<dyn buzz_conformance::Tracer>,
 }
 
 impl AppState {
@@ -406,6 +413,11 @@ impl AppState {
                     .time_to_live(std::time::Duration::from_secs(300))
                     .build(),
             ),
+            // Default to NoopTracer: production builds pay zero cost.
+            // Conformance tests overwrite this with a JsonlTracer after
+            // construction (see test helpers in
+            // `crates/buzz-test-client` once those land).
+            tracer: Arc::new(crate::conformance::NoopTracer),
         };
         (
             state,
