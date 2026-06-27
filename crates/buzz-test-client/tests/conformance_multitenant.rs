@@ -1905,16 +1905,319 @@ mod search_fts {
 mod pubsub_presence_typing {
     use super::*;
 
+    use buzz_test_client::{BuzzTestClient, RelayMessage};
+    use nostr::{Alphabet, EventBuilder, Filter, Keys, Kind, SingleLetterTag, Tag};
+
+    const KIND_PRESENCE_UPDATE: u16 = 20001;
+    const KIND_TYPING_INDICATOR: u16 = 20002;
+
+    /// Convert any base form to `ws(s)://` for WS connect.
+    fn to_ws(base: &str) -> String {
+        if base.starts_with("ws://") || base.starts_with("wss://") {
+            base.trim_end_matches('/').to_string()
+        } else {
+            base.replace("https://", "wss://")
+                .replace("http://", "ws://")
+                .trim_end_matches('/')
+                .to_string()
+        }
+    }
+
+    /// Convert any base form to `http(s)://` for REST.
+    fn to_http(base: &str) -> String {
+        if base.starts_with("http://") || base.starts_with("https://") {
+            base.trim_end_matches('/').to_string()
+        } else {
+            base.replace("wss://", "https://")
+                .replace("ws://", "http://")
+                .trim_end_matches('/')
+                .to_string()
+        }
+    }
+
+    /// Create the same visibility=open channel UUID in the community resolved by
+    /// `http_base`. Open visibility keeps the typing half focused on pub/sub
+    /// fan-out scoping rather than membership setup: either host can post to its
+    /// own tenant-local instance of the UUID, and the only live-delivery fence
+    /// left is the server-resolved community in the subscription/fan-out index.
+    async fn create_open_channel(http_base: &str, keys: &Keys, channel_uuid: uuid::Uuid) -> String {
+        let client = reqwest::Client::new();
+        let pubkey_hex = keys.public_key().to_hex();
+        let event = EventBuilder::new(Kind::Custom(9007), "")
+            .tags(vec![
+                Tag::parse(["h", &channel_uuid.to_string()]).unwrap(),
+                Tag::parse(["name", &format!("conformance-pubsub-{channel_uuid}")]).unwrap(),
+                Tag::parse(["channel_type", "stream"]).unwrap(),
+                Tag::parse(["visibility", "open"]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap();
+        let resp = client
+            .post(format!("{http_base}/events"))
+            .header("X-Pubkey", &pubkey_hex)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&event).unwrap())
+            .send()
+            .await
+            .expect("submit create-channel");
+        assert!(
+            resp.status().is_success(),
+            "create-channel HTTP failed against {http_base}: {}",
+            resp.status()
+        );
+        let body: serde_json::Value = resp.json().await.expect("parse create-channel response");
+        assert!(
+            body["accepted"].as_bool().unwrap_or(false),
+            "create-channel not accepted against {http_base}: {body}"
+        );
+        channel_uuid.to_string()
+    }
+
+    async fn publish_presence(client: &mut BuzzTestClient, keys: &Keys, status: &str) {
+        let event = EventBuilder::new(Kind::Custom(KIND_PRESENCE_UPDATE), status)
+            .sign_with_keys(keys)
+            .unwrap();
+        let ok = client.send_event(event).await.expect("send presence");
+        assert!(ok.accepted, "presence not accepted: {}", ok.message);
+    }
+
+    /// Query synthesized presence through REST `POST /query`. This exercises the
+    /// bridge intercept at `api/bridge.rs::synthesize_presence`, which reads
+    /// Redis via `get_presence_bulk(tenant, authors)`; there is no DB fallback
+    /// for this ephemeral state.
+    async fn query_presence(http_base: &str, pubkey_hex: &str) -> Vec<serde_json::Value> {
+        let client = reqwest::Client::new();
+        let filters = serde_json::json!([{
+            "kinds": [KIND_PRESENCE_UPDATE],
+            "authors": [pubkey_hex],
+            "limit": 1,
+        }]);
+        let resp = client
+            .post(format!("{http_base}/query"))
+            .header("X-Pubkey", pubkey_hex)
+            .header("Content-Type", "application/json")
+            .body(serde_json::to_string(&filters).unwrap())
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("POST /query against {http_base} failed: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "POST /query against {http_base} returned {}",
+            resp.status()
+        );
+        resp.json().await.expect("parse /query JSON")
+    }
+
+    async fn subscribe_typing(client: &mut BuzzTestClient, sub_id: &str, channel_id: &str) {
+        let filter = Filter::new()
+            .kind(Kind::Custom(KIND_TYPING_INDICATOR))
+            .custom_tags(SingleLetterTag::lowercase(Alphabet::H), [channel_id]);
+        client
+            .subscribe(sub_id, vec![filter])
+            .await
+            .expect("subscribe to typing");
+        let historical = client
+            .collect_until_eose(sub_id, Duration::from_secs(10))
+            .await
+            .expect("collect typing EOSE");
+        assert!(
+            historical.is_empty(),
+            "typing is ephemeral and should not return historical events; got {}",
+            historical.len()
+        );
+    }
+
+    async fn publish_typing(
+        client: &mut BuzzTestClient,
+        keys: &Keys,
+        channel_id: &str,
+        content: &str,
+    ) -> String {
+        let event = EventBuilder::new(Kind::Custom(KIND_TYPING_INDICATOR), content)
+            .tags([Tag::parse(["h", channel_id]).unwrap()])
+            .sign_with_keys(keys)
+            .unwrap();
+        let id_hex = event.id.to_hex();
+        let ok = client.send_event(event).await.expect("send typing");
+        assert!(ok.accepted, "typing not accepted: {}", ok.message);
+        id_hex
+    }
+
+    /// Drain live events for `sub_id` until `quiet_for` elapses, returning only
+    /// EVENT frames for that subscription. This deliberately keeps listening
+    /// after the expected local event so a cross-community leak has a window to
+    /// surface as a second/wrong-content live delivery.
+    async fn drain_live_events(
+        client: &mut BuzzTestClient,
+        sub_id: &str,
+        quiet_for: Duration,
+    ) -> Vec<nostr::Event> {
+        let mut events = Vec::new();
+        loop {
+            match client.recv_event(quiet_for).await {
+                Ok(RelayMessage::Event {
+                    subscription_id,
+                    event,
+                }) if subscription_id == sub_id => events.push(*event),
+                Ok(_) => {}
+                Err(_) => return events,
+            }
+        }
+    }
+
+    fn assert_one_content(events: &[nostr::Event], expected: &str, forbidden: &str, side: &str) {
+        let contents = events.iter().map(|e| e.content.clone()).collect::<Vec<_>>();
+        assert_eq!(
+            events.len(),
+            1,
+            "{side}'s typing subscription received {} live events; expected exactly its own. \
+             contents: {contents:?}",
+            events.len()
+        );
+        assert_eq!(
+            events[0].content, expected,
+            "{side}'s typing event content is not its own — cross-community content leaked. \
+             got: {:?}, expected: {:?}, forbidden other-community content: {:?}",
+            events[0].content, expected, forbidden
+        );
+        assert!(
+            !contents.iter().any(|content| content == forbidden),
+            "{side}'s typing subscription saw other-community content {forbidden:?}; \
+             subscription/fan-out community scoping leaked"
+        );
+    }
+
     /// Obligation: keys are `buzz:{community}:…`; cross-node fan-out never
     /// delivers an A event to a B subscription, even for the same channel UUID;
     /// the same pubkey can be online in A and away in B independently.
+    ///
+    /// Wire-observable shape, split across the two load-bearing pub/sub fences:
+    ///
+    /// 1. **Presence / Redis key fence.** The same keypair publishes kind:20001
+    ///    presence with distinct statuses in A and B. Presence is ephemeral, so
+    ///    `/query` is synthesized from Redis (`api/bridge.rs::synthesize_presence`
+    ///    → `buzz_pubsub::get_presence_bulk`). A's query must return only A's
+    ///    status and B's only B's. This bites the Redis key format in
+    ///    `crates/buzz-pubsub/src/presence.rs::presence_key`, which must include
+    ///    `ctx.community()` (`buzz:{community}:presence:{pubkey}`). Same pubkey
+    ///    is required: it proves the isolation coordinate is community, not key.
+    ///
+    /// 2. **Typing / subscription fan-out fence.** The same channel UUID is
+    ///    created in both communities, both sides subscribe to kind:20002 + `#h`
+    ///    for that UUID, then each side publishes distinct typing content.
+    ///    Because the channel UUID and kind are intentionally identical, the only
+    ///    in-memory live-delivery discriminator is the server-resolved community
+    ///    in `SubscriptionRegistry`'s `(CommunityId, channel/kind)` indexes and
+    ///    `fan_out_scoped(community_id, event)`. Distinct content makes a leak a
+    ///    wrong-answer-returned failure instead of setup-equivalence vacuity.
+    ///
+    /// Mutate-bites:
+    ///   - Presence: drop/neutralize `ctx.community()` in
+    ///     `buzz-pubsub/src/presence.rs::presence_key` (shared Redis key). The B
+    ///     publish overwrites A's status for the same pubkey, so A's `/query`
+    ///     returns `status_b` and the presence assertion reds.
+    ///   - Typing: drop both live-delivery tenant fences at once: ignore
+    ///     `community_id` in `SubscriptionRegistry::fan_out_scoped`'s
+    ///     channel-kind lookup AND remove the receiver-side
+    ///     `community_for_conn(conn_id) == Some(event_community)` check in
+    ///     `handlers/event.rs::filter_fanout_by_access`. With the same channel
+    ///     UUID + kind in both tenants, A's live typing event is delivered to B's
+    ///     subscription (and/or vice versa); the exact-one-content assertions red
+    ///     with the other community's content in the drain. Either fence alone is
+    ///     defense-in-depth: the index prevents cross-tenant candidates, and the
+    ///     send chokepoint drops any stale/injected cross-tenant candidate.
     #[tokio::test]
     #[ignore]
     async fn fanout_and_presence_do_not_cross_communities() {
-        pending_lane(
-            "buzz-pubsub",
-            "event on A's channel UUID never reaches B's subscription on the same UUID",
+        let ws_a = to_ws(&url_a());
+        let ws_b = to_ws(&url_b());
+        let http_a = to_http(&url_a());
+        let http_b = to_http(&url_b());
+
+        // Same key across both communities is load-bearing for presence: the
+        // Redis key must be `(community, pubkey)`, not just `pubkey`.
+        let keys = Keys::generate();
+        let pubkey_hex = keys.public_key().to_hex();
+
+        let mut client_a = BuzzTestClient::connect(&ws_a, &keys)
+            .await
+            .expect("connect A");
+        let mut client_b = BuzzTestClient::connect(&ws_b, &keys)
+            .await
+            .expect("connect B");
+
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let status_a = format!("online-a-{suffix}");
+        let status_b = format!("away-b-{suffix}");
+        publish_presence(&mut client_a, &keys, &status_a).await;
+        publish_presence(&mut client_b, &keys, &status_b).await;
+
+        // Let Redis writes and the bridge's subsequent read see a stable value.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+
+        let presence_a = query_presence(&http_a, &pubkey_hex).await;
+        assert_eq!(
+            presence_a.len(),
+            1,
+            "A's synthesized presence query returned {} events; expected exactly 1. \
+             contents: {:?}",
+            presence_a.len(),
+            presence_a
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
         );
+        let got_status_a = presence_a[0]["content"].as_str().unwrap_or_default();
+        assert_eq!(
+            got_status_a, status_a,
+            "A's synthesized presence is not A's status — B's status leaked/overwrote it. \
+             got: {got_status_a:?}, expected: {status_a:?}, B status: {status_b:?}"
+        );
+
+        let presence_b = query_presence(&http_b, &pubkey_hex).await;
+        assert_eq!(
+            presence_b.len(),
+            1,
+            "B's synthesized presence query returned {} events; expected exactly 1. \
+             contents: {:?}",
+            presence_b.len(),
+            presence_b
+                .iter()
+                .map(|e| e["content"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        );
+        let got_status_b = presence_b[0]["content"].as_str().unwrap_or_default();
+        assert_eq!(
+            got_status_b, status_b,
+            "B's synthesized presence is not B's status — A's status leaked/overwrote it. \
+             got: {got_status_b:?}, expected: {status_b:?}, A status: {status_a:?}"
+        );
+
+        // Same channel UUID in both communities. This makes `(channel_id, kind)`
+        // identical on both sides; community_id is the only correct fan-out
+        // partition key.
+        let shared_uuid = uuid::Uuid::new_v4();
+        let chan_a = create_open_channel(&http_a, &keys, shared_uuid).await;
+        let chan_b = create_open_channel(&http_b, &keys, shared_uuid).await;
+        assert_eq!(chan_a, chan_b, "channels must share UUID — test design");
+
+        let sub_a = format!("typing-a-{suffix}");
+        let sub_b = format!("typing-b-{suffix}");
+        subscribe_typing(&mut client_a, &sub_a, &chan_a).await;
+        subscribe_typing(&mut client_b, &sub_b, &chan_b).await;
+
+        let content_a = format!("typing from A {suffix}");
+        let content_b = format!("typing from B {suffix}");
+        let _id_a = publish_typing(&mut client_a, &keys, &chan_a, &content_a).await;
+        let _id_b = publish_typing(&mut client_b, &keys, &chan_b, &content_b).await;
+
+        let live_a = drain_live_events(&mut client_a, &sub_a, Duration::from_millis(500)).await;
+        let live_b = drain_live_events(&mut client_b, &sub_b, Duration::from_millis(500)).await;
+        assert_one_content(&live_a, &content_a, &content_b, "A");
+        assert_one_content(&live_b, &content_b, &content_a, "B");
+
+        client_a.disconnect().await.expect("disconnect A");
+        client_b.disconnect().await.expect("disconnect B");
     }
 }
 
