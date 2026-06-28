@@ -209,14 +209,18 @@ CREATE TABLE events (
     --   1059   = KIND_GIFT_WRAP        (NIP-17 ciphertext)
     --   30300  = KIND_EVENT_REMINDER   (AUTHOR_ONLY_KINDS — defense in depth)
     --   30622  = KIND_DM_VISIBILITY    (per-viewer private hide state)
+    --   44100  = KIND_MEMBER_ADDED_NOTIFICATION  (p-gated membership notice)
+    --   44101  = KIND_MEMBER_REMOVED_NOTIFICATION (p-gated membership notice)
     -- NULL tsvector never matches `@@`, so excluded rows are storage-level
     -- unsearchable. Constants kept in `buzz_core::kind` (KIND_GIFT_WRAP,
-    -- KIND_EVENT_REMINDER, KIND_DM_VISIBILITY); inlined here because a sqlx
+    -- KIND_EVENT_REMINDER, KIND_DM_VISIBILITY,
+    -- KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION); inlined
+    -- here because a sqlx
     -- migration is frozen SQL and cannot import the Rust constant. If a new
     -- privacy-sensitive kind is added there, update this list and add a
     -- regression test in `buzz-search/tests/fts_integration.rs`.
     search_tsv  TSVECTOR GENERATED ALWAYS AS (
-        CASE WHEN kind IN (1059, 30300, 30622) THEN NULL::tsvector
+        CASE WHEN kind IN (1059, 30300, 30622, 44100, 44101) THEN NULL::tsvector
              ELSE to_tsvector('simple', content)
         END
     ) STORED,

@@ -6,7 +6,10 @@
 //! migration into it, exercises a scenario, and drops it. Tests are
 //! parallel-safe.
 
-use buzz_core::{kind::AUTHOR_ONLY_KINDS, CommunityId};
+use buzz_core::{
+    kind::{AUTHOR_ONLY_KINDS, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION},
+    CommunityId,
+};
 use buzz_search::{ChannelScope, SearchQuery, SearchService};
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
 use uuid::Uuid;
@@ -798,13 +801,15 @@ async fn very_long_query_is_bounded_before_pg_parse() {
 ///   - 1059  = `KIND_GIFT_WRAP`      (NIP-17 ciphertext)
 ///   - 30300 = `KIND_EVENT_REMINDER` (in `AUTHOR_ONLY_KINDS`)
 ///   - 30622 = `KIND_DM_VISIBILITY`  (per-viewer private hide state)
+///   - 44100 = `KIND_MEMBER_ADDED_NOTIFICATION`  (p-gated membership notice)
+///   - 44101 = `KIND_MEMBER_REMOVED_NOTIFICATION` (p-gated membership notice)
 ///
-/// All four events are inserted with the same unique token in their content
+/// All six events are inserted with the same unique token in their content
 /// so a single search query exercises every kind in one round-trip. Only
-/// the kind:9 control must surface — the three excluded kinds must not.
+/// the kind:9 control must surface — the excluded kinds must not.
 ///
 /// Mutate-bite: drop the `CASE WHEN kind IN (…)` from the generated column
-/// (revert to `to_tsvector('simple', content)`) → all four events surface →
+/// (revert to `to_tsvector('simple', content)`) → excluded events surface →
 /// restore.
 #[tokio::test]
 #[ignore = "requires Postgres"]
@@ -866,6 +871,32 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
     )
     .await;
 
+    // kind:44100 member-added notification — p-gated and MUST NOT be searchable.
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        rand_bytes32(),
+        KIND_MEMBER_ADDED_NOTIFICATION as i32,
+        &format!("member added — {token}"),
+        None,
+        1_700_000_004,
+    )
+    .await;
+
+    // kind:44101 member-removed notification — p-gated and MUST NOT be searchable.
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        rand_bytes32(),
+        KIND_MEMBER_REMOVED_NOTIFICATION as i32,
+        &format!("member removed — {token}"),
+        None,
+        1_700_000_005,
+    )
+    .await;
+
     let svc = SearchService::new(pool.clone());
     let result = svc
         .search(&SearchQuery {
@@ -891,7 +922,13 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
     );
 
     // Negative (load-bearing): each excluded kind MUST NOT surface.
-    for forbidden in [1059, 30300, 30622] {
+    for forbidden in [
+        1059,
+        30300,
+        30622,
+        KIND_MEMBER_ADDED_NOTIFICATION as i32,
+        KIND_MEMBER_REMOVED_NOTIFICATION as i32,
+    ] {
         assert!(
             !kinds.contains(&forbidden),
             "kind:{forbidden} MUST NOT be searchable — \
