@@ -159,8 +159,18 @@ export function ChannelTasksView({
     () => new Map(messages.map((message) => [message.id, message])),
     [messages],
   );
+  const channelTaskMarkers = React.useMemo(() => {
+    const channelId = activeChannel?.id ?? null;
+
+    return (agentConversationMarkers ?? []).filter(
+      (marker) => !channelId || marker.channelId === channelId,
+    );
+  }, [activeChannel?.id, agentConversationMarkers]);
   const canLoadOlderTasks = Boolean(
-    fetchOlder && hasOlderMessages && !isTimelineLoading && messages.length > 0,
+    fetchOlder &&
+      hasOlderMessages &&
+      !isTimelineLoading &&
+      (messages.length > 0 || channelTaskMarkers.length > 0),
   );
   const handleLoadOlderTasks = React.useCallback(() => {
     if (!fetchOlder || isFetchingOlder) {
@@ -199,10 +209,7 @@ export function ChannelTasksView({
   ]);
 
   const taskItems = React.useMemo<ChannelTaskItem[]>(() => {
-    const channelId = activeChannel?.id ?? null;
-
-    return (agentConversationMarkers ?? [])
-      .filter((marker) => !channelId || marker.channelId === channelId)
+    return channelTaskMarkers
       .map((marker) => {
         const message = messageById.get(marker.agentReplyId) ?? null;
         const resolvedThreadMessage =
@@ -230,7 +237,7 @@ export function ChannelTasksView({
             (left.marker.startedAt || left.marker.createdAt) ||
           right.marker.eventId.localeCompare(left.marker.eventId),
       );
-  }, [activeChannel?.id, agentConversationMarkers, messageById]);
+  }, [channelTaskMarkers, messageById]);
   const olderTasksLoader = canLoadOlderTasks ? (
     <div className="flex justify-center px-3 pt-2" ref={loadOlderRef}>
       <Button
