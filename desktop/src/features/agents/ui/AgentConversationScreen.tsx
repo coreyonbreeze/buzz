@@ -431,6 +431,11 @@ export function AgentConversationScreen({
       },
       {
         startedAt: currentConversationMarker?.startedAt ?? null,
+        summary: currentConversationMarker?.summary ?? null,
+        summaryAuthorName: currentConversationMarker?.summaryAuthorName ?? null,
+        summaryAuthorPubkey:
+          currentConversationMarker?.summaryAuthorPubkey ?? null,
+        summaryCreatedAt: currentConversationMarker?.summaryCreatedAt ?? null,
       },
     ).catch((error) => {
       console.warn("[agentConversations] title marker publish failed:", error);
@@ -439,6 +444,10 @@ export function AgentConversationScreen({
     conversation,
     conversationSourceMessages,
     currentConversationMarker?.startedAt,
+    currentConversationMarker?.summary,
+    currentConversationMarker?.summaryAuthorName,
+    currentConversationMarker?.summaryAuthorPubkey,
+    currentConversationMarker?.summaryCreatedAt,
     updateAgentConversationTitle,
   ]);
   React.useEffect(() => {
