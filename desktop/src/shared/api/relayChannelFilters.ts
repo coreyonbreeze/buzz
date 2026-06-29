@@ -97,6 +97,18 @@ export function buildChannelStructuralAuxFilter(
   ]);
 }
 
+export function buildChannelAgentConversationMarkerFilter(
+  channelId: string,
+  referencedEventIds: string[],
+): RelaySubscriptionFilter {
+  return {
+    kinds: [...CHANNEL_TIMELINE_STATE_KINDS],
+    "#h": [channelId],
+    "#e": referencedEventIds,
+    limit: MAX_HISTORICAL_LIMIT,
+  };
+}
+
 /**
  * Reactions-only filter for the message rows the GUI is currently rendering.
  * Keep this separate from structural aux backfill so the slow kind:5 deletion
