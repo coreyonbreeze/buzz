@@ -31,6 +31,7 @@ type UseAgentConversationRouteTargetInput = {
     input: OpenAgentConversationInput,
     options?: { publishMarker?: boolean },
   ) => void;
+  targetBackfillPending: boolean;
   targetAgentConversationReplyId: string | null;
   timelineMessages: readonly TimelineMessage[];
 };
@@ -63,6 +64,7 @@ export function useAgentConversationRouteTarget({
   goChannel,
   messageProfilesReady,
   openAgentConversation,
+  targetBackfillPending,
   targetAgentConversationReplyId,
   timelineMessages,
 }: UseAgentConversationRouteTargetInput) {
@@ -96,6 +98,9 @@ export function useAgentConversationRouteTarget({
         (message) => message.id === targetAgentConversationReplyId,
       ) ?? null;
     if (!sourceMessage) {
+      return;
+    }
+    if (!marker && targetBackfillPending) {
       return;
     }
     if (!marker?.agentPubkey && !agentLookupReady) {
@@ -160,6 +165,7 @@ export function useAgentConversationRouteTarget({
     goChannel,
     messageProfilesReady,
     openAgentConversation,
+    targetBackfillPending,
     targetAgentConversationReplyId,
     timelineMessages,
   ]);
