@@ -189,6 +189,7 @@ export function useAnchoredScroll({
   // jumping to bottom or to the target message for the new view.
   // biome-ignore lint/correctness/useExhaustiveDependencies: resetKey is intentionally the sole trigger — it includes channel identity plus route-specific layout state.
   React.useLayoutEffect(() => {
+    void scrollScopeKey;
     anchorRef.current = { kind: "at-bottom" };
     setIsAtBottom(true);
     setNewMessageCount(0);
@@ -459,6 +460,7 @@ export function useAnchoredScroll({
   // ---------------------------------------------------------------------------
   // biome-ignore lint/correctness/useExhaustiveDependencies: resetKey is a deliberate re-subscription trigger — the effect body reads only the stable refs, but on route identity changes the keyed scroll container remounts and contentRef.current becomes a fresh node, so the observer must disconnect from the previous route's detached node and re-observe the live one.
   React.useEffect(() => {
+    void scrollScopeKey;
     const content = contentRef.current;
     if (!content || typeof ResizeObserver === "undefined") return;
     const observer = new ResizeObserver(() => {
