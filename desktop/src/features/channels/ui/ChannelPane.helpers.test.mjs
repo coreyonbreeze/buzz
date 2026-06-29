@@ -84,6 +84,18 @@ test("DM composer auto-routes only when exactly one other participant is an agen
   assert.deepEqual(
     getDmAutoRouteAgentPubkeys({
       channel: channel({
+        channelType: "dm",
+        participantPubkeys: ["human", "agent-one", "human-two"],
+      }),
+      currentPubkey: "human",
+      knownAgentPubkeys,
+    }),
+    [],
+  );
+
+  assert.deepEqual(
+    getDmAutoRouteAgentPubkeys({
+      channel: channel({
         participantPubkeys: ["human", "agent-one"],
       }),
       currentPubkey: "human",

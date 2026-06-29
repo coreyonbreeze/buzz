@@ -111,14 +111,21 @@ export function getDmAutoRouteAgentPubkeys({
     ? normalizePubkey(currentPubkey)
     : null;
 
-  return singleKnownAgentPubkey(
-    channel.participantPubkeys.filter(
-      (pubkey) =>
-        !normalizedCurrentPubkey ||
-        normalizePubkey(pubkey) !== normalizedCurrentPubkey,
-    ),
-    knownAgentPubkeys,
-  );
+  const otherParticipants = new Map<string, string>();
+  for (const pubkey of channel.participantPubkeys) {
+    const normalized = normalizePubkey(pubkey);
+    if (!normalized || normalized === normalizedCurrentPubkey) {
+      continue;
+    }
+
+    otherParticipants.set(normalized, pubkey);
+  }
+
+  if (otherParticipants.size !== 1) {
+    return [];
+  }
+
+  return singleKnownAgentPubkey(otherParticipants.values(), knownAgentPubkeys);
 }
 
 export function getThreadAutoRouteAgentPubkeys({
