@@ -17,6 +17,10 @@
 # The relay is pointed at the collector via:
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 # (the collector's gRPC port is published to the host).
+#
+# BUZZ_OTEL_OUTPUT_DIR must be set to a per-run directory created by run.sh
+# (via mktemp -d) before docker compose up.  This prevents stale data from a
+# prior run from satisfying the OTLP trace assertions.
 name: buzz
 
 services:
@@ -26,9 +30,10 @@ services:
     command: ["--config=/etc/otelcol-config.yml"]
     volumes:
       - ./test/otel-e2e/otelcol-config.yml:/etc/otelcol-config.yml:ro
-      # Bind-mount to the host so assertions can read the file directly —
-      # the collector image is distroless (no shell/cat available via docker exec).
-      - /tmp/buzz-otel-e2e-output:/tmp/otelcol-output
+      # Per-run bind-mount set by run.sh (BUZZ_OTEL_OUTPUT_DIR=$(mktemp -d)).
+      # The collector image is distroless — no shell available via docker exec,
+      # so assertions read from the host path directly.
+      - ${BUZZ_OTEL_OUTPUT_DIR}:/tmp/otelcol-output
     ports:
       # OTLP gRPC — relay (on host) dials this
       - "4317:4317"

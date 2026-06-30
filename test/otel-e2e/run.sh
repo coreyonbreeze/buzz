@@ -8,10 +8,13 @@
 #   (a) Prometheus /metrics contains expected buzz_* series with non-zero
 #       values and does NOT contain a target_info series.
 #   (b) OTLP traces: the collector received ws.auth and ws.event spans
-#       carrying a conn_id attribute tagged service.name=buzz-relay.
-#   (c) OTLP metrics: the collector received data tagged service.name=buzz-relay.
+#       carrying a conn_id attribute; service.name=buzz-relay verified
+#       structurally via resource.attributes (not substring).
 #   (d) OTLP-disabled control: with OTEL_EXPORTER_OTLP_ENDPOINT unset the
 #       relay still serves /metrics; the collector receives nothing.
+#
+# Note: OTLP metrics export is out of scope — relay emits metrics via the
+# Prometheus :9102 scrape only; OTLP carries traces only.
 #
 # Usage:
 #   just otel-e2e        # canonical one-command entry point
@@ -72,6 +75,7 @@ cleanup() {
   fi
   # Bring down compose stack (including collector) and remove volumes.
   cd "${REPO_ROOT}"
+  BUZZ_OTEL_OUTPUT_DIR="${BUZZ_OTEL_OUTPUT_DIR:-/tmp/buzz-otel-e2e-missing}" \
   docker compose -f docker-compose.yml -f test/otel-e2e/compose.otel-e2e.yml \
     down -v --remove-orphans 2>/dev/null || true
   ok "Teardown complete"
@@ -80,6 +84,14 @@ trap cleanup EXIT
 
 # ── Step 1: Start backing services + otel-collector ──────────────────────────
 cd "${REPO_ROOT}"
+
+# Create a per-run isolated collector output dir so stale data from a prior run
+# can never satisfy the OTLP trace assertions.  Cleaned on success; preserved on
+# failure so the output is inspectable.
+BUZZ_OTEL_OUTPUT_DIR=$(mktemp -d)
+export BUZZ_OTEL_OUTPUT_DIR
+log "Collector output dir: ${BUZZ_OTEL_OUTPUT_DIR}"
+COLLECTOR_OUTPUT_HOST="${BUZZ_OTEL_OUTPUT_DIR}/telemetry.json"
 
 log "Starting backing services and otel-collector..."
 docker compose -f docker-compose.yml -f test/otel-e2e/compose.otel-e2e.yml \
@@ -161,12 +173,10 @@ else
 fi
 
 # ── Step 4: Set up collector output readback ─────────────────────────────────
-# The file exporter writes to /tmp/otelcol-output inside the collector container,
-# which is bind-mounted to /tmp/buzz-otel-e2e-output on the host (see compose overlay).
-# The collector image is distroless so we read directly from the host path.
-COLLECTOR_OUTPUT_DIR=/tmp/buzz-otel-e2e-output
-mkdir -p "${COLLECTOR_OUTPUT_DIR}"
-COLLECTOR_OUTPUT_HOST="${COLLECTOR_OUTPUT_DIR}/telemetry.json"
+# COLLECTOR_OUTPUT_HOST is already set to ${BUZZ_OTEL_OUTPUT_DIR}/telemetry.json
+# from Step 1 (per-run mktemp -d).  The file exporter writes
+# /tmp/otelcol-output/telemetry.json inside the container, which maps to that
+# host path via the compose bind-mount.
 
 # ── Step 5: Start relay WITH OTLP enabled ────────────────────────────────────
 log "Starting relay (OTLP enabled → http://localhost:4317)..."
@@ -180,7 +190,6 @@ nohup env \
   BUZZ_REQUIRE_AUTH_TOKEN=false \
   BUZZ_RECONCILE_CHANNELS=true \
   OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317" \
-  OTEL_SERVICE_NAME="buzz-relay" \
   RUST_LOG="buzz_relay=info" \
   "${RELAY_BIN}" > "${RELAY_LOG}" 2>&1 &
 RELAY_PID=$!
@@ -206,14 +215,14 @@ for attempt in $(seq 1 60); do
   fi
 done
 
-# ── Step 6: Run OTLP-enabled tests (a), (b), (c) ────────────────────────────
+# ── Step 6: Run OTLP-enabled tests (a), (b) ─────────────────────────────────
 log "Waiting for OTLP exports to flush (batch processor 1s timeout + buffer)..."
 sleep 5  # Give the relay's batch exporter time to flush after readiness
 
 COLLECTOR_LINE_COUNT=$(wc -l < "${COLLECTOR_OUTPUT_HOST}" 2>/dev/null || echo 0)
-log "Collector has ${COLLECTOR_LINE_COUNT} lines so far (may be low — OTLP metrics are periodic)"
+log "Collector has ${COLLECTOR_LINE_COUNT} lines so far"
 
-log "Running OTLP-enabled tests (a)(b)(c)..."
+log "Running OTLP-enabled tests (a)(b)..."
 RELAY_URL="ws://localhost:3000" \
 METRICS_URL="http://localhost:9102/metrics" \
 OTEL_COLLECTOR_OUTPUT="${COLLECTOR_OUTPUT_HOST}" \
@@ -229,7 +238,7 @@ RELAY_URL="ws://localhost:3000" \
 METRICS_URL="http://localhost:9102/metrics" \
 OTEL_COLLECTOR_OUTPUT="${COLLECTOR_OUTPUT_HOST}" \
   cargo test -p buzz-test-client --test e2e_otel \
-    test_otlp \
+    test_otlp_traces \
     -- --ignored 2>&1
 ok "OTLP-enabled assertions passed"
 
@@ -327,6 +336,9 @@ if [[ -n "${DISABLED_OUTPUT}" ]]; then
 fi
 ok "OTLP-disabled: collector received nothing ✓"
 
+# Clean up the per-run collector output dir on success.
+rm -rf "${BUZZ_OTEL_OUTPUT_DIR}"
+
 # ── Done ──────────────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -334,7 +346,7 @@ echo -e "${GREEN}║  OTEL E2E HARNESS — ALL ASSERTIONS PASSED                
 echo -e "${GREEN}╠══════════════════════════════════════════════════════════╣${NC}"
 echo -e "${GREEN}║  (a) Prometheus buzz_* series present, non-zero, no      ║${NC}"
 echo -e "${GREEN}║      target_info                                          ║${NC}"
-echo -e "${GREEN}║  (b) OTLP traces: ws.auth + ws.event with conn_id        ║${NC}"
-echo -e "${GREEN}║  (c) OTLP metrics: service.name=buzz-relay present       ║${NC}"
+echo -e "${GREEN}║  (b) OTLP traces: ws.auth + ws.event with conn_id,       ║${NC}"
+echo -e "${GREEN}║      service.name=buzz-relay verified structurally        ║${NC}"
 echo -e "${GREEN}║  (d) OTLP-disabled: /metrics works, collector silent     ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════════════╝${NC}"

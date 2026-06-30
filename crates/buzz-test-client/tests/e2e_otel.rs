@@ -1,32 +1,21 @@
 //! OTEL export surface E2E tests for the Buzz relay.
 //!
-//! Verifies both export surfaces introduced in PR #1398:
+//! Verifies both export surfaces:
 //!
 //!  1. **Prometheus scrape** — `GET :9102/metrics` contains expected `buzz_*`
 //!     series with non-zero values and does NOT contain `target_info`.
 //!  2. **OTLP traces** — the otel-collector received spans named `ws.auth` and
-//!     `ws.event` carrying a `conn_id` attribute and `service.name=buzz-relay`.
-//!  3. **OTLP metrics** — the collector received OTLP metric data tagged with
-//!     resource attribute `service.name=buzz-relay`.
-//!  4. **OTLP-disabled control** — when `OTEL_EXPORTER_OTLP_ENDPOINT` is not
-//!     set the relay still serves `/metrics` correctly; the test verifies the
-//!     Prometheus surface without an OTLP endpoint.
+//!     `ws.event` carrying a `conn_id` attribute, with resource attribute
+//!     `service.name=buzz-relay` verified structurally (not substring).
+//!  3. **OTLP-disabled control** — when `OTEL_EXPORTER_OTLP_ENDPOINT` is not
+//!     set the relay still serves `/metrics` correctly.
 //!
 //! # Running
 //!
-//! These tests are `#[ignore]` by default; they require a running relay + the
-//! otel-collector compose overlay.  Use the `just otel-e2e` target, which boots
-//! everything and runs them, or manually:
-//!
-//! ```text
-//! # boot the stack (relay on host):
-//! ./test/otel-e2e/run.sh
-//!
-//! # run just these tests:
-//! RELAY_URL=ws://localhost:3000 \
-//! OTEL_COLLECTOR_OUTPUT=/path/to/telemetry.json \
-//! cargo test -p buzz-test-client --test e2e_otel -- --ignored
-//! ```
+//! These tests are `#[ignore]` by default.  They are **harness internals** —
+//! they depend on the two-relay sequence orchestrated by `run.sh` and must not
+//! be run in isolation.  Use the `just otel-e2e` target, which boots everything
+//! and invokes the tests in order.
 //!
 //! Environment variables:
 //!
@@ -79,6 +68,42 @@ fn read_collector_output() -> Vec<Value> {
         .filter(|l| !l.trim().is_empty())
         .filter_map(|l| serde_json::from_str::<Value>(l).ok())
         .collect()
+}
+
+/// Check whether any `ResourceSpans` record in the collector output contains a
+/// resource attribute with the given key and string value.
+///
+/// The OTLP JSON file-exporter format nests attributes as:
+/// `resourceSpans[].resource.attributes[]{key, value.stringValue}`.
+fn has_resource_attr_in_spans(records: &[Value], key: &str, value: &str) -> bool {
+    for record in records {
+        if let Some(spans_arr) = record.get("resourceSpans").and_then(|v| v.as_array()) {
+            for rs in spans_arr {
+                if resource_has_attr(rs, key, value) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns true if the `resource.attributes` array in `record` contains an
+/// entry with the given key and string value.
+fn resource_has_attr(record: &Value, key: &str, value: &str) -> bool {
+    let attrs = record
+        .get("resource")
+        .and_then(|r| r.get("attributes"))
+        .and_then(|a| a.as_array());
+    let Some(attrs) = attrs else { return false };
+    attrs.iter().any(|attr| {
+        attr.get("key").and_then(|k| k.as_str()) == Some(key)
+            && attr
+                .get("value")
+                .and_then(|v| v.get("stringValue"))
+                .and_then(|s| s.as_str())
+                == Some(value)
+    })
 }
 
 // ── test: Prometheus surface ──────────────────────────────────────────────────
@@ -152,7 +177,9 @@ async fn test_prometheus_contains_buzz_metrics_with_nonzero_values() {
 // ── test: OTLP traces ─────────────────────────────────────────────────────────
 
 /// Asserts the otel-collector received ws.auth and ws.event spans carrying
-/// conn_id attributes, tagged service.name=buzz-relay.
+/// conn_id attributes, and that the OTLP resource attribute `service.name` is
+/// structurally set to `buzz-relay` (not a substring match — the relay must
+/// default it without `OTEL_SERVICE_NAME` being set, matching staging).
 ///
 /// Reads from OTEL_COLLECTOR_OUTPUT (populated by run.sh after traffic was
 /// driven by the Prometheus test and the batch exporter flushed).
@@ -188,39 +215,18 @@ async fn test_otlp_traces_contain_ws_spans_with_conn_id() {
         "expected conn_id attribute in span data"
     );
 
-    // (b4) service.name=buzz-relay must appear in resource attributes.
+    // (b4) service.name=buzz-relay must appear as a resource attribute on
+    // ResourceSpans — checked structurally so a span/scope name that happens to
+    // contain "buzz-relay" cannot satisfy this assertion.
     assert!(
-        blob.contains("\"buzz-relay\""),
-        "expected service.name=buzz-relay in collector output"
+        has_resource_attr_in_spans(&records, "service.name", "buzz-relay"),
+        "expected resource attribute service.name=buzz-relay in ResourceSpans.\n\
+         The relay must default this without OTEL_SERVICE_NAME being set (staging shape).\n\
+         Check collector output: {}",
+        collector_output_path()
     );
 
-    println!("✓ OTLP traces: ws.auth + ws.event spans present, conn_id + service.name verified");
-}
-
-// ── test: OTLP metrics ────────────────────────────────────────────────────────
-
-/// Asserts the otel-collector received OTLP metric data tagged
-/// service.name=buzz-relay.
-///
-/// Reads from OTEL_COLLECTOR_OUTPUT (populated by run.sh).
-#[tokio::test]
-#[ignore]
-async fn test_otlp_metrics_tagged_service_name_buzz_relay() {
-    let records = read_collector_output();
-    let blob = serde_json::to_string(&records).expect("re-serialize collector output");
-
-    // (c) service.name=buzz-relay must appear somewhere in the recorded data
-    // (either in ResourceSpans or ResourceMetrics resource attributes).
-    assert!(
-        !records.is_empty(),
-        "collector output is empty — OTLP export did not reach the collector"
-    );
-    assert!(
-        blob.contains("\"buzz-relay\""),
-        "expected service.name=buzz-relay in OTLP data from collector"
-    );
-
-    println!("✓ OTLP metrics: service.name=buzz-relay present in collector output");
+    println!("✓ OTLP traces: ws.auth + ws.event spans present, conn_id + service.name verified structurally");
 }
 
 // ── test: OTLP-disabled control ───────────────────────────────────────────────
