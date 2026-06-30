@@ -99,6 +99,27 @@ test("long autolink wraps without widening the timeline", async ({ page }) => {
     .toBe("visible");
 });
 
+test("supported link previews keep the message link visible", async ({
+  page,
+}) => {
+  const previewUrl = "https://github.com/block/sprout/pull/1334";
+
+  await page.goto("/");
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("general");
+
+  await page.getByTestId("message-input").fill(previewUrl);
+  await page.getByTestId("send-message").click();
+
+  const row = page.getByTestId("message-row").last();
+  await expect(
+    row.getByRole("link", { exact: true, name: previewUrl }),
+  ).toBeVisible();
+  await expect(
+    row.locator('[data-link-preview="github-pull-request"]'),
+  ).toBeVisible();
+});
+
 test("send multiple messages in sequence", async ({ page }) => {
   const ts = Date.now();
   const messages = [
@@ -612,7 +633,7 @@ test("opens a single-level thread panel with inline expansion", async ({
     )
     .toBe(rootSummaryWidthBeforeHover);
 
-  await threadPanel.getByTestId("message-thread-close").click();
+  await threadPanel.getByTestId("auxiliary-panel-close").click();
   await expect(threadPanel).toBeHidden();
 
   await rootSummaryRow.click();
@@ -764,7 +785,7 @@ test("thread panel width uses session storage and reset handle", async ({
     })
     .toBe(defaultWidthPx);
 
-  await threadPanel.getByTestId("message-thread-close").click();
+  await threadPanel.getByTestId("auxiliary-panel-close").click();
   await expect(threadPanel).toBeHidden();
 
   await rootMessage.hover();

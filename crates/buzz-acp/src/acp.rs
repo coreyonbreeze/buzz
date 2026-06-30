@@ -522,6 +522,25 @@ impl AcpClient {
         self.steer_rx = Some(rx);
     }
 
+    /// Clear any installed steer receiver without consuming it.
+    ///
+    /// Called by `send_prompt_result` on every exit path of `run_prompt_task`
+    /// so that `install_steer_rx`'s `is_none()` invariant holds for the next
+    /// dispatch even when the turn ended before the read loop ran `take()`.
+    /// Idempotent — safe to call when `steer_rx` is already `None`.
+    pub fn clear_steer_rx(&mut self) {
+        self.steer_rx = None;
+    }
+
+    /// Returns `true` if no steer receiver is currently installed.
+    ///
+    /// Test-only: used by `pool` tests to assert the post-return invariant
+    /// without exposing the private field directly.
+    #[cfg(test)]
+    pub fn steer_rx_is_none(&self) -> bool {
+        self.steer_rx.is_none()
+    }
+
     /// Cancel a turn cleanly, handling any pending permission request first.
     ///
     /// Steps:
@@ -1535,6 +1554,43 @@ pub fn resolve_model_switch_method(
     None
 }
 
+/// Whether `desired_model` appears in pre-extracted catalog halves.
+///
+/// Mirrors [`resolve_model_switch_method`]'s match, but operates on the
+/// already-extracted `configOptions` (model category) and `models` state that
+/// [`AgentModelCapabilities`](crate::pool::AgentModelCapabilities) caches — the
+/// idle-path pre-cancel guard has those halves, not the full `session/new` JSON.
+pub fn model_in_catalog(
+    config_options: &[serde_json::Value],
+    available_models: Option<&serde_json::Value>,
+    desired_model: &str,
+) -> bool {
+    let in_config_options = config_options.iter().any(|config_opt| {
+        config_opt
+            .get("options")
+            .and_then(|v| v.as_array())
+            .is_some_and(|options| {
+                options
+                    .iter()
+                    .any(|opt| opt.get("value").and_then(|v| v.as_str()) == Some(desired_model))
+            })
+    });
+    if in_config_options {
+        return true;
+    }
+
+    available_models
+        .and_then(|models| models.get("availableModels"))
+        .and_then(|v| v.as_array())
+        .is_some_and(|available| {
+            available
+                .iter()
+                .any(|model| model.get("modelId").and_then(|v| v.as_str()) == Some(desired_model))
+        })
+}
+
+// ─── Drop: kill child process ─────────────────────────────────────────────────
+
 impl Drop for AcpClient {
     fn drop(&mut self) {
         // Best-effort SIGKILL + reap. We cannot `await` in Drop (sync context).
@@ -2086,6 +2142,60 @@ mod tests {
             })
         );
     }
+
+    // ── model_in_catalog tests ────────────────────────────────────────────
+
+    #[test]
+    fn model_in_catalog_true_when_in_config_options() {
+        let config_options = vec![serde_json::json!({
+            "configId": "model",
+            "category": "model",
+            "options": [
+                { "value": "claude-sonnet-4-20250514" },
+                { "value": "claude-opus-4-20250514" }
+            ]
+        })];
+        assert!(super::model_in_catalog(
+            &config_options,
+            None,
+            "claude-opus-4-20250514"
+        ));
+    }
+
+    #[test]
+    fn model_in_catalog_true_when_in_available_models() {
+        let available = serde_json::json!({
+            "currentModelId": "gpt-5",
+            "availableModels": [
+                { "modelId": "gpt-5" },
+                { "modelId": "o3-pro" }
+            ]
+        });
+        assert!(super::model_in_catalog(&[], Some(&available), "o3-pro"));
+    }
+
+    #[test]
+    fn model_in_catalog_false_when_absent_from_both_halves() {
+        let config_options = vec![serde_json::json!({
+            "configId": "model",
+            "options": [{ "value": "claude-sonnet-4-20250514" }]
+        })];
+        let available = serde_json::json!({
+            "availableModels": [{ "modelId": "gpt-5" }]
+        });
+        assert!(!super::model_in_catalog(
+            &config_options,
+            Some(&available),
+            "nonexistent-model"
+        ));
+    }
+
+    #[test]
+    fn model_in_catalog_false_when_both_halves_empty() {
+        assert!(!super::model_in_catalog(&[], None, "anything"));
+    }
+
+    // ── Error variant display ─────────────────────────────────────────────
 
     #[test]
     fn idle_timeout_error_includes_duration() {
