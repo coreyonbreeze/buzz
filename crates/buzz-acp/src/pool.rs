@@ -1829,7 +1829,14 @@ async fn fetch_conversation_context(
     let last_event = batch.events.last()?;
     let tags = crate::queue::parse_thread_tags(&last_event.event);
     if let Some(root_id) = tags.root_event_id {
-        return fetch_thread_context(batch.channel_id, &root_id, limit, &ctx.rest_client).await;
+        return fetch_thread_context(
+            batch.channel_id,
+            &root_id,
+            tags.agent_reply_event_id.as_deref(),
+            limit,
+            &ctx.rest_client,
+        )
+        .await;
     }
 
     // DM non-reply: fetch recent conversation history.
@@ -1994,16 +2001,14 @@ async fn fetch_prompt_profile_lookup(
 async fn fetch_thread_context(
     channel_id: Uuid,
     root_event_id: &str,
+    agent_reply_event_id: Option<&str>,
     limit: u32,
     rest: &RestClient,
 ) -> Option<ConversationContext> {
     use nostr::{Alphabet, SingleLetterTag};
 
     // Defense-in-depth: validate hex event ID.
-    if root_event_id.is_empty()
-        || root_event_id.len() != 64
-        || !root_event_id.chars().all(|c| c.is_ascii_hexdigit())
-    {
+    if !is_valid_event_id_hex(root_event_id) {
         tracing::warn!(
             channel_id = %channel_id,
             "invalid root_event_id (expected 64 hex chars) — skipping thread context fetch"
@@ -2015,7 +2020,7 @@ async fn fetch_thread_context(
     let h_tag = SingleLetterTag::lowercase(Alphabet::H);
     let ch_str = channel_id.to_string();
 
-    // Two filters: (1) root event by ID, (2) replies with #e=root + #h=channel.
+    // Base filters: (1) root event by ID, (2) replies with #e=root + #h=channel.
     let root_filter = nostr::Filter::new().id(nostr::EventId::from_hex(root_event_id).ok()?);
     let replies_filter = nostr::Filter::new()
         .kinds([
@@ -2025,14 +2030,27 @@ async fn fetch_thread_context(
         .custom_tags(e_tag, [root_event_id])
         .custom_tags(h_tag, [ch_str.as_str()])
         .limit(limit as usize);
+    let mut filters = vec![root_filter, replies_filter];
+
+    if let Some(agent_reply_event_id) = agent_reply_event_id {
+        if is_valid_event_id_hex(agent_reply_event_id) && agent_reply_event_id != root_event_id {
+            if let Ok(event_id) = nostr::EventId::from_hex(agent_reply_event_id) {
+                // A selected task anchor may be outside the bounded prompt
+                // window. Fetch it independently, but require the same
+                // channel and thread root so forged client tags cannot route
+                // replies into a different conversation.
+                filters.push(
+                    nostr::Filter::new()
+                        .id(event_id)
+                        .custom_tags(e_tag, [root_event_id])
+                        .custom_tags(h_tag, [ch_str.as_str()]),
+                );
+            }
+        }
+    }
 
     fetch_with_retry(|| async {
-        match timeout(
-            CONTEXT_FETCH_TIMEOUT,
-            rest.query(&[root_filter.clone(), replies_filter.clone()]),
-        )
-        .await
-        {
+        match timeout(CONTEXT_FETCH_TIMEOUT, rest.query(&filters)).await {
             Ok(Ok(json)) => parse_nostr_thread_response(json, root_event_id),
             Ok(Err(e)) => {
                 tracing::warn!(
@@ -2053,6 +2071,10 @@ async fn fetch_thread_context(
         }
     })
     .await
+}
+
+fn is_valid_event_id_hex(event_id: &str) -> bool {
+    event_id.len() == 64 && event_id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Fetch DM context via Nostr query: recent messages in channel by `#h` tag.
@@ -2220,13 +2242,16 @@ fn parse_nostr_thread_response(
     let events = json.as_array()?;
     let mut root_msg = None;
     let mut reply_msgs = Vec::new();
+    let mut seen_reply_ids = HashSet::new();
 
     for ev in events {
         let ev_id = ev.get("id").and_then(|v| v.as_str()).unwrap_or("");
         if let Some(msg) = json_to_context_message(ev) {
             if ev_id == root_event_id {
                 root_msg = Some(msg);
-            } else {
+            } else if event_references_thread_root(ev, root_event_id)
+                && seen_reply_ids.insert(ev_id.to_string())
+            {
                 reply_msgs.push((
                     ev.get("created_at").and_then(|v| v.as_u64()).unwrap_or(0),
                     msg,
@@ -2254,6 +2279,19 @@ fn parse_nostr_thread_response(
         total,
         truncated: false, // query returns all within limit
     })
+}
+
+fn event_references_thread_root(ev: &serde_json::Value, root_event_id: &str) -> bool {
+    ev.get("tags")
+        .and_then(|tags| tags.as_array())
+        .is_some_and(|tags| {
+            tags.iter().any(|tag| {
+                tag.as_array().is_some_and(|parts| {
+                    parts.first().and_then(|part| part.as_str()) == Some("e")
+                        && parts.get(1).and_then(|part| part.as_str()) == Some(root_event_id)
+                })
+            })
+        })
 }
 
 /// Parse a Nostr query response (array of events) into DM context.
@@ -2656,6 +2694,81 @@ mod tests {
         // Malformed JSON — no root, no replies key.
         let json = json!({ "something": "else" });
         assert!(parse_thread_response(json).is_none());
+    }
+
+    #[test]
+    fn test_parse_nostr_thread_response_keeps_independently_fetched_anchor() {
+        let root_id = "a".repeat(64);
+        let reply_id = "b".repeat(64);
+        let anchor_id = "c".repeat(64);
+        let json = json!([
+            {
+                "id": anchor_id.clone(),
+                "pubkey": "agent",
+                "content": "selected task anchor",
+                "created_at": 1710518520_u64,
+                "tags": [["e", root_id.clone(), "", "reply"]]
+            },
+            {
+                "id": root_id.clone(),
+                "pubkey": "human",
+                "content": "root message",
+                "created_at": 1710518400_u64,
+                "tags": []
+            },
+            {
+                "id": reply_id.clone(),
+                "pubkey": "agent",
+                "content": "visible reply",
+                "created_at": 1710518460_u64,
+                "tags": [["e", root_id.clone(), "", "reply"]]
+            }
+        ]);
+
+        let ctx = parse_nostr_thread_response(json, &root_id).expect("should parse");
+
+        match ctx {
+            ConversationContext::Thread { messages, .. } => {
+                assert_eq!(messages.len(), 3);
+                assert_eq!(messages[0].content, "root message");
+                assert_eq!(messages[1].content, "visible reply");
+                assert_eq!(messages[2].content, "selected task anchor");
+            }
+            _ => panic!("expected Thread context"),
+        }
+    }
+
+    #[test]
+    fn test_parse_nostr_thread_response_rejects_wrong_root_anchor() {
+        let root_id = "a".repeat(64);
+        let forged_anchor_id = "c".repeat(64);
+        let other_root_id = "d".repeat(64);
+        let json = json!([
+            {
+                "id": root_id.clone(),
+                "pubkey": "human",
+                "content": "root message",
+                "created_at": 1710518400_u64,
+                "tags": []
+            },
+            {
+                "id": forged_anchor_id.clone(),
+                "pubkey": "agent",
+                "content": "wrong thread",
+                "created_at": 1710518520_u64,
+                "tags": [["e", other_root_id.clone(), "", "reply"]]
+            }
+        ]);
+
+        let ctx = parse_nostr_thread_response(json, &root_id).expect("should parse");
+
+        match ctx {
+            ConversationContext::Thread { messages, .. } => {
+                assert_eq!(messages.len(), 1);
+                assert_eq!(messages[0].content, "root message");
+            }
+            _ => panic!("expected Thread context"),
+        }
     }
 
     #[test]

@@ -29,6 +29,7 @@ import {
 } from "@/features/messages/lib/formatTimelineMessages";
 import {
   buildKnownAgentParticipants,
+  buildAgentConversationTypingScopeIds,
   collectTimelineMessageAuthorPubkeys,
   flattenConversationMessages,
   formatAgentMentionList,
@@ -292,6 +293,14 @@ export function AgentConversationScreen({
       ),
     [conversationAgentPubkeys],
   );
+  const typingScopeIds = React.useMemo(
+    () =>
+      buildAgentConversationTypingScopeIds(
+        conversation,
+        conversationSourceMessages,
+      ),
+    [conversation, conversationSourceMessages],
+  );
   const typingAgentPubkeys = React.useMemo(() => {
     const latestMessage = timelineMessages[timelineMessages.length - 1] ?? null;
     const latestMessagePubkey = latestMessage?.pubkey
@@ -301,7 +310,8 @@ export function AgentConversationScreen({
     for (const entry of typingEntries) {
       const normalized = normalizePubkey(entry.pubkey);
       if (
-        entry.threadHeadId !== conversation.threadRootId ||
+        entry.threadHeadId == null ||
+        !typingScopeIds.has(entry.threadHeadId) ||
         !agentPubkeys.has(normalized) ||
         latestMessagePubkey === normalized ||
         pubkeys.some((pubkey) => normalizePubkey(pubkey) === normalized)
@@ -316,10 +326,10 @@ export function AgentConversationScreen({
 
     return pubkeys;
   }, [
-    conversation.threadRootId,
     agentPubkeys,
     knownAgentParticipants,
     timelineMessages,
+    typingScopeIds,
     typingEntries,
   ]);
   const agentParticipants = React.useMemo<AgentConversationParticipant[]>(

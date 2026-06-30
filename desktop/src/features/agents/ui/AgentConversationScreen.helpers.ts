@@ -43,6 +43,22 @@ export function flattenConversationMessages(messages: TimelineMessage[]) {
   }));
 }
 
+export function buildAgentConversationTypingScopeIds(
+  conversation: AgentConversation,
+  messages: readonly TimelineMessage[],
+) {
+  const ids = new Set<string>([
+    conversation.threadRootId,
+    conversation.agentReply.id,
+  ]);
+
+  for (const message of messages) {
+    ids.add(message.id);
+  }
+
+  return ids;
+}
+
 function getAgentParticipantPreview(
   participants: readonly AgentConversationParticipant[],
 ) {

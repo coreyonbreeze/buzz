@@ -13,7 +13,10 @@ import {
   readPersistedAgentConversations,
   writePersistedAgentConversations,
 } from "./agentConversations.ts";
-import { isConversationMessage } from "./ui/AgentConversationScreen.helpers.ts";
+import {
+  buildAgentConversationTypingScopeIds,
+  isConversationMessage,
+} from "./ui/AgentConversationScreen.helpers.ts";
 
 function message({ body, createdAt, id, pubkey = "human" }) {
   return {
@@ -60,6 +63,45 @@ test("continued conversation title condenses a refined Buzz data thread", () => 
     status: "resolved",
     title: "Data in Buzz app",
   });
+});
+
+test("continued conversation typing scope includes selected task messages", () => {
+  const root = message({
+    body: "Can you check the buttons?",
+    createdAt: 1,
+    id: "root",
+  });
+  const agentReply = message({
+    body: "I'll look.",
+    createdAt: 2,
+    id: "agent-reply",
+    pubkey: "agent",
+  });
+  const taskFollowUp = message({
+    body: "Can you include composer buttons?",
+    createdAt: 3,
+    id: "task-follow-up",
+  });
+  const conversation = buildAgentConversation({
+    agentName: "Fizz",
+    agentPubkey: "agent",
+    agentReply,
+    channel: { id: "channel", name: "design" },
+    contextMessages: [root, agentReply, taskFollowUp],
+    parentMessage: root,
+    threadRootMessage: root,
+  });
+
+  const scopeIds = buildAgentConversationTypingScopeIds(conversation, [
+    root,
+    agentReply,
+    taskFollowUp,
+  ]);
+
+  assert.equal(scopeIds.has("root"), true);
+  assert.equal(scopeIds.has("agent-reply"), true);
+  assert.equal(scopeIds.has("task-follow-up"), true);
+  assert.equal(scopeIds.has("other-thread-message"), false);
 });
 
 test("continued conversation auto-routes only a single messageable agent", () => {
