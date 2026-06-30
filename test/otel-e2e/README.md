@@ -93,7 +93,7 @@ The Rust assertions live in:
 crates/buzz-test-client/tests/e2e_otel.rs
 ```
 
-All four tests are `#[ignore]` by default and selected by `run.sh`.
+All three tests are `#[ignore]` by default and selected by `run.sh`.
 
 ## Running individual tests manually
 

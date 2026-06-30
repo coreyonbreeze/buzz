@@ -252,7 +252,7 @@ test-integration:
     ./scripts/run-tests.sh integration
 
 # OTEL export E2E: boots relay + otel-collector, drives WS traffic, asserts
-# Prometheus scrape + OTLP traces/metrics + disabled-path control.
+# Prometheus scrape + OTLP traces + disabled-path control.
 # Requires Docker. See test/otel-e2e/README.md for details.
 otel-e2e *ARGS:
     ./test/otel-e2e/run.sh {{ARGS}}
