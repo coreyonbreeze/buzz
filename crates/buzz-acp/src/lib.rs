@@ -1147,6 +1147,12 @@ async fn tokio_main() -> Result<()> {
         .map_err(|e| anyhow::anyhow!("membership notification subscribe error: {e}"))?;
     tracing::info!("subscribed to membership notifications");
 
+    relay
+        .subscribe_dream_signals()
+        .await
+        .map_err(|e| anyhow::anyhow!("dream signal subscribe error: {e}"))?;
+    tracing::info!("subscribed to dream-due signals");
+
     let presence_publisher = relay.event_publisher();
     let presence_keys = config.keys.clone();
     if config.presence_enabled {

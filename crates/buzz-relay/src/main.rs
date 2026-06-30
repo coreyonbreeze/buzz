@@ -645,15 +645,9 @@ async fn main() -> anyhow::Result<()> {
     //
     // Idle gate: absence of a live presence key in Redis. An agent that has not
     // published a kind:20001 presence heartbeat within the PRESENCE_TTL_SECS
-    // window (90 s) is considered idle — safe to signal for consolidation.
-    //
-    // Staleness ceiling (Thufir's note): to guard against a stuck instance
-    // that never publishes presence (and thus looks perpetually idle), we
-    // consider an agent idle only when `last_active_secs > 2 × sweep_interval`.
-    // Because presence TTL is 90 s and the default sweep is 300 s, the
-    // "no presence = idle" check already satisfies this ceiling — a presence
-    // key that expired > 90 s ago implies the agent has been silent for at
-    // least 90 s > 2 × 30 s effective heartbeat gap.
+    // window (90 s) is considered idle. See `agent_is_idle()` for why the
+    // relay-side gate is intentionally coarse — agent-side guards (`maybe_dispatch_dream()`
+    // eligibility, dream preemptibility) are the real over-fire protection.
     if config.dream_memory_budget_bytes > 0 {
         if let Some(community_id) = deployment_community {
             let dream_state = Arc::clone(&state);
@@ -716,8 +710,7 @@ async fn main() -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            Ok(Some(_)) => false, // agent has live presence — busy
-                            Ok(None) => true,     // no presence entry — idle
+                            Ok(presence) => agent_is_idle(presence.as_deref()),
                             Err(e) => {
                                 warn!(%community_id, pubkey = %pubkey_hex, "Dream sweep: presence check failed: {e}");
                                 continue;
@@ -735,9 +728,9 @@ async fn main() -> anyhow::Result<()> {
                         }
 
                         // Build a KIND_DREAM_DUE ephemeral event addressed to this agent.
-                        // Signed by the relay keypair; tagged with #p so the agent's
-                        // membership subscription (which filters `#p=[agent_pubkey_hex]`)
-                        // picks it up.
+                        // Signed by the relay keypair; tagged with #p so the ACP
+                        // dream-signal subscription (DREAM_SIGNAL_SUB_ID, kinds:
+                        // [KIND_DREAM_DUE], #p=[agent_pubkey]) delivers it.
                         let event = match nostr::EventBuilder::new(
                             nostr::Kind::Custom(buzz_core::kind::KIND_DREAM_DUE as u16),
                             "",
@@ -998,9 +991,37 @@ fn reminder_to_event(reminder: &buzz_db::event::DueReminder) -> nostr::Event {
     serde_json::from_value(event_json).expect("valid event JSON from DB row")
 }
 
+/// Idle gate for the dream sweep.
+///
+/// Returns `true` when `presence` is `None` — meaning the agent has no live
+/// presence key in Redis (the key is set with a 90 s TTL and refreshed on every
+/// 30 s heartbeat; absence means the agent has been silent for at least 90 s).
+///
+/// This is an intentionally coarse pre-filter. The relay-side idle gate is
+/// best-effort: it avoids signaling agents that are clearly busy (live heartbeat),
+/// but it is not the authoritative "safe to consolidate" decision. The real
+/// over-fire protection is agent-side:
+///
+/// - `maybe_dispatch_dream()` only dispatches when the harness is genuinely
+///   idle: no flushable queue work, no heartbeat in flight, an idle agent
+///   available in the pool.
+/// - Dream runs at lowest priority and is preemptible — any inbound work
+///   cancels it via `ControlSignal::Cancel`.
+///
+/// A false "idle" from the relay (e.g., a live agent whose presence expired)
+/// costs nothing: the agent either ignores the signal or runs a preemptible
+/// low-priority consolidation turn. Coarseness here is by design.
+///
+/// Note: no `last_turn_ended_at` column exists in the DB, so a timestamp-based
+/// gate is not implementable. Presence-TTL is the only available signal.
+fn agent_is_idle(presence: Option<&str>) -> bool {
+    presence.is_none()
+}
+
 #[cfg(test)]
 mod tests {
     use super::buzz_auto_migrate_enabled;
+    use super::agent_is_idle;
 
     #[test]
     fn buzz_auto_migrate_is_opt_in() {
@@ -1015,5 +1036,37 @@ mod tests {
         assert!(buzz_auto_migrate_enabled(Some(" 1 ")));
         assert!(buzz_auto_migrate_enabled(Some("yes")));
         assert!(buzz_auto_migrate_enabled(Some("on")));
+    }
+
+    // Idle-gate boundary tests for the dream sweep.
+    //
+    // The gate is presence-TTL-only: no `last_turn_ended_at` source exists in
+    // the DB or Redis. `Some(status)` means the agent has a live presence key
+    // (refreshed within the last 90 s) — it is busy. `None` means the key
+    // expired (agent has been silent for >90 s) — it is idle.
+
+    #[test]
+    fn test_agent_is_idle_with_live_presence_returns_false() {
+        // Agent published an "online" heartbeat within the last 90 s — not idle.
+        assert!(!agent_is_idle(Some("online")));
+    }
+
+    #[test]
+    fn test_agent_is_idle_with_away_presence_returns_false() {
+        // "away" is still a live presence key — the agent is not idle.
+        assert!(!agent_is_idle(Some("away")));
+    }
+
+    #[test]
+    fn test_agent_is_idle_with_any_nonempty_status_returns_false() {
+        // Any non-None value means the presence key exists — not idle.
+        assert!(!agent_is_idle(Some("custom-status")));
+        assert!(!agent_is_idle(Some("")));
+    }
+
+    #[test]
+    fn test_agent_is_idle_with_no_presence_returns_true() {
+        // No presence key in Redis — TTL expired, agent has been silent >90 s.
+        assert!(agent_is_idle(None));
     }
 }
