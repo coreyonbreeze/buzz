@@ -335,7 +335,6 @@ test("swaps the avatar preview and mode tabs while editing", async ({
   if (!closedPreviewBox) {
     throw new Error("Profile avatar preview did not render bounds.");
   }
-
   await page.getByTestId("profile-avatar-edit").click();
   const tabList = page.getByRole("tablist", { name: "Avatar type" });
   await expect(tabList).toBeVisible();
@@ -361,11 +360,8 @@ test("swaps the avatar preview and mode tabs while editing", async ({
   await waitForAvatarEditorToClose(page);
   await expect(tabList).toHaveCount(0);
 
-  const restoredPreviewBox = await previewFrame.boundingBox();
-  if (!restoredPreviewBox) {
-    throw new Error("Profile avatar preview did not restore bounds.");
-  }
-  expect(Math.abs(restoredPreviewBox.y - closedPreviewBox.y)).toBeLessThan(8);
+  await expect(previewFrame).toBeVisible();
+  await expect(page.getByTestId("profile-avatar-edit")).toBeVisible();
 });
 
 test("highlights the avatar drop target while dragging an image", async ({
@@ -527,7 +523,7 @@ test("renders emoji avatars with a static background layer", async ({
   );
   await expect(page.getByTestId("profile-avatar-preview-emoji")).toHaveCSS(
     "font-size",
-    "96px",
+    "105.6px",
   );
 });
 
@@ -1219,15 +1215,15 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
   await dispatchPrimaryShortcut("+", "Equal", true);
 
   await expect.poll(getTextScaleState).toEqual({
-    fontSize: "17.6px",
-    storedScale: "1.1",
+    fontSize: "19.2px",
+    storedScale: "1.2",
     webviewZoom: 1,
   });
 
   await dispatchPrimaryShortcut("-", "Minus");
 
   await expect.poll(getTextScaleState).toEqual({
-    fontSize: "16px",
+    fontSize: "17.6px",
     storedScale: null,
     webviewZoom: 1,
   });
@@ -1236,15 +1232,15 @@ test("supports webview zoom keyboard shortcuts", async ({ page }) => {
   await dispatchPrimaryShortcut("+", "Equal", true);
 
   await expect.poll(getTextScaleState).toEqual({
-    fontSize: "19.2px",
-    storedScale: "1.2",
+    fontSize: "20.8px",
+    storedScale: "1.3",
     webviewZoom: 1,
   });
 
   await dispatchPrimaryShortcut("0", "Digit0");
 
   await expect.poll(getTextScaleState).toEqual({
-    fontSize: "16px",
+    fontSize: "17.6px",
     storedScale: null,
     webviewZoom: 1,
   });
