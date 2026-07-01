@@ -11,6 +11,7 @@ import {
 } from "@/features/agents/hooks";
 import { useManagedAgentObserverBridge } from "@/features/agents/observerRelayStore";
 import { useUsersBatchQuery } from "@/features/profile/hooks";
+import { ownsAuthorAgent } from "@/features/profile/lib/identity";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import type {
   ManagedAgent,
@@ -49,11 +50,9 @@ export function getOwnedRelayWorkingAgents(
 ): OwnedRelayWorkingAgent[] {
   if (!currentPubkey) return [];
 
-  const normalizedCurrentPubkey = normalizePubkey(currentPubkey);
   return relayAgents.flatMap((agent) => {
     const profile = profiles?.[normalizePubkey(agent.pubkey)];
-    if (!profile?.ownerPubkey) return [];
-    if (normalizePubkey(profile.ownerPubkey) !== normalizedCurrentPubkey) {
+    if (!ownsAuthorAgent(profile, currentPubkey)) {
       return [];
     }
 
