@@ -33,6 +33,7 @@ export function ConnectionBanner({ errorMessage }: ConnectionBannerProps) {
   const { state: sidebarState } = useSidebar();
   const hasCollapsedRelayError =
     sidebarState === "collapsed" &&
+    state !== "connected" &&
     Boolean(errorMessage && isRelayUnreachableError(errorMessage));
 
   if (!isRelayConnectionDegraded(state) && !hasCollapsedRelayError) {

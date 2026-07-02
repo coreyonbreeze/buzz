@@ -82,7 +82,7 @@ export function useSidebarRelayConnectionCard(
   const [isWindowVisible, setIsWindowVisible] =
     React.useState(isDocumentVisible);
   const hasActiveRelayUnreachableError =
-    hasRelayUnreachableError && !hasSuccess;
+    hasRelayUnreachableError && !hasSuccess && !isRelayConnectionConnected;
   const isRelayConnectionActuallyDegraded =
     hasActiveRelayUnreachableError || isRelayConnectionStateDegraded;
   const isRelayConnectionSuccess = hasSuccess && isRelayConnectionConnected;
