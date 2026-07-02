@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { pageOlderMessagesUntilRowFloor } from "./pageOlderMessages.ts";
+import {
+  maxEventIdAtSecond,
+  pageOlderMessagesUntilRowFloor,
+} from "./pageOlderMessages.ts";
 import {
   channelMessagesKey,
   mergeNonContiguousTimelineMessages,
@@ -177,4 +180,40 @@ test("late island response never downgrades a contiguous copy (downgrade race)",
   assert.equal(oldestContiguousHistoryTimestamp(merged), 1_000);
   // And the reverse direction: thread replies already contiguous stay put.
   assert.equal(merged.length, cache.length);
+});
+
+test("dense-second seed ignores aux and island ids at the boundary second", () => {
+  const channelId = "dense-second-seed";
+  const second = 7_000;
+  // Two content events already held at the stalled second...
+  const contentA = event({ id: id("caa", 0), createdAt: second, channelId });
+  const contentB = event({ id: id("cbb", 0), createdAt: second, channelId });
+  // ...an unmarked reaction whose id sorts after both (aux kinds are absent
+  // from the bridge keyset pages, so its id proves nothing about content)...
+  const auxLater = event({
+    id: id("zaux", 0),
+    kind: 7,
+    createdAt: second,
+    channelId,
+    tags: [
+      ["h", channelId],
+      ["e", contentA.id],
+    ],
+  });
+  // ...and a marked island whose id sorts after everything.
+  const islandLater = {
+    ...event({ id: id("zisl", 0), createdAt: second, channelId }),
+    nonContiguous: true,
+  };
+
+  const seed = maxEventIdAtSecond(
+    [contentA, contentB, auxLater, islandLater],
+    second,
+  );
+
+  // Seeding from the aux/island id would tell the relay "everything up to
+  // this id is held" and skip unseen content rows in the same second.
+  assert.equal(seed, contentB.id);
+  // No contiguous content at the second -> no fabricated cursor.
+  assert.equal(maxEventIdAtSecond([auxLater, islandLater], second), null);
 });

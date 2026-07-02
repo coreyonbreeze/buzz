@@ -4,6 +4,7 @@ import { countTopLevelTimelineRows } from "@/features/messages/lib/formatTimelin
 import { backfillAuxForMessages } from "@/features/messages/lib/auxBackfill";
 import {
   channelMessagesKey,
+  isTimelineWindowContentEvent,
   mergeTimelineHistoryMessages,
   oldestContiguousHistoryTimestamp,
 } from "@/features/messages/lib/messageQueryKeys";
@@ -49,15 +50,24 @@ const inFlightPasses = new Map<string, Promise<PageOlderResult>>();
  * Non-contiguous events are excluded: an out-of-band island at the boundary
  * second is a *point*, not proof that everything up to its id is held —
  * seeding past it would skip the unfetched rows before it. The island itself
- * just dedupes away when re-fetched.
+ * just dedupes away when re-fetched. Auxiliary events are excluded for the
+ * same reason: the bridge keyset pages timeline-content kinds only, so an aux
+ * id at the boundary second says nothing about which *content* rows are held
+ * — seeding from a later aux id would skip unseen content in that second.
+ *
+ * Exported for tests only — the pager is the sole runtime caller.
  */
-function maxEventIdAtSecond(
+export function maxEventIdAtSecond(
   events: RelayEvent[],
   second: number,
 ): string | null {
   let maxId: string | null = null;
   for (const event of events) {
-    if (event.created_at !== second || event.nonContiguous) {
+    if (
+      event.created_at !== second ||
+      event.nonContiguous ||
+      !isTimelineWindowContentEvent(event)
+    ) {
       continue;
     }
     if (maxId === null || event.id > maxId) {

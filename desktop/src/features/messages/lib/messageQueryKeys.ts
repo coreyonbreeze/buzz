@@ -50,7 +50,7 @@ export function sortMessages(messages: RelayEvent[]) {
   });
 }
 
-function isTimelineWindowContentEvent(event: RelayEvent) {
+export function isTimelineWindowContentEvent(event: RelayEvent) {
   return (
     event.kind === KIND_STREAM_MESSAGE ||
     event.kind === KIND_STREAM_MESSAGE_V2 ||
