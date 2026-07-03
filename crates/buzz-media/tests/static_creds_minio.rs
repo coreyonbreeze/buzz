@@ -18,7 +18,7 @@
 //! `BUZZ_S3_SECRET_KEY` / `BUZZ_S3_BUCKET`.
 
 use buzz_media::config::MediaConfig;
-use buzz_media::storage::MediaStorage;
+use buzz_media::storage::{MediaStorage, BUZZ_COMMUNITY_ID_META_KEY, BUZZ_UPLOADER_ID_META_KEY};
 
 fn minio_config() -> MediaConfig {
     MediaConfig {
@@ -49,7 +49,15 @@ async fn static_creds_round_trip_against_minio() {
 
     // PUT
     storage
-        .put(&key, body, "application/octet-stream")
+        .put_with_metadata(
+            &key,
+            body,
+            "application/octet-stream",
+            &[
+                (BUZZ_UPLOADER_ID_META_KEY, "test-uploader"),
+                (BUZZ_COMMUNITY_ID_META_KEY, "test-community"),
+            ],
+        )
         .await
         .expect("put with static creds should succeed");
 
@@ -61,6 +69,14 @@ async fn static_creds_round_trip_against_minio() {
         .expect("head_with_metadata should succeed")
         .expect("object should exist");
     assert_eq!(meta.size, body.len() as u64);
+    assert_eq!(
+        meta.metadata.get(BUZZ_UPLOADER_ID_META_KEY),
+        Some(&"test-uploader".to_string())
+    );
+    assert_eq!(
+        meta.metadata.get(BUZZ_COMMUNITY_ID_META_KEY),
+        Some(&"test-community".to_string())
+    );
 
     // GET round-trips the bytes
     let got = storage.get(&key).await.expect("get should succeed");

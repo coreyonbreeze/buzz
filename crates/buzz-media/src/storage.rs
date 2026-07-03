@@ -1,5 +1,6 @@
 //! S3/MinIO storage client.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 
@@ -14,6 +15,11 @@ use serde::{Deserialize, Serialize};
 
 /// A stream of byte chunks from S3, usable with `axum::body::Body::from_stream()`.
 pub type ByteStream = Pin<Box<dyn futures_core::Stream<Item = Result<Bytes, MediaError>> + Send>>;
+
+/// Bare S3 user-metadata key for the authenticated uploader pubkey.
+pub const BUZZ_UPLOADER_ID_META_KEY: &str = "buzz-uploader-id";
+/// Bare S3 user-metadata key for the server-resolved community id.
+pub const BUZZ_COMMUNITY_ID_META_KEY: &str = "buzz-community-id";
 
 /// S3-compatible object storage client.
 pub struct MediaStorage {
@@ -219,12 +225,10 @@ impl MediaStorage {
         Ok(())
     }
 
-    /// HEAD with metadata — returns Content-Length (size).
+    /// HEAD with metadata — returns Content-Length (size) and user metadata.
     pub async fn head_with_metadata(&self, key: &str) -> Result<Option<BlobHeadMeta>, MediaError> {
         match self.bucket.head_object(key).await {
-            Ok((result, _)) => Ok(Some(BlobHeadMeta {
-                size: result.content_length.unwrap_or(0) as u64,
-            })),
+            Ok((result, _)) => Ok(Some(BlobHeadMeta::from_head_object_result(result))),
             Err(s3::error::S3Error::HttpFailWithBody(404, _)) => Ok(None),
             Err(e) => Err(MediaError::StorageError(e.to_string())),
         }
@@ -396,23 +400,54 @@ mod tests {
     #[test]
     fn amz_meta_headers_are_prefixed_and_validated() {
         let headers = build_amz_meta_headers(&[
-            ("buzz-uploader-id", "aabbcc"),
-            ("buzz-community-id", "0000-1111"),
+            (BUZZ_UPLOADER_ID_META_KEY, "aabbcc"),
+            (BUZZ_COMMUNITY_ID_META_KEY, "0000-1111"),
         ])
         .unwrap();
         assert_eq!(
-            headers.get("x-amz-meta-buzz-uploader-id").unwrap(),
+            headers
+                .get(format!("x-amz-meta-{BUZZ_UPLOADER_ID_META_KEY}"))
+                .unwrap(),
             "aabbcc"
         );
         assert_eq!(
-            headers.get("x-amz-meta-buzz-community-id").unwrap(),
+            headers
+                .get(format!("x-amz-meta-{BUZZ_COMMUNITY_ID_META_KEY}"))
+                .unwrap(),
             "0000-1111"
         );
 
         // Control characters in values are rejected, not silently mangled.
-        assert!(build_amz_meta_headers(&[("buzz-uploader-id", "bu\nzz")]).is_err());
+        assert!(build_amz_meta_headers(&[(BUZZ_UPLOADER_ID_META_KEY, "bu\nzz")]).is_err());
         // Invalid header-name characters in the key are rejected.
         assert!(build_amz_meta_headers(&[("bad key", "v")]).is_err());
+    }
+
+    #[test]
+    fn blob_head_meta_surfaces_s3_user_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert(BUZZ_UPLOADER_ID_META_KEY.to_string(), "aabbcc".to_string());
+        metadata.insert(
+            BUZZ_COMMUNITY_ID_META_KEY.to_string(),
+            "0000-1111".to_string(),
+        );
+
+        let result = s3::serde_types::HeadObjectResult {
+            content_length: Some(42),
+            metadata: Some(metadata),
+            ..Default::default()
+        };
+
+        let head = BlobHeadMeta::from_head_object_result(result);
+        assert_eq!(head.size, 42);
+        assert_eq!(
+            head.metadata.get(BUZZ_UPLOADER_ID_META_KEY),
+            Some(&"aabbcc".to_string())
+        );
+        assert_eq!(
+            head.metadata.get(BUZZ_COMMUNITY_ID_META_KEY),
+            Some(&"0000-1111".to_string())
+        );
     }
 
     /// Old sidecars (written before upload attribution) must still parse, and
@@ -459,9 +494,23 @@ fn build_amz_meta_headers(metadata: &[(&str, &str)]) -> Result<http::HeaderMap, 
     Ok(headers)
 }
 
-/// Metadata returned by HEAD — just enough for BUD-01 response headers.
+/// Metadata returned by HEAD for BUD-01 responses and moderation tooling.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BlobHeadMeta {
+    /// Object size in bytes.
     pub size: u64,
+    /// S3 user metadata returned by HEAD, keyed by bare metadata name (without
+    /// the `x-amz-meta-` prefix), e.g. `buzz-uploader-id`.
+    pub metadata: HashMap<String, String>,
+}
+
+impl BlobHeadMeta {
+    fn from_head_object_result(result: s3::serde_types::HeadObjectResult) -> Self {
+        Self {
+            size: result.content_length.unwrap_or(0).max(0) as u64,
+            metadata: result.metadata.unwrap_or_default(),
+        }
+    }
 }
 
 /// Full blob metadata — stored as sidecar JSON in `_meta/{community}/{sha256}.json`.

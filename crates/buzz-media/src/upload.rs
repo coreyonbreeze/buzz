@@ -8,12 +8,24 @@ use tokio::io::AsyncWriteExt;
 use crate::auth::verify_blossom_upload_auth;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
-use crate::storage::{BlobMeta, MediaStorage};
+use crate::storage::{
+    BlobMeta, MediaStorage, BUZZ_COMMUNITY_ID_META_KEY, BUZZ_UPLOADER_ID_META_KEY,
+};
 use crate::thumbnail::generate_image_metadata_sync;
 use crate::types::BlobDescriptor;
 use crate::validation::{
     mime_to_ext, validate_content, validate_file_content, validate_video_file,
 };
+
+fn attribution_meta<'a>(
+    uploader_id: &'a str,
+    community_id: &'a str,
+) -> [(&'static str, &'a str); 2] {
+    [
+        (BUZZ_UPLOADER_ID_META_KEY, uploader_id),
+        (BUZZ_COMMUNITY_ID_META_KEY, community_id),
+    ]
+}
 
 /// Shared buffered-upload pipeline for the image and generic-file paths.
 ///
@@ -109,10 +121,7 @@ where
             &key,
             &body,
             &mime,
-            &[
-                ("buzz-uploader-id", uploader_id.as_str()),
-                ("buzz-community-id", community_id.as_str()),
-            ],
+            &attribution_meta(uploader_id.as_str(), community_id.as_str()),
         )
         .await?;
 
@@ -410,10 +419,7 @@ pub async fn process_video_upload(
             &key,
             &tmp_path,
             &mime,
-            &[
-                ("buzz-uploader-id", uploader_id.as_str()),
-                ("buzz-community-id", community_id.as_str()),
-            ],
+            &attribution_meta(uploader_id.as_str(), community_id.as_str()),
         )
         .await?;
     drop(tmp); // Free temp file disk space immediately after S3 upload.
@@ -476,16 +482,10 @@ async fn generate_and_store_metadata(
                 &thumb_key,
                 tb,
                 "image/jpeg",
-                &[
-                    (
-                        "buzz-uploader-id",
-                        meta.uploader_id.as_deref().unwrap_or_default(),
-                    ),
-                    (
-                        "buzz-community-id",
-                        meta.community_id.as_deref().unwrap_or_default(),
-                    ),
-                ],
+                &attribution_meta(
+                    meta.uploader_id.as_deref().unwrap_or_default(),
+                    meta.community_id.as_deref().unwrap_or_default(),
+                ),
             )
             .await?;
     }
