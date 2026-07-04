@@ -51,7 +51,12 @@ export function ChatWorkPanel({
               <span className="min-w-0 truncate font-mono">{branch}</span>
             </div>
           ) : null}
-          <GithubPullRequestCard className="w-full" preview={preview} />
+          <GithubPullRequestCard
+            // Matches the branch chip: the card needs its own surface on the
+            // secondary container or the two read as one flat block.
+            className="w-full border-transparent bg-background/60 hover:bg-background/80"
+            preview={preview}
+          />
         </div>
       </div>
     </aside>
