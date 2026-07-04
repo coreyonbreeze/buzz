@@ -459,6 +459,7 @@ pub fn run() {
             get_relay_http_url,
             get_media_proxy_port,
             fetch_link_preview_title,
+            fetch_github_pull_request,
             discover_acp_providers,
             install_acp_runtime,
             discover_managed_agent_prereqs,

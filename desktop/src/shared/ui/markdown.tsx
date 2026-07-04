@@ -36,7 +36,10 @@ import remarkSpoilers from "@/shared/lib/remarkSpoilers";
 import remarkMessageLinks from "@/features/messages/lib/remarkMessageLinks";
 import { AttachmentGroup } from "@/shared/ui/attachment";
 import { ConfigNudgeCard } from "@/shared/ui/config-nudge-attachment";
-import { LinkPreviewAttachment } from "@/shared/ui/link-preview-attachment";
+import {
+  GithubPullRequestCard,
+  LinkPreviewAttachment,
+} from "@/shared/ui/link-preview-attachment";
 import { useSmoothCorners } from "@/shared/ui/smoothCorners";
 import {
   computeConfigNudge,
@@ -2072,9 +2075,13 @@ function MarkdownInner({
             className="max-w-full flex-wrap overflow-visible pb-0"
             data-link-preview-list=""
           >
-            {resolvedLinkPreviews.map((preview) => (
-              <LinkPreviewAttachment key={preview.href} preview={preview} />
-            ))}
+            {resolvedLinkPreviews.map((preview) =>
+              preview.kind === "github-pull-request" ? (
+                <GithubPullRequestCard key={preview.href} preview={preview} />
+              ) : (
+                <LinkPreviewAttachment key={preview.href} preview={preview} />
+              ),
+            )}
           </AttachmentGroup>
         ) : null}
       </VideoReviewMarkdownContext.Provider>

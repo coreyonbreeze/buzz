@@ -2,13 +2,103 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use reqwest::{
-    header::{ACCEPT, CONTENT_TYPE, USER_AGENT},
+    header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT},
     redirect::Policy,
 };
 use url::Url;
 
 const MAX_TITLE_FETCH_BYTES: usize = 256 * 1024;
 const TITLE_FETCH_TIMEOUT: Duration = Duration::from_secs(4);
+const GITHUB_API_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Live pull-request details for the rich GitHub PR link card.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GithubPullRequestInfo {
+    pub title: String,
+    /// GitHub PR state: `open` or `closed` (merged PRs report `closed`).
+    pub state: String,
+    pub merged: bool,
+    pub draft: bool,
+    pub additions: i64,
+    pub deletions: i64,
+    pub changed_files: i64,
+}
+
+/// Fetch live PR details from the GitHub REST API.
+///
+/// Anonymous requests cover public repos; when the desktop was launched from
+/// a shell with `GITHUB_TOKEN`/`GH_TOKEN` set, the token is attached so
+/// private-repo cards work too. Returns `Ok(None)` on any non-success
+/// response (not found, rate limited, private without token) — the card
+/// falls back to its static form.
+#[tauri::command]
+pub async fn fetch_github_pull_request(
+    owner: String,
+    repo: String,
+    number: u64,
+) -> Result<Option<GithubPullRequestInfo>, String> {
+    if !is_valid_github_name(&owner) || !is_valid_github_name(&repo) {
+        return Err("invalid GitHub repository reference".to_string());
+    }
+
+    let client = reqwest::Client::builder()
+        .pool_idle_timeout(Duration::from_secs(10))
+        .pool_max_idle_per_host(1)
+        .build()
+        .map_err(|error| format!("github client failed: {error}"))?;
+
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/pulls/{number}");
+    let mut request = client
+        .get(&url)
+        .timeout(GITHUB_API_TIMEOUT)
+        .header(ACCEPT, "application/vnd.github+json")
+        .header(USER_AGENT, "Buzz Desktop link preview")
+        .header("X-GitHub-Api-Version", "2022-11-28");
+    if let Some(token) = ambient_github_token() {
+        request = request.header(AUTHORIZATION, format!("Bearer {token}"));
+    }
+
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("github request failed: {error}"))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+
+    let body: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|error| format!("github response parse failed: {error}"))?;
+
+    Ok(Some(GithubPullRequestInfo {
+        title: body["title"].as_str().unwrap_or_default().to_string(),
+        state: body["state"].as_str().unwrap_or("open").to_string(),
+        merged: body["merged"].as_bool().unwrap_or(false),
+        draft: body["draft"].as_bool().unwrap_or(false),
+        additions: body["additions"].as_i64().unwrap_or(0),
+        deletions: body["deletions"].as_i64().unwrap_or(0),
+        changed_files: body["changed_files"].as_i64().unwrap_or(0),
+    }))
+}
+
+fn ambient_github_token() -> Option<String> {
+    ["GITHUB_TOKEN", "GH_TOKEN"].iter().find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn is_valid_github_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 100
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
 
 #[tauri::command]
 pub async fn fetch_link_preview_title(href: String) -> Result<Option<String>, String> {

@@ -8888,6 +8888,20 @@ export function maybeInstallE2eTauriMocks() {
         );
       case "get_media_proxy_port":
         return MOCK_MEDIA_PROXY_PORT;
+      case "fetch_github_pull_request": {
+        // Deterministic PR details so the rich GitHub card renders in mocks.
+        const prPayload = payload as { number?: number };
+        return {
+          title: "Add Chats mode",
+          state: "open",
+          merged: false,
+          draft: false,
+          additions: 1248,
+          deletions: 96,
+          changedFiles: 24,
+          number: prPayload.number ?? 0,
+        };
+      }
       case "pick_and_upload_media":
         return await resolveMockUploadDescriptors(activeConfig);
       case "upload_media_bytes":
