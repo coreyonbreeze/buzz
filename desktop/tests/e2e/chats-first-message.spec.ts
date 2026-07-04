@@ -1,5 +1,6 @@
 import { expect, test } from "@playwright/test";
 
+import { waitForAnimations } from "../helpers/animations";
 import { installMockBridge } from "../helpers/bridge";
 
 test("first message in a new chat is sent and rendered", async ({ page }) => {
@@ -159,5 +160,6 @@ test("first message in a new chat is sent and rendered", async ({ page }) => {
   await expect(workPanel).not.toBeVisible();
   await page.getByTestId("toggle-work-panel").click();
   await expect(workPanel).toBeVisible();
+  await waitForAnimations(page);
   await page.screenshot({ path: "test-results/agent-pr-card.png" });
 });
