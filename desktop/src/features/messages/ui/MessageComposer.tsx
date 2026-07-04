@@ -266,15 +266,15 @@ function MessageComposerImpl({
     emojiAutocomplete.isEmojiAutocompleteOpen;
 
   const submitMessageRef = React.useRef<() => void>(() => {});
-
+  const setEditorContentRef = React.useRef<(t: string) => void>(() => {});
   const dictation = useComposerDictation({
     contentRef,
     disabled,
     isSending,
-    setComposerContentFromText,
+    setComposerContent,
+    setEditorContentRef,
     submitMessageRef,
   });
-
   const composerScrollRef = React.useRef<HTMLDivElement>(null);
 
   // Set after `useLinkEditor` exists below; the editor's link-click handler
@@ -335,6 +335,7 @@ function MessageComposerImpl({
     },
   });
 
+  setEditorContentRef.current = richText.setContent;
   const linkEditor = useLinkEditor(richText);
   syncContentRefFromEditorRef.current = () => {
     const markdown = richText.getMarkdown();
