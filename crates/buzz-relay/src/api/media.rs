@@ -18,7 +18,7 @@ use axum::{
 use base64::Engine;
 use buzz_audit::{AuditAction, NewAuditEntry};
 use buzz_core::tenant::TenantContext;
-use buzz_media::{BlobDescriptor, MediaError};
+use buzz_media::{BlobDescriptor, MediaError, UploadAttributionLabels};
 
 use crate::state::AppState;
 
@@ -203,6 +203,21 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
     }
 }
 
+async fn upload_attribution_labels(
+    state: &AppState,
+    auth: &AuthenticatedUpload,
+) -> UploadAttributionLabels {
+    let uploader_name = state
+        .db
+        .get_user(auth.tenant.community(), &auth.auth_event.pubkey.to_bytes())
+        .await
+        .ok()
+        .flatten()
+        .and_then(|profile| profile.display_name);
+
+    UploadAttributionLabels::from_profile_and_host(uploader_name, auth.tenant.host())
+}
+
 /// PUT /media/upload — Blossom BUD-02 upload.
 ///
 /// Auth is validated via the [`AuthenticatedUpload`] extractor BEFORE the body
@@ -232,6 +247,8 @@ pub async fn upload_blob(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    let labels = upload_attribution_labels(&state, &auth).await;
+
     let mut descriptor = if content_type.starts_with("video/") {
         // Video path: stream body directly to disk — never fully buffered in RAM.
         let content_length = headers
@@ -245,6 +262,7 @@ pub async fn upload_blob(
             &auth.auth_event,
             body.into_data_stream(),
             content_length,
+            labels,
         )
         .await?
     } else {
@@ -274,6 +292,7 @@ pub async fn upload_blob(
                 &auth.tenant,
                 &auth.auth_event,
                 bytes,
+                labels,
             )
             .await?
         } else {
@@ -283,6 +302,7 @@ pub async fn upload_blob(
                 &auth.tenant,
                 &auth.auth_event,
                 bytes,
+                labels,
             )
             .await?
         }

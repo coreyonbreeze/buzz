@@ -9,7 +9,8 @@ use crate::auth::verify_blossom_upload_auth;
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::{
-    BlobMeta, MediaStorage, BUZZ_COMMUNITY_ID_META_KEY, BUZZ_UPLOADER_ID_META_KEY,
+    BlobMeta, MediaStorage, BUZZ_COMMUNITY_ALIAS_META_KEY, BUZZ_COMMUNITY_ID_META_KEY,
+    BUZZ_UPLOADER_ID_META_KEY, BUZZ_UPLOADER_NAME_META_KEY,
 };
 use crate::thumbnail::generate_image_metadata_sync;
 use crate::types::BlobDescriptor;
@@ -17,14 +18,74 @@ use crate::validation::{
     mime_to_ext, validate_content, validate_file_content, validate_video_file,
 };
 
+/// Readability metadata for upload attribution. The id fields remain
+/// authoritative; names/aliases are best-effort labels for moderators.
+#[derive(Debug, Clone, Default)]
+pub struct UploadAttributionLabels {
+    /// Configured display name for the authenticated uploader, if known.
+    pub uploader_name: Option<String>,
+    /// Human-readable alias derived from the server-resolved tenant host.
+    pub community_alias: Option<String>,
+}
+
+impl UploadAttributionLabels {
+    /// Build labels from optional profile data and the resolved tenant host.
+    pub fn from_profile_and_host(uploader_name: Option<String>, tenant_host: &str) -> Self {
+        Self {
+            uploader_name: uploader_name.and_then(sanitize_label),
+            community_alias: community_alias_from_host(tenant_host),
+        }
+    }
+}
+
 fn attribution_meta<'a>(
     uploader_id: &'a str,
     community_id: &'a str,
-) -> [(&'static str, &'a str); 2] {
-    [
+    labels: &'a UploadAttributionLabels,
+) -> Vec<(&'static str, &'a str)> {
+    let mut metadata = vec![
         (BUZZ_UPLOADER_ID_META_KEY, uploader_id),
         (BUZZ_COMMUNITY_ID_META_KEY, community_id),
-    ]
+    ];
+    if let Some(uploader_name) = labels.uploader_name.as_deref() {
+        metadata.push((BUZZ_UPLOADER_NAME_META_KEY, uploader_name));
+    }
+    if let Some(community_alias) = labels.community_alias.as_deref() {
+        metadata.push((BUZZ_COMMUNITY_ALIAS_META_KEY, community_alias));
+    }
+    metadata
+}
+
+fn sanitize_label(label: String) -> Option<String> {
+    let label = label.trim();
+    if label.is_empty() {
+        return None;
+    }
+
+    // S3 user metadata is represented as HTTP headers. Keep labels readable but
+    // header-safe and bounded; the id metadata remains the complete source.
+    let mut out = String::with_capacity(label.len().min(128));
+    let mut last_was_space = false;
+    for ch in label.chars() {
+        if out.len() >= 128 {
+            break;
+        }
+        if ch.is_ascii_graphic() {
+            out.push(ch);
+            last_was_space = false;
+        } else if ch.is_ascii_whitespace() && !last_was_space && !out.is_empty() {
+            out.push(' ');
+            last_was_space = true;
+        }
+    }
+    let out = out.trim().to_string();
+    (!out.is_empty()).then_some(out)
+}
+
+fn community_alias_from_host(host: &str) -> Option<String> {
+    let authority = host.split(':').next().unwrap_or(host).trim();
+    let alias = authority.split('.').next().unwrap_or(authority);
+    sanitize_label(alias.to_string())
 }
 
 /// Shared buffered-upload pipeline for the image and generic-file paths.
@@ -49,14 +110,16 @@ async fn process_buffered_upload<V, M, Fut>(
     ctx: &TenantContext,
     auth_event: &nostr::Event,
     body: Bytes,
-    validate: V,
-    store_metadata: M,
+    labels: UploadAttributionLabels,
+    ops: (V, M),
 ) -> Result<BlobDescriptor, MediaError>
 where
     V: FnOnce(&Bytes, &MediaConfig) -> Result<(String, String), MediaError> + Send + 'static,
     M: FnOnce(MetadataInput) -> Fut,
     Fut: std::future::Future<Output = Result<BlobMeta, MediaError>>,
 {
+    let (validate, store_metadata) = ops;
+
     // CPU-bound: validate content, compute hash, verify auth.
     let auth = auth_event.clone();
     let bytes = body.clone();
@@ -121,7 +184,7 @@ where
             &key,
             &body,
             &mime,
-            &attribution_meta(uploader_id.as_str(), community_id.as_str()),
+            &attribution_meta(uploader_id.as_str(), community_id.as_str(), &labels),
         )
         .await?;
 
@@ -133,6 +196,7 @@ where
         uploaded_at,
         uploader_id,
         community_id,
+        labels,
     })
     .await;
 
@@ -167,6 +231,8 @@ struct MetadataInput {
     uploader_id: String,
     /// Host-resolved community id, mirrored into the sidecar.
     community_id: String,
+    /// Best-effort human-readable labels mirrored into S3 metadata and sidecar.
+    labels: UploadAttributionLabels,
 }
 
 /// Process an upload end-to-end: validate, store, thumbnail, return descriptor.
@@ -179,6 +245,7 @@ pub async fn process_upload(
     ctx: &TenantContext,
     auth_event: &nostr::Event,
     body: Bytes,
+    labels: UploadAttributionLabels,
 ) -> Result<BlobDescriptor, MediaError> {
     process_buffered_upload(
         storage,
@@ -186,12 +253,15 @@ pub async fn process_upload(
         ctx,
         auth_event,
         body,
-        |bytes, cfg| {
-            let mime = validate_content(bytes, cfg)?;
-            let ext = mime_to_ext(&mime).to_string();
-            Ok((mime, ext))
-        },
-        |input| async move { generate_and_store_metadata(storage, config, ctx, input).await },
+        labels,
+        (
+            |bytes, cfg| {
+                let mime = validate_content(bytes, cfg)?;
+                let ext = mime_to_ext(&mime).to_string();
+                Ok((mime, ext))
+            },
+            |input| async move { generate_and_store_metadata(storage, config, ctx, input).await },
+        ),
     )
     .await
 }
@@ -212,6 +282,7 @@ pub async fn process_file_upload(
     ctx: &TenantContext,
     auth_event: &nostr::Event,
     body: Bytes,
+    labels: UploadAttributionLabels,
 ) -> Result<BlobDescriptor, MediaError> {
     process_buffered_upload(
         storage,
@@ -219,24 +290,29 @@ pub async fn process_file_upload(
         ctx,
         auth_event,
         body,
-        |bytes, cfg| validate_file_content(bytes, cfg),
-        |input| async move {
-            // Minimal sidecar — no thumbnail/dim/blurhash/duration for generic files.
-            let meta = BlobMeta {
-                dim: String::new(),
-                blurhash: String::new(),
-                thumb_url: String::new(),
-                size: input.body.len() as u64,
-                ext: input.ext,
-                mime_type: input.mime,
-                uploaded_at: input.uploaded_at,
-                duration_secs: None,
-                uploader_id: Some(input.uploader_id),
-                community_id: Some(input.community_id),
-            };
-            storage.put_sidecar(ctx, &input.sha256, &meta).await?;
-            Ok(meta)
-        },
+        labels,
+        (
+            |bytes, cfg| validate_file_content(bytes, cfg),
+            |input| async move {
+                // Minimal sidecar — no thumbnail/dim/blurhash/duration for generic files.
+                let meta = BlobMeta {
+                    dim: String::new(),
+                    blurhash: String::new(),
+                    thumb_url: String::new(),
+                    size: input.body.len() as u64,
+                    ext: input.ext,
+                    mime_type: input.mime,
+                    uploaded_at: input.uploaded_at,
+                    duration_secs: None,
+                    uploader_id: Some(input.uploader_id),
+                    uploader_name: input.labels.uploader_name,
+                    community_id: Some(input.community_id),
+                    community_alias: input.labels.community_alias,
+                };
+                storage.put_sidecar(ctx, &input.sha256, &meta).await?;
+                Ok(meta)
+            },
+        ),
     )
     .await
 }
@@ -259,6 +335,7 @@ pub async fn process_video_upload(
     auth_event: &nostr::Event,
     body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
     content_length: Option<u64>,
+    labels: UploadAttributionLabels,
 ) -> Result<BlobDescriptor, MediaError> {
     // --- 1. Stream body to temp file, compute SHA-256 incrementally ---
     let tmp = tempfile::NamedTempFile::new().map_err(|e| MediaError::Io(e.to_string()))?;
@@ -419,7 +496,7 @@ pub async fn process_video_upload(
             &key,
             &tmp_path,
             &mime,
-            &attribution_meta(uploader_id.as_str(), community_id.as_str()),
+            &attribution_meta(uploader_id.as_str(), community_id.as_str(), &labels),
         )
         .await?;
     drop(tmp); // Free temp file disk space immediately after S3 upload.
@@ -435,7 +512,9 @@ pub async fn process_video_upload(
         uploaded_at,
         duration_secs: Some(video_meta.duration_secs),
         uploader_id: Some(uploader_id),
+        uploader_name: labels.uploader_name,
         community_id: Some(community_id),
+        community_alias: labels.community_alias,
     };
     storage.put_sidecar(ctx, &sha256_hex, &meta).await?;
 
@@ -471,7 +550,9 @@ async fn generate_and_store_metadata(
 
     meta.uploaded_at = input.uploaded_at;
     meta.uploader_id = Some(input.uploader_id);
+    meta.uploader_name = input.labels.uploader_name;
     meta.community_id = Some(input.community_id);
+    meta.community_alias = input.labels.community_alias;
 
     if let Some(ref tb) = thumb_bytes {
         // The thumbnail is a derived object with its own S3 key, so it carries
@@ -485,6 +566,10 @@ async fn generate_and_store_metadata(
                 &attribution_meta(
                     meta.uploader_id.as_deref().unwrap_or_default(),
                     meta.community_id.as_deref().unwrap_or_default(),
+                    &UploadAttributionLabels {
+                        uploader_name: meta.uploader_name.clone(),
+                        community_alias: meta.community_alias.clone(),
+                    },
                 ),
             )
             .await?;
@@ -551,7 +636,9 @@ mod tests {
             uploaded_at: 1700000000,
             duration_secs: Some(29.5),
             uploader_id: None,
+            uploader_name: None,
             community_id: None,
+            community_alias: None,
         };
 
         let desc = build_descriptor(
@@ -611,7 +698,9 @@ mod tests {
             uploaded_at: 1700000000,
             duration_secs: None,
             uploader_id: None,
+            uploader_name: None,
             community_id: None,
+            community_alias: None,
         };
 
         let desc = build_descriptor(
@@ -667,6 +756,21 @@ mod tests {
 
         // Non-limit errors should remain as Other.
         assert_eq!(detect("connection reset"), std::io::ErrorKind::Other);
+    }
+
+    #[test]
+    fn upload_attribution_labels_are_sanitized_and_host_aliased() {
+        let labels = UploadAttributionLabels::from_profile_and_host(
+            Some("  Ada Lovelace\n🚀  ".to_string()),
+            "moderation.buzz.example",
+        );
+
+        assert_eq!(labels.uploader_name.as_deref(), Some("Ada Lovelace"));
+        assert_eq!(labels.community_alias.as_deref(), Some("moderation"));
+
+        let localhost = UploadAttributionLabels::from_profile_and_host(None, "localhost:3000");
+        assert_eq!(localhost.uploader_name, None);
+        assert_eq!(localhost.community_alias.as_deref(), Some("localhost"));
     }
 
     #[test]

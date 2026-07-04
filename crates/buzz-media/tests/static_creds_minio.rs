@@ -18,7 +18,10 @@
 //! `BUZZ_S3_SECRET_KEY` / `BUZZ_S3_BUCKET`.
 
 use buzz_media::config::MediaConfig;
-use buzz_media::storage::{MediaStorage, BUZZ_COMMUNITY_ID_META_KEY, BUZZ_UPLOADER_ID_META_KEY};
+use buzz_media::storage::{
+    MediaStorage, BUZZ_COMMUNITY_ALIAS_META_KEY, BUZZ_COMMUNITY_ID_META_KEY,
+    BUZZ_UPLOADER_ID_META_KEY, BUZZ_UPLOADER_NAME_META_KEY,
+};
 
 fn minio_config() -> MediaConfig {
     MediaConfig {
@@ -55,7 +58,9 @@ async fn static_creds_round_trip_against_minio() {
             "application/octet-stream",
             &[
                 (BUZZ_UPLOADER_ID_META_KEY, "test-uploader"),
+                (BUZZ_UPLOADER_NAME_META_KEY, "Test Uploader"),
                 (BUZZ_COMMUNITY_ID_META_KEY, "test-community"),
+                (BUZZ_COMMUNITY_ALIAS_META_KEY, "moderation"),
             ],
         )
         .await
@@ -74,8 +79,16 @@ async fn static_creds_round_trip_against_minio() {
         Some(&"test-uploader".to_string())
     );
     assert_eq!(
+        meta.metadata.get(BUZZ_UPLOADER_NAME_META_KEY),
+        Some(&"Test Uploader".to_string())
+    );
+    assert_eq!(
         meta.metadata.get(BUZZ_COMMUNITY_ID_META_KEY),
         Some(&"test-community".to_string())
+    );
+    assert_eq!(
+        meta.metadata.get(BUZZ_COMMUNITY_ALIAS_META_KEY),
+        Some(&"moderation".to_string())
     );
 
     // GET round-trips the bytes

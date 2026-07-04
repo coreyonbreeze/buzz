@@ -15,5 +15,7 @@ pub use config::MediaConfig;
 pub use error::MediaError;
 pub use storage::{BlobHeadMeta, BlobMeta, ByteStream, MediaStorage};
 pub use types::BlobDescriptor;
-pub use upload::{process_file_upload, process_upload, process_video_upload};
+pub use upload::{
+    process_file_upload, process_upload, process_video_upload, UploadAttributionLabels,
+};
 pub use validation::{serve_inline, validate_video_file, VideoMeta};
