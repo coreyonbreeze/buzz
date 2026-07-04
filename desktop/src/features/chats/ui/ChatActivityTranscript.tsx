@@ -70,6 +70,23 @@ function hasRecentEntrance(timestamp?: string | null) {
   return Boolean(timestamp) && isEntranceRecent(Date.parse(timestamp ?? ""));
 }
 
+// "Turn started" / "Session ready" plumbing rows. Hidden from the chat
+// timeline (they add noise to every turn); their timestamps still feed the
+// completed-turn duration.
+function isSetupLifecycleItem(item: TranscriptItem) {
+  if (item.type !== "lifecycle") {
+    return false;
+  }
+  const source = item.acpSource ?? "";
+  const title = item.title.toLowerCase();
+  return (
+    source === "turn_started" ||
+    source === "session_resolved" ||
+    title.includes("turn started") ||
+    title.includes("session ready")
+  );
+}
+
 export function ChatActivityTranscript({
   agent,
   blocks,
@@ -253,13 +270,25 @@ function ChatActivitySegmentView({
             profiles={profiles}
           />
         ) : null}
-        <PromptSetupMarker context={segment.context} setup={segment.setup} />
+        {segment.context ? (
+          <ActivityMarkerRow
+            details={<PromptSections sections={segment.context.sections} />}
+            entrance={hasRecentEntrance(segment.context.timestamp)}
+            icon={<FileText className="h-3.5 w-3.5" />}
+            label="Captured prompt context"
+            timestamp={segment.context.timestamp}
+            tone="muted"
+          />
+        ) : null}
       </>
     );
   }
 
   if (segment.kind === "setup") {
-    return <TurnSetupMarker items={segment.items} />;
+    // "Turn started" / "Session ready" plumbing rows add noise to every
+    // turn without telling the user anything actionable — the Working
+    // marker (and its raw-event dropdown) already covers turn liveness.
+    return null;
   }
 
   if (segment.kind === "summary") {
@@ -363,6 +392,10 @@ function ChatActivityItemView({
     );
   }
 
+  if (isSetupLifecycleItem(item)) {
+    return null;
+  }
+
   return (
     <ActivityMarkerRow
       details={item.text ? <Markdown compact content={item.text} /> : null}
@@ -442,71 +475,6 @@ function ChatTranscriptMessageRow({
   );
 }
 
-function PromptSetupMarker({
-  context,
-  setup,
-}: {
-  context: Extract<TranscriptItem, { type: "metadata" }> | null;
-  setup: Extract<TranscriptItem, { type: "lifecycle" }>[];
-}) {
-  return (
-    <>
-      <TurnSetupMarker items={setup} />
-      {context ? (
-        <ActivityMarkerRow
-          details={<PromptSections sections={context.sections} />}
-          entrance={hasRecentEntrance(context.timestamp)}
-          icon={<FileText className="h-3.5 w-3.5" />}
-          label="Captured prompt context"
-          timestamp={context.timestamp}
-          tone="muted"
-        />
-      ) : null}
-    </>
-  );
-}
-
-function TurnSetupMarker({
-  items,
-}: {
-  items: Extract<TranscriptItem, { type: "lifecycle" }>[];
-}) {
-  if (items.length === 0) {
-    return null;
-  }
-
-  return (
-    <>
-      {items.map((item) => (
-        <LifecycleMarker item={item} key={item.id} />
-      ))}
-    </>
-  );
-}
-
-function LifecycleMarker({
-  item,
-}: {
-  item: Extract<TranscriptItem, { type: "lifecycle" }>;
-}) {
-  return (
-    <ActivityMarkerRow
-      details={
-        item.text ? (
-          <Markdown compact content={item.text} />
-        ) : (
-          <span>No additional details.</span>
-        )
-      }
-      entrance={hasRecentEntrance(item.timestamp)}
-      icon={lifecycleIcon(item)}
-      label={item.title}
-      timestamp={item.timestamp}
-      tone={item.renderClass === "error" ? "danger" : "muted"}
-    />
-  );
-}
-
 function SummaryMarker({ summary }: { summary: TranscriptSameKindSummary }) {
   return (
     <ActivityMarkerRow
@@ -528,7 +496,10 @@ function SummaryMarker({ summary }: { summary: TranscriptSameKindSummary }) {
 
 function CompletedWorkMarker({ items }: { items: TranscriptItem[] }) {
   const [isOpen, setIsOpen] = React.useState(false);
+  // Duration spans ALL items (setup lifecycle marks the turn's true start),
+  // but the expanded list hides the "Turn started"/"Session ready" plumbing.
   const label = completedWorkLabel(items);
+  const detailItems = items.filter((item) => !isSetupLifecycleItem(item));
   const entrance = hasRecentEntrance(items[items.length - 1]?.timestamp);
 
   return (
@@ -557,7 +528,7 @@ function CompletedWorkMarker({ items }: { items: TranscriptItem[] }) {
         {isOpen ? (
           <div className="pt-4">
             <div className="space-y-3">
-              {items.map((item) => (
+              {detailItems.map((item) => (
                 <CompletedWorkDetailRow item={item} key={item.id} />
               ))}
             </div>
