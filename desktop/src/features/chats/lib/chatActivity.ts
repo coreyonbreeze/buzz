@@ -41,15 +41,22 @@ export function buildChatActivityPlacement({
 
   for (const block of blocks) {
     const promptMessageId = getPromptMessageId(block);
-    const attachedMessageId =
+    const exactMessageId =
       promptMessageId && messageIds.has(promptMessageId)
         ? promptMessageId
         : null;
+    // A block whose prompt message can't be matched (replayed backlog id
+    // outside the fetch window, prompt text that didn't carry the id, …)
+    // must NOT drop to the trailing bucket — that pins it below every
+    // message that arrives later, forever. Place it at its chronological
+    // spot instead: after the latest message that predates the block.
+    const attachedMessageId =
+      exactMessageId ?? findMessageIdByTime(messages, getBlockStartMs(block));
     const renderBlock = {
       id: getBlockId(block),
       block,
       attachedMessageId,
-      suppressPromptMessage: attachedMessageId !== null,
+      suppressPromptMessage: exactMessageId !== null,
     };
 
     if (attachedMessageId) {
@@ -209,6 +216,74 @@ function collectRepresentedAgentTextCounts(
 
 function normalizeMessageText(text: string) {
   return normalizeAssistantMessageTextForMatching(text);
+}
+
+// Transcript timestamps come from the agent host's clock while message
+// created_at comes from the sender's; a little leeway keeps a block from
+// slipping one message early when the agent clock runs slightly behind.
+const BLOCK_TIME_SKEW_MS = 5_000;
+
+/**
+ * Latest message at or before the block's start (with skew tolerance), for
+ * blocks whose prompt message couldn't be matched by id. A block older than
+ * every message attaches to the earliest one; null only when there are no
+ * messages or the block has no usable timestamp.
+ */
+function findMessageIdByTime(
+  messages: RelayEvent[],
+  blockStartMs: number | null,
+): string | null {
+  if (blockStartMs === null || messages.length === 0) {
+    return null;
+  }
+  let bestId: string | null = null;
+  let bestMs = Number.NEGATIVE_INFINITY;
+  let earliestId: string | null = null;
+  let earliestMs = Number.POSITIVE_INFINITY;
+  for (const message of messages) {
+    const ms = message.created_at * 1_000;
+    if (ms < earliestMs) {
+      earliestMs = ms;
+      earliestId = message.id;
+    }
+    if (ms <= blockStartMs + BLOCK_TIME_SKEW_MS && ms >= bestMs) {
+      bestMs = ms;
+      bestId = message.id;
+    }
+  }
+  return bestId ?? earliestId;
+}
+
+function getBlockStartMs(block: TranscriptDisplayBlock): number | null {
+  if (block.kind === "single") {
+    return parseTimestampMs(block.item.timestamp);
+  }
+  for (const segment of block.segments) {
+    let ms: number | null = null;
+    if (segment.kind === "prompt") {
+      ms = parseTimestampMs(segment.user.timestamp);
+    } else if (segment.kind === "item") {
+      ms = parseTimestampMs(segment.item.timestamp);
+    } else if (segment.kind === "summary") {
+      ms =
+        parseTimestampMs(segment.summary.items[0]?.timestamp) ??
+        parseTimestampMs(segment.summary.timestamp);
+    } else if (segment.kind === "setup") {
+      ms = parseTimestampMs(segment.items[0]?.timestamp);
+    }
+    if (ms !== null) {
+      return ms;
+    }
+  }
+  return null;
+}
+
+function parseTimestampMs(timestamp: string | undefined): number | null {
+  if (!timestamp) {
+    return null;
+  }
+  const ms = Date.parse(timestamp);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 function getBlockId(block: TranscriptDisplayBlock) {

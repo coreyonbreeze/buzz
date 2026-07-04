@@ -283,3 +283,117 @@ test("buildChatActivityPlacement keeps separate agent turns visible", () => {
 
   assert.deepEqual([...placement.hiddenAgentMessageIds], []);
 });
+
+// ── Time-based fallback placement ────────────────────────────────────────
+
+function unmatchedTurnTranscript(promptIso, toolIso) {
+  return [
+    {
+      id: "prompt-x",
+      type: "message",
+      renderClass: "message",
+      role: "user",
+      title: "User",
+      text: "A replayed ask",
+      timestamp: promptIso,
+      turnId: "turn-x",
+      channelId: "chat-1",
+      sessionId: "session-1",
+      // Not present in the fetched message window — the id can't match.
+      messageId: "missing-from-window",
+      acpSource: "session/prompt:user",
+      authorPubkey: self,
+    },
+    {
+      id: "tool-x",
+      type: "tool",
+      renderClass: "shell",
+      descriptor: {
+        renderClass: "shell",
+        label: "Ran command",
+        preview: "pnpm test",
+      },
+      title: "pnpm test",
+      toolName: "shell",
+      buzzToolName: null,
+      status: "completed",
+      args: { command: "pnpm test" },
+      result: "ok",
+      isError: false,
+      timestamp: toolIso,
+      startedAt: toolIso,
+      completedAt: toolIso,
+      turnId: "turn-x",
+      channelId: "chat-1",
+      sessionId: "session-1",
+    },
+  ];
+}
+
+const seconds = (iso) => Math.floor(Date.parse(iso) / 1_000);
+
+test("a turn with an unmatched prompt id places by time, not at the bottom", () => {
+  const messages = [
+    message({
+      id: "user-1",
+      content: "First ask",
+      created_at: seconds("2026-07-02T07:00:00Z"),
+    }),
+    message({
+      id: "user-2",
+      content: "Second ask",
+      created_at: seconds("2026-07-02T08:00:00Z"),
+    }),
+  ];
+  const placement = buildChatActivityPlacement({
+    agentPubkey: agent,
+    messages,
+    transcript: unmatchedTurnTranscript(
+      "2026-07-02T07:00:05.000Z",
+      "2026-07-02T07:00:06.000Z",
+    ),
+  });
+
+  const attached = placement.blocksByMessageId.get("user-1") ?? [];
+  assert.equal(attached.length, 1, "the turn must follow its era's message");
+  assert.equal(
+    attached[0].suppressPromptMessage,
+    false,
+    "a time-placed block did not match the message by id",
+  );
+  assert.equal(placement.unplacedBlocks.length, 0);
+});
+
+test("an unmatched turn newer than every message follows the latest one", () => {
+  const messages = [
+    message({
+      id: "user-1",
+      content: "First ask",
+      created_at: seconds("2026-07-02T07:00:00Z"),
+    }),
+  ];
+  const placement = buildChatActivityPlacement({
+    agentPubkey: agent,
+    messages,
+    transcript: unmatchedTurnTranscript(
+      "2026-07-02T09:00:00.000Z",
+      "2026-07-02T09:00:01.000Z",
+    ),
+  });
+
+  assert.equal((placement.blocksByMessageId.get("user-1") ?? []).length, 1);
+  assert.equal(placement.unplacedBlocks.length, 0);
+});
+
+test("an unmatched turn with no messages stays in the trailing bucket", () => {
+  const placement = buildChatActivityPlacement({
+    agentPubkey: agent,
+    messages: [],
+    transcript: unmatchedTurnTranscript(
+      "2026-07-02T09:00:00.000Z",
+      "2026-07-02T09:00:01.000Z",
+    ),
+  });
+
+  assert.equal(placement.unplacedBlocks.length, 1);
+});
