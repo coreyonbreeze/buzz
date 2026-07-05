@@ -135,6 +135,75 @@ async fn chat_backlog_replay_since(
     }
 }
 
+/// Reclassify compatibility chats.
+///
+/// Relays that predate `channel_type: chat` store chats as plain private
+/// channels — the chat-ness lives only in a kind 30623 (or legacy 30078)
+/// chat-metadata event. Without this, every chat behavior keyed on
+/// `channel_type == "chat"` (activation backlog replay, mention gating,
+/// reaction suppression, title emission) silently degrades against staging.
+async fn mark_compat_chats(
+    rest: &relay::RestClient,
+    channel_info: &mut HashMap<Uuid, relay::ChannelInfo>,
+) {
+    const KIND_CHAT_METADATA: u16 = 30623;
+    const LEGACY_CHAT_METADATA_KIND: u16 = 30078;
+    const LEGACY_D_PREFIX: &str = "buzz:chat:";
+
+    if channel_info
+        .values()
+        .all(|info| info.channel_type == "chat")
+    {
+        return;
+    }
+    let filters = [
+        nostr::Filter::new()
+            .kind(nostr::Kind::Custom(KIND_CHAT_METADATA))
+            .limit(500),
+        nostr::Filter::new()
+            .kind(nostr::Kind::Custom(LEGACY_CHAT_METADATA_KIND))
+            .limit(1000),
+    ];
+    let value = match rest.query(&filters).await {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::debug!("compat chat metadata query failed: {error}");
+            return;
+        }
+    };
+    let mut reclassified = 0usize;
+    for event in value.as_array().into_iter().flatten() {
+        let kind = event.get("kind").and_then(|v| v.as_u64()).unwrap_or(0);
+        let tag_value = |name: &str| -> Option<String> {
+            event.get("tags")?.as_array()?.iter().find_map(|tag| {
+                let tag = tag.as_array()?;
+                (tag.first()?.as_str()? == name)
+                    .then(|| tag.get(1)?.as_str().map(str::to_string))
+                    .flatten()
+            })
+        };
+        let channel_id = if kind == u64::from(LEGACY_CHAT_METADATA_KIND) {
+            tag_value("chat_h").or_else(|| {
+                tag_value("d").and_then(|d| d.strip_prefix(LEGACY_D_PREFIX).map(str::to_string))
+            })
+        } else {
+            tag_value("d")
+        };
+        let Some(channel_id) = channel_id.and_then(|id| id.parse::<Uuid>().ok()) else {
+            continue;
+        };
+        if let Some(info) = channel_info.get_mut(&channel_id) {
+            if info.channel_type != "chat" {
+                info.channel_type = "chat".to_string();
+                reclassified += 1;
+            }
+        }
+    }
+    if reclassified > 0 {
+        tracing::info!("reclassified {reclassified} compatibility chat channel(s)");
+    }
+}
+
 /// Resolve the agent's owner pubkey at startup.
 ///
 /// Priority:
@@ -1382,10 +1451,12 @@ async fn tokio_main() -> Result<()> {
         }
     }
 
-    let channel_info_map = relay
+    let mut channel_info_map = relay
         .discover_channels()
         .await
         .map_err(|e| anyhow::anyhow!("channel discovery error: {e}"))?;
+    mark_compat_chats(&relay.rest_client(), &mut channel_info_map).await;
+    let channel_info_map = channel_info_map;
 
     tracing::info!("discovered {} channel(s)", channel_info_map.len());
     let channel_ids: Vec<Uuid> = channel_info_map.keys().copied().collect();
@@ -1830,6 +1901,11 @@ async fn tokio_main() -> Result<()> {
                                         match relay.discover_channels().await {
                                             Ok(discovered) => {
                                                 event_channel_info.extend(discovered);
+                                                mark_compat_chats(
+                                                    &ctx.rest_client,
+                                                    &mut event_channel_info,
+                                                )
+                                                .await;
                                             }
                                             Err(e) => {
                                                 tracing::debug!(
