@@ -123,12 +123,13 @@ function parseWorktreeAdd(args: string[]): string | null {
   if (positional.length >= 2) {
     // `git worktree add <path> <branch>` — a commit-ish second arg (sha)
     // isn't a branch name worth showing.
-    return looksLikeSha(positional[1]) ? null : positional[1];
+    return isPlausibleBranchName(positional[1]) ? positional[1] : null;
   }
   if (positional.length === 1) {
     // `git worktree add <path>` creates a branch named after the basename.
     const parts = positional[0].split("/").filter(Boolean);
-    return parts[parts.length - 1] || null;
+    const basename = parts[parts.length - 1] ?? "";
+    return isPlausibleBranchName(basename) ? basename : null;
   }
   return null;
 }
@@ -145,7 +146,7 @@ function parseCheckoutOrSwitch(args: string[]): string | null {
     return null;
   }
   const positional = args.filter((token) => !token.startsWith("-"));
-  if (positional.length !== 1 || looksLikeSha(positional[0])) {
+  if (positional.length !== 1 || !isPlausibleBranchName(positional[0])) {
     return null;
   }
   return positional[0];
@@ -155,12 +156,21 @@ function valueOfFlag(args: string[], flags: string[]): string | null {
   for (let index = 0; index < args.length; index += 1) {
     if (flags.includes(args[index])) {
       const value = args[index + 1];
-      if (value && !value.startsWith("-")) {
+      if (value && isPlausibleBranchName(value)) {
         return value;
       }
     }
   }
   return null;
+}
+
+/**
+ * Real git ref charset, no placeholders: template text like
+ * `git checkout -b <branch>` in an explanatory message must never surface
+ * "<branch>" as the chip's branch.
+ */
+function isPlausibleBranchName(token: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(token) && !looksLikeSha(token);
 }
 
 function looksLikeSha(token: string): boolean {

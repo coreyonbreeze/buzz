@@ -141,3 +141,22 @@ test("non-agent messages and branchless text derive nothing", () => {
   );
   assert.equal(deriveBranchFromAgentMessages([], null), null);
 });
+
+test("placeholder tokens in template commands never parse as branches", () => {
+  assert.equal(parseBranchFromCommand("git checkout -b <branch>"), null);
+  assert.equal(parseBranchFromCommand("git switch <name>"), null);
+  assert.equal(parseBranchFromCommand("git worktree add ../wt <branch>"), null);
+  assert.equal(parseBranchFromCommand("git worktree add ../<dir>"), null);
+  assert.equal(
+    deriveBranchFromAgentMessages(
+      [
+        {
+          pubkey: "cd".repeat(32),
+          content: "Run `git checkout -b <branch>` to start.",
+        },
+      ],
+      "cd".repeat(32),
+    ),
+    null,
+  );
+});
