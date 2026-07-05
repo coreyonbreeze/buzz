@@ -30,6 +30,13 @@ import { GithubPullRequestCard } from "@/shared/ui/link-preview-attachment";
 const CHIP_CLASS =
   "flex items-center gap-1.5 rounded-2xl border border-border/70 bg-muted/30 px-3 py-2.5 text-xs";
 
+// Last branch/PR the panel showed per chat. Async sources (the PR query)
+// resolve after mount, and without this the chip replays its swap animation
+// and the card replays its pop-in on every visit to the chat — the
+// animations should mark NEW information, not navigation.
+const lastShownBranchByChat = new Map<string, string>();
+const lastShownPrByChat = new Map<string, string>();
+
 /**
  * Right-hand work drawer for a chat: branch, live PR card, and a CI monitor
  * once the agent has produced a pull request; an empty state before that.
@@ -83,7 +90,35 @@ export function ChatWorkPanel({
   const openThreads = commentStateQuery.data?.openThreads ?? 0;
   // Live activity wins over the PR's head ref: the agent may have moved to a
   // new worktree since opening the PR, and activity updates immediately.
-  const currentBranch = branch?.trim() || pr?.headRef?.trim() || null;
+  // While async sources are still resolving, fall back to what this chat
+  // last showed so a revisit renders the branch statically from the first
+  // frame instead of animating in from the placeholder.
+  const resolvedBranch = branch?.trim() || pr?.headRef?.trim() || null;
+  const currentBranch =
+    resolvedBranch ?? lastShownBranchByChat.get(chatId) ?? null;
+  React.useEffect(() => {
+    if (resolvedBranch) {
+      lastShownBranchByChat.set(chatId, resolvedBranch);
+    }
+  }, [chatId, resolvedBranch]);
+  // Latched per href for this mount: the effect below records the href as
+  // seen immediately, and un-latching would strip the class mid-animation.
+  const prEntranceDecisions = React.useRef(new Map<string, boolean>());
+  let isNewPrForChat = false;
+  if (preview) {
+    const latched = prEntranceDecisions.current.get(preview.href);
+    if (latched === undefined) {
+      isNewPrForChat = lastShownPrByChat.get(chatId) !== preview.href;
+      prEntranceDecisions.current.set(preview.href, isNewPrForChat);
+    } else {
+      isNewPrForChat = latched;
+    }
+  }
+  React.useEffect(() => {
+    if (preview?.href) {
+      lastShownPrByChat.set(chatId, preview.href);
+    }
+  }, [chatId, preview?.href]);
 
   // Automation: prompt the agent on CI failure / newly-open review threads.
   // Watermarks in storage keep this to one nudge per failing sha and per
@@ -145,6 +180,10 @@ export function ChatWorkPanel({
                 "min-w-0",
                 currentBranch ? "font-mono" : "text-muted-foreground",
               )}
+              // Keyed by chat: switching chats remounts the text statically
+              // (first render never animates) — only an in-place branch
+              // change for THIS chat plays the swap.
+              key={chatId}
               text={currentBranch ?? "No current branch"}
             />
           </div>
@@ -152,7 +191,10 @@ export function ChatWorkPanel({
             // Keyed by href so a NEW pull request re-runs the pop-in, not
             // just the first one.
             <div
-              className="buzz-work-card-in flex flex-col gap-2"
+              className={cn(
+                "flex flex-col gap-2",
+                isNewPrForChat && "buzz-work-card-in",
+              )}
               key={preview.href}
             >
               <GithubPullRequestCard className="w-full" preview={preview} />
