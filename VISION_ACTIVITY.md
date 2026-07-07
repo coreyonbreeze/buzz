@@ -1,5 +1,7 @@
 # Vision: The Agent Activity Feed
 
+> **Note:** migrated to [docs/vision/activity.md](docs/vision/activity.md); the docs tree is canonical. Retained temporarily.
+
 ## The Problem
 
 When you delegate work to an agent, you are trusting a process you cannot see. The activity feed is the window into that process — but a window is only useful if you can read it at a glance. A raw input/output dump is not a window; it is a transcript you have to decode. It forces you to *parse* before you can *judge*.

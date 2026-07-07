@@ -1,5 +1,7 @@
 # 🐝 Buzz — The relay is the workspace
 
+> **Note:** this document has been migrated to [docs/vision/README.md](docs/vision/README.md). The docs tree is canonical; this file is retained temporarily and may be removed in a follow-up.
+
 > An engineer is debugging a production incident at 2am. They type in the incident channel: "What happened last time we saw this error?"
 >
 > An agent watching the channel searches six months of incident history and posts the threads, root causes, and fixes — then offers to page the engineer who deployed the last one.

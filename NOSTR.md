@@ -1,5 +1,7 @@
 # Using Third-Party Nostr Clients with Buzz
 
+> **Note:** this document has been migrated: protocol semantics → [docs/architecture/protocol.md](docs/architecture/protocol.md), client-interop how-to → [docs/guides/nostr-clients.md](docs/guides/nostr-clients.md). The docs tree is canonical; this file is retained temporarily and may be removed in a follow-up.
+
 Buzz is a Nostr relay that speaks NIP-29 (relay-based groups) natively. Third-party Nostr clients connect directly to `buzz-relay` using NIP-29 and NIP-42 authentication. The old NIP-28 compatibility proxy has been removed.
 
 ## Community scope

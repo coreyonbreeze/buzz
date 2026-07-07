@@ -1,5 +1,7 @@
 # Testing
 
+> **Note:** this document has been migrated into the docs tree: local relay setup → [docs/getting-started/local-relay.md](docs/getting-started/local-relay.md), testing guide → [docs/guides/testing.md](docs/guides/testing.md), agent harness → [docs/guides/agents.md](docs/guides/agents.md), configuration tables → [docs/reference/configuration.md](docs/reference/configuration.md). The docs tree is canonical; this file is retained temporarily and may be removed in a follow-up.
+
 ## Automated Tests
 
 ```bash

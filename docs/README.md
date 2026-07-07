@@ -1,8 +1,5 @@
 # Buzz Documentation
 
-> **Status: skeleton — Phase 1 (structure).** Stub pages carry per-page outlines and
-> source-material pointers; content lands in Phase 2.
-
 ## Getting Started
 
 - [Installation](getting-started/installation.md)
@@ -42,16 +39,23 @@
 
 ## Vision
 
-- [Vision](vision/README.md) — aspirational direction, **not** current behavior
+Aspirational direction — **not** current behavior (see [known limitations](reference/known-limitations.md) for what's real today):
+
+- [The relay is the workspace](vision/README.md) — core vision
+- [Agent Activity Feed](vision/activity.md)
+- [buzz-agent + buzz-dev-mcp](vision/agent.md)
+- [Buzz Mesh](vision/mesh.md) — community compute
+- [Buzz Projects](vision/projects.md) — Nostr-native forge
+- [Sovereign relay](vision/sovereign.md) — your project, your domain
 
 ## Root-Level Docs (stay at repository root)
 
 GitHub-convention files remain at the root: `README.md`, `CONTRIBUTING.md`, `SECURITY.md`,
 `GOVERNANCE.md`, `CODE_OF_CONDUCT.md`, `CHANGELOG.md`, `AGENTS.md`/`CLAUDE.md`.
 
-`ARCHITECTURE.md`, `NOSTR.md`, `TESTING.md`, `RELEASING.md`, and `VISION*.md` are being
-migrated into this tree. In Phase 2 they will be reduced to pointer files once their
-content has moved; they are untouched in Phase 1.
+`ARCHITECTURE.md`, `NOSTR.md`, `TESTING.md`, `RELEASING.md`, and `VISION*.md` have been
+migrated into this tree. The originals remain at the root with pointer notes for now;
+removing them is a follow-up decision. **This tree is canonical for migrated content.**
 
 ## Note on file locations
 

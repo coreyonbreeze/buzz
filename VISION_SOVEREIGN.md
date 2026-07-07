@@ -1,5 +1,7 @@
 # Buzz — Your Project, Your Domain
 
+> **Note:** migrated to [docs/vision/sovereign.md](docs/vision/sovereign.md); the docs tree is canonical. Retained temporarily.
+
 `myproject.com` is your workspace. Not a GitHub org page that happens to have your
 name on it. Not a Discord server that Discord could delete tomorrow. Your domain.
 Your relay. One thing.

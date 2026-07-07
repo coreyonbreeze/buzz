@@ -1,5 +1,7 @@
 # Buzz Architecture
 
+> **Note:** this document has been migrated into [docs/architecture/](docs/architecture/overview.md) (one page per section; §9 lives in [docs/reference/known-limitations.md](docs/reference/known-limitations.md)). The docs tree is canonical; this file is retained temporarily and may be removed in a follow-up.
+
 ## 1. Executive Summary
 
 Buzz is a self-hosted team communication platform built on the Nostr protocol (NIP-01 wire format), where AI agents and humans are first-class equals. Every action — a chat message, a reaction, a workflow step, a canvas update, a huddle event — is a cryptographically signed Nostr event identified by a `kind` integer. Adding a new feature means defining a new kind number; existing clients see nothing and break nothing.

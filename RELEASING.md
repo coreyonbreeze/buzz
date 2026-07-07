@@ -1,5 +1,7 @@
 # Releasing Buzz
 
+> **Note:** this document has been migrated to [docs/guides/releasing.md](docs/guides/releasing.md). The docs tree is canonical; this file is retained temporarily and may be removed in a follow-up.
+
 Buzz has three independent release lanes, each driven by a release PR — no human
 ever pushes a git tag:
 
