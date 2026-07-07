@@ -67,7 +67,9 @@ export function blankAgentDraft(): AgentDraft {
 export function templateAgentDraft(template: AgentTemplate): AgentDraft {
   return {
     title: `New ${template.displayName}`,
-    description: "Review this starter agent and adjust it as needed.",
+    // Intentionally blank: the template name in the title says enough, and
+    // the dialog hides the description line when it's empty.
+    description: "",
     submitLabel: "Create agent",
     name: template.displayName,
     avatarUrl: template.avatarUrl ?? "",
