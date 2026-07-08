@@ -339,7 +339,10 @@ const overrides = new Map([
   // +3: onLinkShortcutRef wiring (ref decl + editor option + assignment) for
   // the ⌘K link-editor shortcut, mirroring the existing onEditLinkRef
   // pattern. Queued to split with the rest of this list.
-  ["src/features/messages/ui/MessageComposer.tsx", 1036],
+  // +15 local-dictation integration: useLocalDictation wiring (mic toggle,
+  // transcript-append handler, recording/transcribing state, stop-on-send/edit
+  // guards). Load-bearing feature growth; queued to split with the rest.
+  ["src/features/messages/ui/MessageComposer.tsx", 1052],
   // global-agent-config: model-tuning section (BuzzAgentModelTuningFields via
   // EditAgentAdvancedFields) + providerValid gate + effectiveProvider derivation
   // + globalProvider threading into getPersonaProviderOptions. All load-bearing
