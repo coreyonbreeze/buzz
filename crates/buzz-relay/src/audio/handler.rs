@@ -419,6 +419,8 @@ async fn handle_audio_connection(
     // path is complete and correct; roster consistency lands with the owner's
     // roster-delta messages over the same `HuddleControl` stream.
     let mut remote_session: Option<crate::audio::join::RemoteHuddleSession> = None;
+    let mut remote_stream: Option<buzz_relay_mesh::MeshStream> = None;
+    let mut remote_fence: Option<Arc<crate::audio::mesh::GenerationFloor>> = None;
     if let (Some(mesh), Some(crate::audio::join::JoinOutcome::RemoteOwner { .. })) =
         (state.mesh(), pending_remote)
     {
@@ -441,7 +443,11 @@ async fn handle_audio_connection(
         )
         .await
         {
-            Ok(session) => remote_session = Some(session),
+            Ok((session, stream)) => {
+                remote_session = Some(session);
+                remote_stream = Some(stream);
+                remote_fence = Some(Arc::clone(&mesh.audio_fence));
+            }
             Err(crate::audio::join::DialError::Rejected(reason)) => {
                 warn!(
                     channel_id = %channel_id,
@@ -532,6 +538,39 @@ async fn handle_audio_connection(
         fwd_cancel,
     ));
 
+    // Non-owner path: own the owner's `HuddleControl` stream in a reader task.
+    // It races the owner's teardown signal against our own cancellation:
+    //   * owner speaks first (`Goodbye` / stream close) → tear the client down
+    //     and close its WS so it rejoins (against a fresh owner/generation),
+    //     and forget the local generation floor so the rejoin isn't fenced by
+    //     the dead session. Redis remains the ownership arbiter; forgetting the
+    //     floor only clears local stale-frame suppression.
+    //   * we cancel first (client left / heartbeat death) → send the clean
+    //     `UnregisterPeer` + `Goodbye(SessionEnded)` so the owner drops us.
+    let reader_task = remote_stream.map(|mut stream| {
+        let reader_cancel = cancel.clone();
+        let fence = remote_fence.expect("remote_fence set whenever remote_stream is");
+        let fenced = remote_session
+            .as_ref()
+            .expect("remote_session set whenever remote_stream is")
+            .fenced();
+        let pubkey = remote_session
+            .as_ref()
+            .expect("remote_session set whenever remote_stream is")
+            .pubkey()
+            .to_string();
+        tokio::spawn(async move {
+            tokio::select! {
+                cause = crate::audio::join::read_teardown_cause(&mut stream) => {
+                    teardown_remote_huddle(cause, channel_id, &reader_cancel, &fence);
+                }
+                _ = reader_cancel.cancelled() => {
+                    crate::audio::join::send_clean_close(&mut stream, fenced, &pubkey).await;
+                }
+            }
+        })
+    });
+
     recv_loop(
         ws_recv,
         Arc::clone(&room),
@@ -544,16 +583,15 @@ async fn handle_audio_connection(
     )
     .await;
 
-    // Non-owner path: unregister from the owner and close the control stream
-    // cleanly. Best-effort — teardown never blocks connection cleanup.
-    if let Some(session) = remote_session {
-        session.close().await;
-    }
-
     cancel.cancel();
     let _ = send_task.await;
     let _ = heartbeat_task.await;
     let _ = forward_task.await;
+    // The reader task owns the owner control stream; joining it here guarantees
+    // its clean-close (or teardown) completes before connection cleanup returns.
+    if let Some(reader_task) = reader_task {
+        let _ = reader_task.await;
+    }
 
     // Atomic remove + end check: remove_peer_and_check_ended holds the
     // AdmissionGuard lock across index recycling AND the is_empty + ended=true
@@ -617,6 +655,31 @@ async fn handle_audio_connection(
         pubkey = %pubkey_hex,
         "audio peer left"
     );
+}
+
+/// React to a non-owner huddle teardown signal read off the owner's control
+/// stream: cancel the connection (which drives the client's WS to close so it
+/// rejoins) and forget the local generation floor for this session.
+///
+/// The `cause` is logged for observability but does not change behaviour —
+/// every cause is recoverable by a rejoin, whether against a fresh owner
+/// (`OwnerLost`/`StreamClosed`), a draining owner (`OwnerDraining`), or a room
+/// that simply ended (`SessionEnded`). `forget` clears local stale-frame
+/// suppression so the rejoin's fresh generation is accepted; it never
+/// authorizes ownership — Redis fenced CAS remains the arbiter.
+fn teardown_remote_huddle(
+    cause: crate::audio::join::HuddleTeardownCause,
+    channel_id: Uuid,
+    cancel: &CancellationToken,
+    fence: &crate::audio::mesh::GenerationFloor,
+) {
+    info!(
+        channel_id = %channel_id,
+        ?cause,
+        "owner tore down cross-pod huddle session — closing client for rejoin"
+    );
+    cancel.cancel();
+    fence.forget(channel_id);
 }
 
 /// Map an owner's registration rejection to the client-facing WS error, using

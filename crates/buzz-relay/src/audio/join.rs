@@ -712,11 +712,75 @@ pub struct RemoteHuddleSession {
     pubkey: String,
     /// Transport for datagrams and the control-stream teardown.
     transport: Arc<dyn RelayPeerTransport>,
-    /// The open `HuddleControl` stream to the owner; a clean `Goodbye` is sent
-    /// on teardown.
-    stream: MeshStream,
     /// Per-datagram monotonic sequence for loss/reorder observability.
     seq: u64,
+}
+
+/// Why a non-owner pod is tearing down a client's cross-pod huddle session.
+///
+/// Read off the owner's `HuddleControl` stream: the owner speaks its intent as
+/// a [`MeshStreamFrame::Goodbye`] reason, or the stream simply ends. The
+/// non-owner maps that cause to a client-facing outcome — every cause tears the
+/// local client down and closes its WS so it can rejoin (against a fresh owner
+/// or a fresh generation); the distinction is observability, not divergent
+/// behaviour. There is no `Lost` wire variant: owner loss surfaces as
+/// [`GoodbyeReason::StaleGeneration`] (the owner fenced itself out) or, if it
+/// died mid-flight, as a bare stream close.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HuddleTeardownCause {
+    /// Owner sent `Goodbye(StaleGeneration)` — it observed a newer generation
+    /// and fenced itself out. From the client's view: the owner was lost; a
+    /// rejoin will resolve the new owner via Redis.
+    OwnerLost,
+    /// Owner sent `Goodbye(Draining)` — it is shutting down (SIGTERM). A rejoin
+    /// re-establishes against whichever pod takes the lease next.
+    OwnerDraining,
+    /// Owner sent `Goodbye(SessionEnded)` — the session ended normally
+    /// (e.g. the room emptied on the owner). An ordinary disconnect.
+    SessionEnded,
+    /// The stream closed or reset with no `Goodbye` — the owner pod died or the
+    /// link broke mid-flight. Treated like owner loss: rejoin to recover.
+    StreamClosed,
+}
+
+impl HuddleTeardownCause {
+    fn from_goodbye(reason: GoodbyeReason) -> Self {
+        match reason {
+            GoodbyeReason::StaleGeneration => Self::OwnerLost,
+            GoodbyeReason::Draining => Self::OwnerDraining,
+            GoodbyeReason::SessionEnded => Self::SessionEnded,
+        }
+    }
+}
+
+/// Read the owner's `HuddleControl` stream until it signals teardown.
+///
+/// The non-owner side's stream carries only owner→client control today
+/// (`PeerRegistered`/`RegisterRejected` are consumed during the dial). Any
+/// further `Data`/`Gossip` frame is non-terminal and skipped — this is the
+/// forward-compatible seam for owner→client roster deltas, which must not be
+/// mistaken for teardown. The loop returns exactly once, on the first terminal
+/// signal: a [`MeshStreamFrame::Goodbye`], or a clean close / transport error
+/// (both [`HuddleTeardownCause::StreamClosed`]).
+pub async fn read_teardown_cause(stream: &mut MeshStream) -> HuddleTeardownCause {
+    loop {
+        match stream.recv_frame().await {
+            Ok(Some(MeshStreamFrame::Goodbye { reason, .. })) => {
+                return HuddleTeardownCause::from_goodbye(reason);
+            }
+            // Non-terminal owner→client traffic (future roster deltas): ignore
+            // and keep reading. A stray Hello here would be a protocol error,
+            // but the transport already validated the opening Hello, so treat
+            // any non-Goodbye frame as non-terminal rather than tearing down.
+            Ok(Some(_)) => continue,
+            // Clean close (None) or transport error: the owner is gone.
+            Ok(None) => return HuddleTeardownCause::StreamClosed,
+            Err(e) => {
+                debug!(owner_stream_error = %e, "huddle owner stream ended abnormally");
+                return HuddleTeardownCause::StreamClosed;
+            }
+        }
+    }
 }
 
 /// Why a cross-pod join could not complete on the non-owner side.
@@ -749,7 +813,7 @@ pub async fn dial_remote_owner(
     community_id: CommunityId,
     pubkey: String,
     protocol_version: u8,
-) -> Result<RemoteHuddleSession, DialError> {
+) -> Result<(RemoteHuddleSession, MeshStream), DialError> {
     let hello = StreamHello {
         sender: local_runtime_id,
         role: StreamRole::Session {
@@ -773,15 +837,17 @@ pub async fn dial_remote_owner(
 
     match stream.recv_frame().await? {
         Some(MeshStreamFrame::Data { payload, .. }) => match decode_control(&payload)? {
-            HuddleControlMsg::PeerRegistered { peer_index, .. } => Ok(RemoteHuddleSession {
-                peer_index,
-                fenced,
-                owner,
-                pubkey,
-                transport,
+            HuddleControlMsg::PeerRegistered { peer_index, .. } => Ok((
+                RemoteHuddleSession {
+                    peer_index,
+                    fenced,
+                    owner,
+                    pubkey,
+                    transport,
+                    seq: 0,
+                },
                 stream,
-                seq: 0,
-            }),
+            )),
             HuddleControlMsg::RegisterRejected { reason, .. } => Err(DialError::Rejected(reason)),
             other => Err(DialError::Mesh(MeshError::Transport(format!(
                 "expected PeerRegistered/RegisterRejected, got {other:?}"
@@ -806,6 +872,17 @@ impl RemoteHuddleSession {
         self.peer_index
     }
 
+    /// The session fence — used by the reader task to author the closing
+    /// `UnregisterPeer` / `Goodbye` on the owner's control stream.
+    pub fn fenced(&self) -> FencedHeader {
+        self.fenced
+    }
+
+    /// The local client's pubkey — used by the reader task's `UnregisterPeer`.
+    pub fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
+
     /// Forward one client Opus frame to the owner as a media datagram, tagged
     /// with the owner-assigned index. Drop-on-error: realtime audio never blocks
     /// on a slow or gone link (the same discipline as local fan-out).
@@ -816,30 +893,29 @@ impl RemoteHuddleSession {
             debug!(owner = %self.owner, "huddle media datagram to owner failed: {e}");
         }
     }
+}
 
-    /// Unregister the client from the owner and close the control stream
-    /// cleanly. Best-effort: teardown never blocks connection cleanup.
-    pub async fn close(mut self) {
-        let _ = self
-            .stream
-            .send_frame(MeshStreamFrame::Data {
-                fenced: self.fenced,
-                payload: match encode_control(&HuddleControlMsg::UnregisterPeer {
-                    pubkey: self.pubkey.clone(),
-                }) {
-                    Ok(p) => p,
-                    Err(_) => return,
-                },
-            })
-            .await;
-        let _ = self
-            .stream
-            .send_frame(MeshStreamFrame::Goodbye {
-                fenced: self.fenced,
-                reason: HUDDLE_SESSION_ENDED,
-            })
+/// Unregister the client from the owner and close the control stream cleanly.
+///
+/// Called on a *local-client-initiated* disconnect (the reader task's cancel
+/// branch), so the owner drops the remote peer and stops fanning media back.
+/// Best-effort: teardown never blocks connection cleanup, and a `Goodbye`
+/// already received from the owner makes this a no-op the owner ignores.
+pub async fn send_clean_close(stream: &mut MeshStream, fenced: FencedHeader, pubkey: &str) {
+    if let Ok(payload) = encode_control(&HuddleControlMsg::UnregisterPeer {
+        pubkey: pubkey.to_string(),
+    }) {
+        let _ = stream
+            .send_frame(MeshStreamFrame::Data { fenced, payload })
             .await;
     }
+    let _ = stream
+        .send_frame(MeshStreamFrame::Goodbye {
+            fenced,
+            reason: HUDDLE_SESSION_ENDED,
+        })
+        .await;
+    let _ = stream.finish();
 }
 
 /// Build the media datagram a non-owner ships to the owner for one client
@@ -1313,5 +1389,109 @@ mod tests {
         let d1 = media_datagram(7, fenced, 3, &[]);
         assert_eq!(d1.payload, vec![7]);
         assert_eq!(d1.seq, 3);
+    }
+
+    // ── Non-owner teardown reader: wire signal → HuddleTeardownCause ──────────
+    //
+    // Drive `read_teardown_cause` over the in-memory stream pair: the "owner"
+    // half writes a terminal signal, and the "client" half's reader must
+    // classify it. Every arm of `GoodbyeReason` plus a bare stream close.
+
+    /// Send a `Goodbye(reason)` from the owner half and assert the reader maps
+    /// it to `expected`.
+    async fn assert_goodbye_maps(reason: GoodbyeReason, expected: HuddleTeardownCause) {
+        let fenced = fenced_owned_by(rt(2), Uuid::new_v4());
+        let (mut owner, mut client) = stream_pair();
+        owner
+            .send_frame(MeshStreamFrame::Goodbye { fenced, reason })
+            .await
+            .unwrap();
+        assert_eq!(read_teardown_cause(&mut client).await, expected);
+    }
+
+    #[tokio::test]
+    async fn reader_maps_stale_generation_to_owner_lost() {
+        assert_goodbye_maps(
+            GoodbyeReason::StaleGeneration,
+            HuddleTeardownCause::OwnerLost,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reader_maps_draining_to_owner_draining() {
+        assert_goodbye_maps(GoodbyeReason::Draining, HuddleTeardownCause::OwnerDraining).await;
+    }
+
+    #[tokio::test]
+    async fn reader_maps_session_ended_to_ordinary_disconnect() {
+        assert_goodbye_maps(
+            GoodbyeReason::SessionEnded,
+            HuddleTeardownCause::SessionEnded,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn reader_maps_bare_stream_close_to_stream_closed() {
+        let (owner, mut client) = stream_pair();
+        // Owner pod dies mid-flight: the send half drops with no Goodbye, so the
+        // client's recv sees a clean close.
+        drop(owner);
+        assert_eq!(
+            read_teardown_cause(&mut client).await,
+            HuddleTeardownCause::StreamClosed
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_skips_non_terminal_frames_then_tears_down() {
+        // A future owner→client roster delta (a `Data` frame) must NOT be read
+        // as teardown; the reader keeps going and returns on the later Goodbye.
+        let fenced = fenced_owned_by(rt(2), Uuid::new_v4());
+        let (mut owner, mut client) = stream_pair();
+        owner
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: vec![0xAB, 0xCD],
+            })
+            .await
+            .unwrap();
+        owner
+            .send_frame(MeshStreamFrame::Goodbye {
+                fenced,
+                reason: GoodbyeReason::StaleGeneration,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            read_teardown_cause(&mut client).await,
+            HuddleTeardownCause::OwnerLost
+        );
+    }
+
+    /// The client-initiated clean close emits `UnregisterPeer` then
+    /// `Goodbye(SessionEnded)` on the owner's control stream, in that order.
+    #[tokio::test]
+    async fn clean_close_sends_unregister_then_goodbye() {
+        let fenced = fenced_owned_by(rt(2), Uuid::new_v4());
+        let (mut owner, mut client) = stream_pair();
+        send_clean_close(&mut client, fenced, "client-a").await;
+
+        match owner.recv_frame().await.unwrap().unwrap() {
+            MeshStreamFrame::Data { payload, .. } => assert_eq!(
+                decode_control(&payload).unwrap(),
+                HuddleControlMsg::UnregisterPeer {
+                    pubkey: "client-a".into()
+                }
+            ),
+            other => panic!("expected UnregisterPeer Data, got {other:?}"),
+        }
+        match owner.recv_frame().await.unwrap().unwrap() {
+            MeshStreamFrame::Goodbye { reason, .. } => {
+                assert_eq!(reason, GoodbyeReason::SessionEnded)
+            }
+            other => panic!("expected Goodbye(SessionEnded), got {other:?}"),
+        }
     }
 }
