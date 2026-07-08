@@ -435,6 +435,7 @@ async fn handle_audio_connection(
             mesh.local_runtime_id,
             owner_runtime_id,
             fenced,
+            tenant.community(),
             pubkey_hex.clone(),
             requested_version,
         )
@@ -621,9 +622,7 @@ async fn handle_audio_connection(
 /// Map an owner's registration rejection to the client-facing WS error, using
 /// the same `code`s a same-pod join produces so a cross-pod client handles them
 /// identically. Fence rejections carry their taxonomy code for observability.
-fn remote_rejection_ws_error(
-    reason: &crate::audio::join::RegisterRejection,
-) -> serde_json::Value {
+fn remote_rejection_ws_error(reason: &crate::audio::join::RegisterRejection) -> serde_json::Value {
     use crate::audio::join::RegisterRejection;
     match reason {
         RegisterRejection::RoomFull => serde_json::json!({

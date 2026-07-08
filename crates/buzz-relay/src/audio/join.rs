@@ -273,6 +273,20 @@ pub enum HuddleControlMsg {
     /// Non-owner → owner: register a local client as a remote peer in the
     /// owner's room. The owner allocates the `peer_index`.
     RegisterPeer {
+        /// The community the huddle belongs to, as its raw UUID. Rides the
+        /// control frame because the mesh dispatch layer is community-agnostic —
+        /// `Hello` and the fenced header carry no community — yet the owner's
+        /// Redis fence key is `(community_id, session_id)`. Carried as a `Uuid`,
+        /// not a [`CommunityId`], on purpose: `CommunityId` is deliberately
+        /// non-deserializable so it can never be minted from client input. This
+        /// mesh frame is server-to-server, and the owner reconstitutes the
+        /// `CommunityId` explicitly via `from_uuid` before fencing. The
+        /// assertion is self-verifying, not trusted: `validate` looks up the key
+        /// the owner's own `acquire` created, so a wrong community finds no lease
+        /// and is rejected (`no_active_lease`) *before* any room mutation. The
+        /// owner latches the community from the first frame and rejects any
+        /// later frame on the same stream that names a different one.
+        community_id: Uuid,
         /// Nostr pubkey hex of the joining client.
         pubkey: String,
         /// Huddle audio protocol version the client negotiated; the owner's
@@ -400,8 +414,9 @@ pub const HUDDLE_CONTROL_PROFILE: Profile = Profile::HuddleControl;
 /// One instance per relay; the boot-seam dispatcher routes every
 /// `Profile::HuddleControl` session stream to [`Self::accept_inbound`]. It is
 /// the counterpart to Perci's reliable-stream acceptor — same
-/// `accept_inbound(community_id, from, hello, stream)` shape, different profile
-/// and body.
+/// `accept_inbound(from, hello, stream)` shape, different profile and body.
+/// The community is not a handshake parameter: it rides the first stateful
+/// frame and is self-verified by the fence (see [`Self::serve_control_loop`]).
 pub struct HuddleControlAcceptor<D: HuddleDirectory + ?Sized> {
     rooms: Arc<AudioRoomManager>,
     transport: Arc<dyn RelayPeerTransport>,
@@ -430,14 +445,18 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
     /// Accept and validate an inbound `HuddleControl` stream, then serve its
     /// register/unregister control loop until the stream closes.
     ///
-    /// Validation mirrors the reliable-stream acceptor and enforces the fencing
-    /// law on receipt: the claimed sender must be the authenticated peer, the
-    /// profile must be `HuddleControl`, the fence must pass Redis, and this pod
-    /// must be the fenced owner. Any of these failing rejects the stream before
-    /// a single peer is admitted.
+    /// The `Hello` is validated **structurally only** — it admits no peer and
+    /// touches no room, so it is deliberately not Redis-fenced: the fence key is
+    /// `(community_id, session_id)` and the community is not known until the
+    /// first `RegisterPeer` frame carries it. Structural checks are: the claimed
+    /// sender is the authenticated peer, the role is a `HuddleControl` session,
+    /// and this pod is the header's named owner. The first *stateful* operation
+    /// (`RegisterPeer`) is where the Redis fence runs, before `room.add_peer` —
+    /// see [`Self::serve_control_loop`]. Matches the dispatcher callback shape
+    /// `(from, hello, stream)`; no `community_id` param — community rides the
+    /// wire and is self-verified by the fence.
     pub async fn accept_inbound(
         &self,
-        community_id: CommunityId,
         from: RuntimeId,
         hello: StreamHello,
         stream: MeshStream,
@@ -458,9 +477,10 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                 "huddle-control acceptor got profile {profile:?}"
             )));
         }
-        // Fence at every hop: the origin validated before dialing; the owner
-        // re-validates on receipt so a lease that moved in between is caught.
-        self.directory.validate(community_id, &fenced).await?;
+        // Structural owner check: reject an obviously-misrouted stream cheaply,
+        // before serving any frame. This is not the fence — the authoritative
+        // Redis re-validation happens per control frame in the loop, keyed by
+        // the community the frame carries.
         if fenced.owner_runtime_id != self.local_runtime_id {
             return Err(MeshError::OwnerMismatch {
                 session_id: fenced.session_id,
@@ -470,31 +490,44 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
             });
         }
 
-        self.serve_control_loop(community_id, from, fenced, stream)
-            .await
+        self.serve_control_loop(from, fenced, stream).await
     }
 
     /// Serve register/unregister frames for one non-owner pod's stream.
+    ///
+    /// The community is learned from the first `RegisterPeer` frame and latched
+    /// for the life of the stream — a stream is one non-owner pod's view of one
+    /// huddle, so exactly one community applies. Later frames naming a different
+    /// community are rejected. The Redis fence runs on `RegisterPeer` *before*
+    /// `room.add_peer` (validate-before-admit): a frame asserting the wrong
+    /// community keys a lease that does not exist and is rejected before any
+    /// state mutation. `UnregisterPeer` only removes entries from this stream's
+    /// own `registered` map, so it needs no fence — it cannot mutate another
+    /// community's room.
     ///
     /// Peers this stream registers are tracked so a stream close (the non-owner
     /// pod went away) tears them all down — no leaked remote peers holding
     /// index slots in the owner's room.
     async fn serve_control_loop(
         &self,
-        community_id: CommunityId,
         from: RuntimeId,
         fenced: FencedHeader,
         mut stream: MeshStream,
     ) -> Result<(), MeshError> {
         let session_id = fenced.session_id;
         // pubkey -> peer_id, for UnregisterPeer and teardown on stream close.
-        let mut registered: std::collections::HashMap<String, Uuid> = std::collections::HashMap::new();
+        let mut registered: std::collections::HashMap<String, Uuid> =
+            std::collections::HashMap::new();
+        // Community (raw UUID) latched from the first RegisterPeer; every later
+        // frame must agree. `None` until the first register arrives.
+        let mut stream_community: Option<Uuid> = None;
 
         let result = loop {
             let msg = match stream.recv_frame().await {
                 Ok(Some(MeshStreamFrame::Data { fenced: f, payload })) => {
-                    // Re-fence every control frame, not just the Hello: a lease
-                    // that moves mid-stream must reject subsequent registers.
+                    // Every control frame must carry the same fenced header the
+                    // Hello did: a lease that moves mid-stream (owner or
+                    // generation change) rejects subsequent frames.
                     if f != fenced {
                         break Err(MeshError::OwnerMismatch {
                             session_id,
@@ -502,9 +535,6 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
                             frame_owner_runtime_id: f.owner_runtime_id,
                             current_owner_runtime_id: self.local_runtime_id,
                         });
-                    }
-                    if let Err(e) = self.directory.validate(community_id, &f).await {
-                        break Err(e);
                     }
                     match decode_control(&payload) {
                         Ok(m) => m,
@@ -522,17 +552,49 @@ impl<D: HuddleDirectory + ?Sized> HuddleControlAcceptor<D> {
 
             match msg {
                 HuddleControlMsg::RegisterPeer {
+                    community_id,
                     pubkey,
                     protocol_version,
                 } => {
-                    let reply = self.register_remote_peer(
-                        session_id,
-                        fenced,
-                        from,
-                        &pubkey,
-                        protocol_version,
-                        &mut registered,
-                    );
+                    // Latch the community on first receipt; reject any later
+                    // frame that names a different one (tenant-boundary guard).
+                    match stream_community {
+                        None => stream_community = Some(community_id),
+                        Some(latched) if latched != community_id => {
+                            break Err(MeshError::Transport(format!(
+                                "huddle-control stream community changed {latched} -> {community_id}"
+                            )));
+                        }
+                        Some(_) => {}
+                    }
+                    // Reconstitute the server-trusted `CommunityId` from the wire
+                    // UUID — explicit and localized, honoring `CommunityId`'s
+                    // no-client-input invariant — then fence.
+                    let community = CommunityId::from_uuid(community_id);
+                    // Validate-before-admit: the Redis fence keyed by the
+                    // asserted community must pass before any room mutation. A
+                    // wrong community keys a lease the owner never wrote → a
+                    // typed fence rejection, so no peer is admitted and the
+                    // client sees the same taxonomy a same-pod join would. A
+                    // *non-fence* validate error (Redis unreachable, decode) is
+                    // not a clean rejection — it tears the stream down.
+                    let reply = match self.directory.validate(community, &fenced).await {
+                        Ok(()) => self.register_remote_peer(
+                            session_id,
+                            fenced,
+                            from,
+                            &pubkey,
+                            protocol_version,
+                            &mut registered,
+                        ),
+                        Err(e) => match FenceRejection::from_mesh_error(&e) {
+                            Some(reason) => HuddleControlMsg::RegisterRejected {
+                                pubkey: pubkey.clone(),
+                                reason: RegisterRejection::Fenced(reason),
+                            },
+                            None => break Err(e),
+                        },
+                    };
                     if let Err(e) = stream
                         .send_frame(MeshStreamFrame::Data {
                             fenced,
@@ -684,6 +746,7 @@ pub async fn dial_remote_owner(
     local_runtime_id: RuntimeId,
     owner: RuntimeId,
     fenced: FencedHeader,
+    community_id: CommunityId,
     pubkey: String,
     protocol_version: u8,
 ) -> Result<RemoteHuddleSession, DialError> {
@@ -701,6 +764,7 @@ pub async fn dial_remote_owner(
         .send_frame(MeshStreamFrame::Data {
             fenced,
             payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                community_id: *community_id.as_uuid(),
                 pubkey: pubkey.clone(),
                 protocol_version,
             })?,
@@ -955,6 +1019,7 @@ mod tests {
     fn control_msg_roundtrips() {
         for msg in [
             HuddleControlMsg::RegisterPeer {
+                community_id: *community().as_uuid(),
                 pubkey: "abc123".into(),
                 protocol_version: 2,
             },
@@ -980,6 +1045,192 @@ mod tests {
             let bytes = encode_control(&msg).unwrap();
             assert_eq!(decode_control(&bytes).unwrap(), msg);
         }
+    }
+
+    // ── In-memory MeshStream pair for handshake round-trip tests ─────────────
+    //
+    // A channel-backed `StreamSendHalf`/`StreamRecvHalf` pair drives
+    // `accept_inbound` end-to-end without iroh: what the owner side sends, the
+    // client side receives, and vice versa. Uses only the public
+    // `MeshStream::new` seam plus the public half traits.
+    use buzz_relay_mesh::{BoxFuture, StreamRecvHalf, StreamSendHalf};
+    use tokio::sync::mpsc as tmpsc;
+
+    struct ChanSend(tmpsc::UnboundedSender<MeshStreamFrame>);
+    struct ChanRecv(tmpsc::UnboundedReceiver<MeshStreamFrame>);
+
+    impl StreamSendHalf for ChanSend {
+        fn send_frame(&mut self, frame: MeshStreamFrame) -> BoxFuture<'_, Result<(), MeshError>> {
+            let r = self
+                .0
+                .send(frame)
+                .map_err(|_| MeshError::Transport("peer closed".into()));
+            Box::pin(async move { r })
+        }
+        fn finish(&mut self) -> Result<(), MeshError> {
+            Ok(())
+        }
+    }
+
+    impl StreamRecvHalf for ChanRecv {
+        fn recv_frame(&mut self) -> BoxFuture<'_, Result<Option<MeshStreamFrame>, MeshError>> {
+            Box::pin(async move { Ok(self.0.recv().await) })
+        }
+    }
+
+    /// A connected `(owner_side, client_side)` `MeshStream` pair.
+    fn stream_pair() -> (MeshStream, MeshStream) {
+        let (a_tx, a_rx) = tmpsc::unbounded_channel();
+        let (b_tx, b_rx) = tmpsc::unbounded_channel();
+        // owner sends on a_tx (client reads a_rx); client sends on b_tx (owner
+        // reads b_rx).
+        let owner = MeshStream::new(Box::new(ChanSend(a_tx)), Box::new(ChanRecv(b_rx)));
+        let client = MeshStream::new(Box::new(ChanSend(b_tx)), Box::new(ChanRecv(a_rx)));
+        (owner, client)
+    }
+
+    /// Transport whose only exercised method is a no-op `send_datagram` (the
+    /// remote-peer sink fires into it). `open_session_stream`/`set_inbound` are
+    /// not reached on the accept path.
+    struct NullTransport;
+    impl RelayPeerTransport for NullTransport {
+        fn send_datagram(&self, _to: RuntimeId, _d: MeshDatagram) -> Result<(), MeshError> {
+            Ok(())
+        }
+        fn open_session_stream(
+            &self,
+            _to: RuntimeId,
+            _hello: StreamHello,
+        ) -> BoxFuture<'_, Result<MeshStream, MeshError>> {
+            Box::pin(async { Err(MeshError::Transport("unused".into())) })
+        }
+        fn set_inbound(&self, _handler: Box<dyn buzz_relay_mesh::InboundHandler>) {}
+    }
+
+    fn fenced_owned_by(owner: RuntimeId, session_id: Uuid) -> FencedHeader {
+        FencedHeader {
+            session_id,
+            generation: 7,
+            owner_runtime_id: owner,
+        }
+    }
+
+    fn huddle_hello(sender: RuntimeId, fenced: FencedHeader) -> StreamHello {
+        StreamHello {
+            sender,
+            role: StreamRole::Session {
+                fenced,
+                profile: Profile::HuddleControl,
+            },
+        }
+    }
+
+    /// Full accept-side handshake: a structural `Hello`, then a
+    /// community-bearing `RegisterPeer` whose fence passes, yields
+    /// `PeerRegistered`. Exercises the public `MeshStream::new` seam and the
+    /// validate-before-admit path end-to-end.
+    #[tokio::test]
+    async fn register_peer_handshake_admits_on_valid_fence() {
+        let owner_rt = rt(1);
+        let from = rt(2);
+        let session_id = Uuid::new_v4();
+        let fenced = fenced_owned_by(owner_rt, session_id);
+
+        let acceptor = HuddleControlAcceptor::new(
+            Arc::new(AudioRoomManager::new()),
+            Arc::new(NullTransport) as Arc<dyn RelayPeerTransport>,
+            Arc::new(FakeDir::default()), // validate() succeeds by default
+            owner_rt,
+        );
+
+        let (owner_stream, mut client) = stream_pair();
+        let hello = huddle_hello(from, fenced);
+        let served =
+            tokio::spawn(async move { acceptor.accept_inbound(from, hello, owner_stream).await });
+
+        // Client registers, carrying its community as the wire UUID.
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                    community_id: *community().as_uuid(),
+                    pubkey: "client-a".into(),
+                    protocol_version: 2,
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let reply = match client.recv_frame().await.unwrap().unwrap() {
+            MeshStreamFrame::Data { payload, .. } => decode_control(&payload).unwrap(),
+            other => panic!("expected Data reply, got {other:?}"),
+        };
+        assert!(
+            matches!(reply, HuddleControlMsg::PeerRegistered { ref pubkey, .. } if pubkey == "client-a"),
+            "expected PeerRegistered for client-a, got {reply:?}"
+        );
+
+        // Closing the client stream ends the serve loop cleanly.
+        client.finish().unwrap();
+        drop(client);
+        served.await.unwrap().unwrap();
+    }
+
+    /// A `RegisterPeer` whose fence is rejected (wrong community keys a lease
+    /// Redis never wrote) yields a `RegisterRejected(Fenced(..))` reply — no
+    /// peer admitted — and the stream stays alive for the client to close.
+    #[tokio::test]
+    async fn register_peer_handshake_rejects_on_fence_failure() {
+        let owner_rt = rt(1);
+        let from = rt(2);
+        let session_id = Uuid::new_v4();
+        let fenced = fenced_owned_by(owner_rt, session_id);
+
+        let dir = FakeDir::default();
+        *dir.validate_fails.lock().unwrap() = true;
+        let acceptor = HuddleControlAcceptor::new(
+            Arc::new(AudioRoomManager::new()),
+            Arc::new(NullTransport) as Arc<dyn RelayPeerTransport>,
+            Arc::new(dir),
+            owner_rt,
+        );
+
+        let (owner_stream, mut client) = stream_pair();
+        let hello = huddle_hello(from, fenced);
+        let served =
+            tokio::spawn(async move { acceptor.accept_inbound(from, hello, owner_stream).await });
+
+        client
+            .send_frame(MeshStreamFrame::Data {
+                fenced,
+                payload: encode_control(&HuddleControlMsg::RegisterPeer {
+                    community_id: *community().as_uuid(),
+                    pubkey: "client-a".into(),
+                    protocol_version: 2,
+                })
+                .unwrap(),
+            })
+            .await
+            .unwrap();
+
+        let reply = match client.recv_frame().await.unwrap().unwrap() {
+            MeshStreamFrame::Data { payload, .. } => decode_control(&payload).unwrap(),
+            other => panic!("expected Data reply, got {other:?}"),
+        };
+        assert!(
+            matches!(
+                reply,
+                HuddleControlMsg::RegisterRejected {
+                    reason: RegisterRejection::Fenced(_),
+                    ..
+                }
+            ),
+            "expected fence rejection, got {reply:?}"
+        );
+
+        drop(client);
+        served.await.unwrap().unwrap();
     }
 
     #[test]
