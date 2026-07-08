@@ -200,6 +200,12 @@ type MockBridgeOptions = {
     scope_value: string;
     kinds: string; // JSON-encoded integer array, e.g. "[9,40002]"
   }>;
+  /**
+   * Event IDs that `get_event` should report as definitively not found.
+   * Causes `useDraftRootStatus` to map the draft to `deleted` state so specs
+   * can exercise the "Thread deleted" label / disabled-send path.
+   */
+  deletedEventIds?: string[];
 };
 
 type BridgeOptions = {
@@ -558,4 +564,23 @@ export async function openChannelBrowser(page: Page) {
       }),
     );
   }, isMacBrowser);
+}
+
+// Section header actions (create channel, new DM, mark all read, sort) now
+// live inside a per-section "more actions" (⋮) menu instead of standalone
+// header icon buttons. These helpers open that menu and pick an item.
+async function openSectionMenu(page: Page, actionsTestId: string) {
+  const trigger = page.getByTestId(actionsTestId);
+  await trigger.scrollIntoViewIfNeeded();
+  await trigger.click();
+}
+
+export async function openCreateChannelDialog(page: Page) {
+  await openSectionMenu(page, "section-actions-channels");
+  await page.getByRole("menuitem", { name: "New channel" }).click();
+}
+
+export async function openNewDirectMessageDialog(page: Page) {
+  await openSectionMenu(page, "section-actions-dms");
+  await page.getByRole("menuitem", { name: "New message" }).click();
 }

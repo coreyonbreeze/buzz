@@ -5,6 +5,7 @@ import {
   useAcpRuntimesQuery,
   useAvailableAcpRuntimes,
   useBackendProvidersQuery,
+  useBakedBuildEnvKeysQuery,
   useCreateManagedAgentMutation,
   useManagedAgentPrereqsQuery,
   useRuntimeFileConfigQuery,
@@ -41,14 +42,16 @@ import { meshPrepareRelayMeshClient } from "@/shared/api/tauriMesh";
 import type { MeshServeTarget } from "@/shared/api/tauriMesh";
 import { useLastRuntime } from "@/features/agents/lib/useLastRuntime";
 import {
+  getBakedSatisfiedEnvKeys,
   requiredCredentialEnvKeys,
   runtimeSupportsLlmProviderSelection,
   shouldClearKnownModelForSelectionScope,
-  getProviderApiKeyEnvVar,
-  CUSTOM_PROVIDER_DROPDOWN_VALUE,
-  AUTO_PROVIDER_DROPDOWN_VALUE,
 } from "./personaDialogPickers";
-import { shouldClearModelForRuntimeChange } from "./personaRuntimeModel";
+import {
+  selectionOnProviderDropdownChange,
+  selectionOnRuntimeChange,
+  type RuntimeModelProviderSelection,
+} from "./runtimeModelProviderSelection";
 import {
   AgentModelField,
   AgentProviderField,
@@ -182,28 +185,45 @@ export function CreateAgentDialog({
     selectedRuntimeId,
     { enabled: open },
   );
-  // Credential keys satisfied by the runtime file config (e.g. goose config.yaml).
-  // These are shown as "Set in goose config" rows rather than amber required rows.
-  const fileSatisfiedEnvKeys = React.useMemo(() => {
-    if (!runtimeFileConfig) return [] as string[];
-    const allKeys = requiredCredentialEnvKeys(
-      selectedRuntimeId,
-      runtimeSupportsLlmProviderSelection(selectedRuntimeId) ? provider : "",
-    );
-    return allKeys.filter(
-      (key) =>
-        (envVars[key] ?? "").length === 0 &&
-        runtimeFileConfig.satisfiedEnvKeys.includes(key),
-    );
-  }, [runtimeFileConfig, selectedRuntimeId, provider, envVars]);
+  const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
 
-  const requiredEnvKeys = React.useMemo(
+  // All required keys for the selected runtime + provider.
+  const allRequiredEnvKeys = React.useMemo(
     () =>
       requiredCredentialEnvKeys(
         selectedRuntimeId,
         runtimeSupportsLlmProviderSelection(selectedRuntimeId) ? provider : "",
-      ).filter((key) => !fileSatisfiedEnvKeys.includes(key)),
-    [selectedRuntimeId, provider, fileSatisfiedEnvKeys],
+      ),
+    [selectedRuntimeId, provider],
+  );
+
+  // Keys covered by the baked build env (Block-internal builds only) — silenced,
+  // produce no amber row or info row.
+  const bakedSatisfiedEnvKeys = React.useMemo(
+    () => getBakedSatisfiedEnvKeys(allRequiredEnvKeys, envVars, bakedEnvKeys),
+    [allRequiredEnvKeys, envVars, bakedEnvKeys],
+  );
+
+  // Credential keys satisfied by the runtime file config (e.g. goose config.yaml).
+  // These are shown as "Set in goose config" rows rather than amber required rows.
+  const fileSatisfiedEnvKeys = React.useMemo(() => {
+    if (!runtimeFileConfig) return [] as string[];
+    return allRequiredEnvKeys.filter(
+      (key) =>
+        (envVars[key] ?? "").length === 0 &&
+        !bakedSatisfiedEnvKeys.includes(key) &&
+        runtimeFileConfig.satisfiedEnvKeys.includes(key),
+    );
+  }, [runtimeFileConfig, allRequiredEnvKeys, envVars, bakedSatisfiedEnvKeys]);
+
+  const requiredEnvKeys = React.useMemo(
+    () =>
+      allRequiredEnvKeys.filter(
+        (key) =>
+          !bakedSatisfiedEnvKeys.includes(key) &&
+          !fileSatisfiedEnvKeys.includes(key),
+      ),
+    [allRequiredEnvKeys, bakedSatisfiedEnvKeys, fileSatisfiedEnvKeys],
   );
 
   // Clear model when provider scope changes, mirroring EditAgentDialog.
@@ -367,6 +387,22 @@ export function CreateAgentDialog({
     onOpenChange(next);
   }
 
+  const selection: RuntimeModelProviderSelection = {
+    provider,
+    model,
+    isCustomProviderEditing,
+    isCustomModelEditing,
+    envVars,
+  };
+
+  function applySelection(next: RuntimeModelProviderSelection) {
+    setProvider(next.provider);
+    setModel(next.model);
+    setIsCustomProviderEditing(next.isCustomProviderEditing);
+    setIsCustomModelEditing(next.isCustomModelEditing);
+    setEnvVars(next.envVars);
+  }
+
   function handleProviderChange(nextProviderId: string) {
     const previousRuntimeId = selectedRuntimeId;
     setSelectedRuntimeId(nextProviderId);
@@ -385,23 +421,15 @@ export function CreateAgentDialog({
       }
     }
 
-    // Clear model when switching to a runtime with a different model scope,
-    // and clear provider/model when switching away from provider-selection runtimes.
-    if (
-      shouldClearModelForRuntimeChange(previousRuntimeId, nextProviderId) ||
-      shouldClearKnownModelForSelectionScope({
-        model,
-        provider,
-        runtime: nextProviderId,
-      })
-    ) {
-      setModel("");
-      setIsCustomModelEditing(false);
-    }
-    if (!runtimeSupportsLlmProviderSelection(nextProviderId)) {
-      setProvider("");
-      setIsCustomProviderEditing(false);
-    }
+    applySelection(
+      selectionOnRuntimeChange(selection, {
+        previousRuntime: previousRuntimeId,
+        nextRuntime: nextProviderId,
+        nextRuntimeCanChooseProvider:
+          runtimeSupportsLlmProviderSelection(nextProviderId),
+        lockedRuntimeReset: "provider-only",
+      }),
+    );
   }
 
   function handleRunOnChange(value: string) {
@@ -413,48 +441,13 @@ export function CreateAgentDialog({
 
   // Provider dropdown handler for local-mode provider field — mirrors Edit.
   function handleProviderDropdownChange(nextValue: string) {
-    if (nextValue === CUSTOM_PROVIDER_DROPDOWN_VALUE) {
-      const previousApiKey = getProviderApiKeyEnvVar(provider);
-      if (previousApiKey) {
-        setEnvVars((current) => {
-          const next = { ...current };
-          delete next[previousApiKey];
-          return next;
-        });
-      }
-      setIsCustomProviderEditing(true);
-      setProvider("");
-      return;
-    }
-
-    const nextProvider =
-      nextValue === AUTO_PROVIDER_DROPDOWN_VALUE ? "" : nextValue;
-
-    // Clear the old API key when switching providers.
-    const previousApiKey = getProviderApiKeyEnvVar(provider);
-    const nextApiKey = getProviderApiKeyEnvVar(nextProvider);
-    if (previousApiKey && previousApiKey !== nextApiKey) {
-      setEnvVars((current) => {
-        const next = { ...current };
-        delete next[previousApiKey];
-        return next;
-      });
-    }
-
-    setIsCustomProviderEditing(false);
-    setProvider(nextProvider);
-
-    if (
-      !isCustomModelEditing &&
-      shouldClearKnownModelForSelectionScope({
-        model,
-        provider: nextProvider,
+    applySelection(
+      selectionOnProviderDropdownChange(selection, {
         runtime: selectedRuntimeId,
-      })
-    ) {
-      setModel("");
-      setIsCustomModelEditing(false);
-    }
+        nextValue,
+        clearModelWhenApiKeyMissing: false,
+      }),
+    );
   }
 
   // Check provider config required fields are filled.
