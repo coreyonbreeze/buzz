@@ -5,6 +5,7 @@ use tauri::AppHandle;
 use super::agent_env::build_buzz_agent_provider_defaults;
 
 use crate::{
+    app_state::AppState,
     managed_agents::{
         append_log_marker, known_acp_runtime, login_shell_path, managed_agent_log_path,
         missing_command_message, normalize_agent_args, open_log_file, resolve_command,
@@ -1620,7 +1621,7 @@ pub fn spawn_agent_child(
     //
     // The JSON format mirrors `setup_mode::SetupPayload` in buzz-acp:
     //   { "agent_name": "...", "agent_pubkey": "...", "requirements": [{ "surface": "...", ... }] }
-    {
+    let in_setup_mode = {
         use crate::managed_agents::{
             agent_readiness, resolve_effective_agent_env, AgentReadiness, Requirement,
         };
@@ -1682,6 +1683,7 @@ pub fn spawn_agent_child(
         command.env_remove("BUZZ_ACP_SETUP_PAYLOAD");
 
         // Set the payload only when desktop computed NotReady.
+        let in_setup_mode = setup_payload_json.is_some();
         if let Some(json) = setup_payload_json {
             command.env("BUZZ_ACP_SETUP_PAYLOAD", json);
             eprintln!(
@@ -1689,7 +1691,8 @@ pub fn spawn_agent_child(
                 record.name
             );
         }
-    }
+        in_setup_mode
+    };
     // Only emit BUZZ_ACP_IDLE_TIMEOUT when the user has explicitly set an
     // override. When unset, the buzz-acp harness applies its own default
     // (see `DEFAULT_IDLE_TIMEOUT_SECS` in crates/buzz-acp/src/config.rs),
@@ -1890,6 +1893,7 @@ pub fn spawn_agent_child(
         child,
         log_path,
         spawn_config_hash,
+        in_setup_mode,
         &record.name,
     ));
     #[cfg(not(windows))]
@@ -1897,7 +1901,83 @@ pub fn spawn_agent_child(
         child,
         log_path,
         spawn_config_hash,
+        in_setup_mode,
     })
+}
+
+/// Returns `true` when a process that was spawned in setup mode would pass
+/// readiness with the record's current config. Setup-mode buzz-acp is a
+/// nudge-only listener and does not re-read desktop config after spawn, so this
+/// is the predicate for auto-restarting after an Edit Agent save.
+pub fn setup_mode_now_ready(
+    record: &ManagedAgentRecord,
+    personas: &[crate::managed_agents::types::PersonaRecord],
+    was_spawned_in_setup_mode: bool,
+) -> bool {
+    use crate::managed_agents::{agent_readiness, resolve_effective_agent_env, AgentReadiness};
+
+    if !was_spawned_in_setup_mode {
+        return false;
+    }
+
+    let effective_command = crate::managed_agents::effective_agent_command(
+        record.persona_id.as_deref(),
+        personas,
+        record.agent_command_override.as_deref(),
+    );
+    let runtime_meta = known_acp_runtime(&effective_command);
+    let effective = resolve_effective_agent_env(record, personas, runtime_meta);
+    matches!(agent_readiness(&effective), AgentReadiness::Ready)
+}
+
+/// Stop and respawn a setup-mode process if the current record now passes
+/// readiness. Called after Edit Agent saves mutate the record but before the
+/// store is persisted.
+pub fn maybe_restart_setup_mode_agent(
+    app: &AppHandle,
+    state: &AppState,
+    record: &mut ManagedAgentRecord,
+    runtimes: &mut HashMap<String, ManagedAgentProcess>,
+) {
+    let was_setup_mode = runtimes
+        .get(&record.pubkey)
+        .is_some_and(|runtime| runtime.in_setup_mode);
+    let personas = super::load_personas(app).unwrap_or_default();
+    if !setup_mode_now_ready(record, &personas, was_setup_mode) {
+        return;
+    }
+
+    let restart = (|| -> Result<(), String> {
+        let owner_hex = {
+            let keys = state.keys.lock().map_err(|e| e.to_string())?;
+            keys.public_key().to_hex()
+        };
+        stop_managed_agent_process(app, record, runtimes)?;
+        let process = spawn_agent_child(app, record, Some(&owner_hex))?;
+        let now = now_iso();
+        record.updated_at = now.clone();
+        record.runtime_pid = Some(process.child.id());
+        record.last_started_at = Some(now);
+        record.last_stopped_at = None;
+        record.last_exit_code = None;
+        record.last_error = None;
+        runtimes.insert(record.pubkey.clone(), process);
+        Ok(())
+    })();
+
+    match restart {
+        Ok(()) => eprintln!(
+            "buzz-desktop: auto-restarted agent {} out of setup mode",
+            record.name
+        ),
+        Err(error) => {
+            eprintln!(
+                "buzz-desktop: failed to auto-restart agent {} out of setup mode: {error}",
+                record.name
+            );
+            record.last_error = Some(format!("auto-restart failed: {error}"));
+        }
+    }
 }
 
 fn child_rust_log_filter() -> String {

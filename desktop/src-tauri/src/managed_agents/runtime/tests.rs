@@ -434,7 +434,47 @@ fn non_persona_agent_never_drifts() {
     assert!(!orphaned);
 }
 
-use super::runtime_metadata_env_vars;
+use super::{runtime_metadata_env_vars, setup_mode_now_ready};
+
+#[test]
+fn setup_mode_now_ready_requires_setup_mode_stamp() {
+    let mut record = fixture(RespondTo::Anyone, vec![], Some("tag".into()));
+    record.agent_command_override = Some("buzz-agent".into());
+    record.provider = Some("databricks_v2".into());
+    record.model = Some("goose-claude-4-6-opus".into());
+    record.env_vars.insert(
+        "DATABRICKS_HOST".into(),
+        "https://databricks.example.com".into(),
+    );
+
+    assert!(setup_mode_now_ready(&record, &[], true));
+    assert!(
+        !setup_mode_now_ready(&record, &[], false),
+        "healthy running agents must not be auto-restarted just because they are ready"
+    );
+}
+
+#[test]
+fn setup_mode_now_ready_stays_false_until_missing_config_is_fixed() {
+    let mut record = fixture(RespondTo::Anyone, vec![], Some("tag".into()));
+    record.agent_command_override = Some("buzz-agent".into());
+    record.provider = Some("databricks_v2".into());
+    record.env_vars.insert(
+        "DATABRICKS_HOST".into(),
+        "https://databricks.example.com".into(),
+    );
+
+    assert!(
+        !setup_mode_now_ready(&record, &[], true),
+        "missing model keeps the setup listener in place"
+    );
+
+    record.model = Some("goose-claude-4-6-opus".into());
+    assert!(
+        setup_mode_now_ready(&record, &[], true),
+        "filling the missing model makes the setup-mode process eligible for restart"
+    );
+}
 
 #[test]
 fn runtime_metadata_env_vars_injects_model_and_provider() {

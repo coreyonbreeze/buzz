@@ -247,6 +247,13 @@ pub struct ManagedAgentProcess {
     /// `runtime_pid` have no `ManagedAgentProcess` entry, so their spawn
     /// config is unknown and the badge stays off.
     pub spawn_config_hash: u64,
+    /// `true` when this process was spawned with `BUZZ_ACP_SETUP_PAYLOAD` set —
+    /// readiness failed at spawn and buzz-acp is running as a nudge-only setup
+    /// listener instead of the real agent pool. Runtime-only — never persisted.
+    /// `update_managed_agent` uses this stamp to restart the harness once an
+    /// edit satisfies readiness, because setup-mode processes do not re-read
+    /// desktop config after launch.
+    pub in_setup_mode: bool,
     /// Win32 Job Object owning the harness + its entire process tree. Closing
     /// the handle (via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) kills the whole
     /// tree — the Windows mirror of the Unix process-group teardown. `None`

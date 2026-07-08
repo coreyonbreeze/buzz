@@ -12,10 +12,11 @@ use crate::{
     managed_agents::{
         build_managed_agent_summary, current_instance_id, default_agent_workdir,
         discovery_env_with_baked_floor, find_managed_agent_mut, known_acp_runtime,
-        load_managed_agents, load_personas, managed_agent_avatar_url, missing_command_message,
-        normalize_agent_args, resolve_command, save_managed_agents, sync_managed_agent_processes,
-        try_regenerate_nest, AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest,
-        UpdateManagedAgentResponse, DEFAULT_ACP_COMMAND,
+        load_managed_agents, load_personas, managed_agent_avatar_url,
+        maybe_restart_setup_mode_agent, missing_command_message, normalize_agent_args,
+        resolve_command, save_managed_agents, sync_managed_agent_processes, try_regenerate_nest,
+        AgentModelInfo, AgentModelsResponse, UpdateManagedAgentRequest, UpdateManagedAgentResponse,
+        DEFAULT_ACP_COMMAND,
     },
     relay::{relay_ws_url_with_override, sync_managed_agent_profile},
     util::now_iso,
@@ -786,9 +787,8 @@ async fn run_agent_models_command(
 
 /// Update mutable fields on an existing managed agent record.
 ///
-/// Does NOT auto-restart the agent. Runtime config changes (system prompt,
-/// parallelism, commands, toolsets) take effect on the next agent spawn.
-/// Name changes are synced to the relay immediately via a kind:0 re-publish.
+/// Does NOT auto-restart healthy agents; only setup-mode listeners are respawned.
+/// Other runtime config changes take effect on next spawn; renames sync now.
 #[tauri::command]
 pub async fn update_managed_agent(
     input: UpdateManagedAgentRequest,
@@ -909,6 +909,8 @@ pub async fn update_managed_agent(
         }
 
         record.updated_at = now_iso();
+
+        maybe_restart_setup_mode_agent(&app, &state, record, &mut runtimes);
 
         save_managed_agents(&app, &records)?;
 

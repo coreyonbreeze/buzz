@@ -134,6 +134,7 @@ pub fn finish_spawn(
     child: std::process::Child,
     log_path: std::path::PathBuf,
     spawn_config_hash: u64,
+    in_setup_mode: bool,
     agent_name: &str,
 ) -> super::ManagedAgentProcess {
     let job = create_job_for_child(child.id());
@@ -147,6 +148,7 @@ pub fn finish_spawn(
         child,
         log_path,
         spawn_config_hash,
+        in_setup_mode,
         job,
     }
 }
