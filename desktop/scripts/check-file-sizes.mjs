@@ -189,10 +189,16 @@ const overrides = new Map([
   // (Quinn's merge-bar checklist #4), the one-clock/single-writer reasoning, and
   // the build-stamp/probe contract are all documented AT their sites. The file
   // was 888 lines at HEAD; this fix's code + load-bearing provenance comments
-  // crossed 1000. Comment-dominated overage on a correctness fix, not generic
-  // debt growth. Approved override; queued to split (extract the mid-history
-  // corrector + band walk into a sibling module) with the rest of this list.
-  ["src/features/messages/ui/useAnchoredScroll.ts", 1140],
+  // crossed 1000. The 1140→1180 bump is the W4a chase instrumentation inflating
+  // a load-bearing hook mid-investigation: the signed-shift grow/shrink probe
+  // (classifier arm) and the renderedScroll gate-clock rekey (w4a-gate-1 arm),
+  // both carrying their provenance inline. EXIT CONDITION: once #1662's fate is
+  // decided, the diagnostic emits get stripped or gated and the mid-history
+  // corrector + band walk split into a sibling module — Eva's ruling holds the
+  // structural split until the arms in flight against this file settle, so it is
+  // NOT done mid-chase. Comment-dominated overage on a correctness fix, not
+  // generic debt growth. Approved override; queued to split with the rest.
+  ["src/features/messages/ui/useAnchoredScroll.ts", 1180],
   // AgentConfigPanel footer fold into ProfileFieldGroup for the config-bridge
   // panel — a small overage from load-bearing UI plumbing, not generic debt
   // growth. Approved override; still queued to split with the rest of this list.
