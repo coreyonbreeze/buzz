@@ -3037,7 +3037,7 @@ pub async fn publish_dm_visibility_snapshot(
 
     let (stored, was_inserted) = state
         .db
-        .replace_parameterized_event(tenant.community(), &event, &viewer_hex, None)
+        .replace_parameterized_event(tenant.community(), &event, &viewer_hex, None, None)
         .await?;
     if was_inserted {
         dispatch_persistent_event(

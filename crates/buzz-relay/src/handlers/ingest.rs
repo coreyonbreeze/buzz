@@ -157,7 +157,7 @@ fn required_scope_for_kind(kind: u32, event: &Event) -> Result<Scope, &'static s
         | KIND_EVENT_REMINDER | KIND_PERSONA | KIND_TEAM | KIND_MANAGED_AGENT => {
             Ok(Scope::UsersWrite)
         }
-        // NIP-37: draft wraps are author-private global state (UsersWrite scope).
+        // NIP-37: draft wraps are author-private channel-bound state (UsersWrite scope).
         KIND_DRAFT => Ok(Scope::UsersWrite),
         // NIP-AM: agent turn metrics are agent-authored global events (encrypted to owner).
         KIND_AGENT_TURN_METRIC => Ok(Scope::MessagesWrite),
@@ -1309,10 +1309,18 @@ fn validate_draft_wrap_envelope(event: &Event) -> Result<(), String> {
         ));
     }
     let h = h_value.unwrap();
-    if uuid::Uuid::parse_str(h).is_err() {
-        return Err(format!(
-            "draft-wrap `h` tag must be a canonical UUID (channel or DM id), got: {h:?}"
-        ));
+    match uuid::Uuid::parse_str(h) {
+        Err(_) => {
+            return Err(format!(
+                "draft-wrap `h` tag must be a canonical UUID (channel or DM id), got: {h:?}"
+            ));
+        }
+        Ok(parsed) if parsed.to_string() != h => {
+            return Err(format!(
+                "draft-wrap `h` tag must be lowercase hyphenated UUID, got: {h:?}"
+            ));
+        }
+        Ok(_) => {}
     }
 
     // Validate `expiration` tag (optional, at most one).
@@ -1686,6 +1694,16 @@ async fn ingest_event_inner(
                 )));
             }
         }
+    }
+
+    // NIP-37 draft wraps: validate the envelope (d/k/h/p/expiration/content)
+    // BEFORE channel extraction so that missing/malformed/duplicate h-tag errors
+    // are reported as structural validation failures rather than channel-scope
+    // failures.  This also ensures the `p`-tag guard fires before the channel
+    // membership check.
+    if kind_u32 == KIND_DRAFT {
+        validate_draft_wrap_envelope(&event)
+            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
     let mut channel_id = if kind_u32 == KIND_REACTION {
@@ -2067,11 +2085,6 @@ async fn ingest_event_inner(
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
     }
 
-    if kind_u32 == KIND_DRAFT {
-        validate_draft_wrap_envelope(&event)
-            .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
-    }
-
     if kind_u32 == KIND_PERSONA {
         validate_persona_envelope(&event)
             .map_err(|e| IngestError::Rejected(format!("invalid: {e}")))?;
@@ -2382,50 +2395,34 @@ async fn ingest_event_inner(
             )));
         }
 
-        // Immutable channel binding for kind:31234 (NIP-37 draft wraps).
-        //
-        // The NIP-33 address (community, author, 31234, d_tag) is unique, but
-        // channel_id is NOT part of the NIP-33 key. This means a replacement
-        // with a different h-tag would silently re-bind the draft to a new
-        // channel while still winning the NIP-01 replacement. To prevent that,
-        // we reject any incoming kind:31234 update whose channel_id differs
-        // from the stored head's channel_id.
-        //
-        // A tombstone (empty content) carries the same h-tag as the draft it
-        // closes — this check enforces that invariant too.
-        if kind_u32 == KIND_DRAFT {
-            let pubkey_bytes = auth.pubkey().to_bytes().to_vec();
-            match state
-                .db
-                .get_draft_head_channel_id(tenant.community(), &pubkey_bytes, &d_tag)
-                .await
-            {
-                Ok(Some(head_ch)) => {
-                    // A live head exists. Its channel_id must match the incoming event's.
-                    if head_ch != channel_id {
-                        return Err(IngestError::Rejected(
-                            "invalid: draft-wrap channel binding is immutable — \
-                             `h` tag must match the existing head's channel"
-                                .into(),
-                        ));
-                    }
-                }
-                Ok(None) => {
-                    // No live head — this is the first write for this address.
-                }
-                Err(e) => {
-                    return Err(IngestError::Internal(format!(
-                        "error: checking draft channel binding: {e}"
-                    )));
-                }
-            }
-        }
+        // For kind:31234 draft wraps, pass the expected channel_id so that
+        // replace_parameterized_event enforces the immutable-binding invariant
+        // atomically inside the advisory lock.  All other parameterized-
+        // replaceable kinds pass None (no channel binding constraint).
+        let expected_channel_id = if kind_u32 == KIND_DRAFT {
+            Some(channel_id)
+        } else {
+            None
+        };
 
         state
             .db
-            .replace_parameterized_event(tenant.community(), &event, &d_tag, channel_id)
+            .replace_parameterized_event(
+                tenant.community(),
+                &event,
+                &d_tag,
+                channel_id,
+                expected_channel_id,
+            )
             .await
-            .map_err(|e| IngestError::Internal(format!("error: {e}")))?
+            .map_err(|e| match e {
+                buzz_db::DbError::DraftChannelMismatch => IngestError::Rejected(
+                    "invalid: draft-wrap channel binding is immutable — \
+                     `h` tag must match the existing head's channel"
+                        .into(),
+                ),
+                other => IngestError::Internal(format!("error: {other}")),
+            })?
     } else {
         let thread_params = thread_meta.as_ref().map(|m| m.as_params());
         match state

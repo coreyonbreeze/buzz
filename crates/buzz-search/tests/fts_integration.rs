@@ -1091,11 +1091,12 @@ async fn very_long_query_is_bounded_before_pg_parse() {
 ///   - 1059  = `KIND_GIFT_WRAP`      (NIP-17 ciphertext)
 ///   - 30300 = `KIND_EVENT_REMINDER` (in `AUTHOR_ONLY_KINDS`)
 ///   - 30622 = `KIND_DM_VISIBILITY`  (per-viewer private hide state)
+///   - 31234 = `KIND_DRAFT`          (NIP-37: channel-bound author-private draft)
 ///   - 44100 = `KIND_MEMBER_ADDED_NOTIFICATION`  (p-gated membership notice)
 ///   - 44101 = `KIND_MEMBER_REMOVED_NOTIFICATION` (p-gated membership notice)
 ///   - 44200 = `KIND_AGENT_TURN_METRIC` (NIP-AM: p-gated encrypted turn metrics)
 ///
-/// All seven events are inserted with the same unique token in their content
+/// All eight events are inserted with the same unique token in their content
 /// so a single search query exercises every kind in one round-trip. Only
 /// the kind:9 control must surface — the excluded kinds must not.
 ///
@@ -1162,6 +1163,19 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
     )
     .await;
 
+    // kind:31234 draft wrap (NIP-37, AUTHOR_ONLY_KINDS) — MUST NOT be searchable.
+    insert_event(
+        &pool,
+        c,
+        rand_bytes32(),
+        rand_bytes32(),
+        KIND_DRAFT as i32,
+        &format!("draft wrap — {token}"),
+        None,
+        1_700_000_004,
+    )
+    .await;
+
     // kind:44100 member-added notification — p-gated and MUST NOT be searchable.
     insert_event(
         &pool,
@@ -1171,7 +1185,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
         KIND_MEMBER_ADDED_NOTIFICATION as i32,
         &format!("member added — {token}"),
         None,
-        1_700_000_004,
+        1_700_000_005,
     )
     .await;
 
@@ -1184,7 +1198,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
         KIND_MEMBER_REMOVED_NOTIFICATION as i32,
         &format!("member removed — {token}"),
         None,
-        1_700_000_005,
+        1_700_000_006,
     )
     .await;
 
@@ -1197,7 +1211,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
         KIND_AGENT_TURN_METRIC as i32,
         &format!("agent turn metric — {token}"),
         None,
-        1_700_000_006,
+        1_700_000_007,
     )
     .await;
 
@@ -1231,6 +1245,7 @@ async fn excluded_kinds_are_storage_level_unsearchable() {
         1059,
         30300,
         30622,
+        KIND_DRAFT as i32,
         KIND_MEMBER_ADDED_NOTIFICATION as i32,
         KIND_MEMBER_REMOVED_NOTIFICATION as i32,
         KIND_AGENT_TURN_METRIC as i32,

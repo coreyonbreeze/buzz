@@ -48,6 +48,15 @@ pub enum DbError {
     /// A stored timestamp value could not be interpreted.
     #[error("invalid timestamp: {0}")]
     InvalidTimestamp(i64),
+
+    /// A kind:31234 draft-wrap update tried to rebind to a different channel.
+    ///
+    /// The `(community, author, 31234, d_tag)` address is already bound to a
+    /// channel UUID.  Incoming updates must use the same `h` tag.
+    #[error(
+        "draft-wrap channel binding is immutable — `h` tag must match the existing head's channel"
+    )]
+    DraftChannelMismatch,
 }
 
 /// Convenience alias for `Result<T, DbError>`.

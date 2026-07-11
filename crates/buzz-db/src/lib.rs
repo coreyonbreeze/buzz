@@ -2806,6 +2806,13 @@ impl Db {
     /// by its d-tag, regardless of which channel it was submitted to. The `channel_id`
     /// parameter is stored on the new row for query scoping but does not affect replacement.
     ///
+    /// **Immutable-channel enforcement (`expected_channel_id`):** When `Some(expected)`,
+    /// the function checks — **inside the advisory lock, before the stale-ordering step** —
+    /// that the current head's `channel_id` equals `expected`.  If it differs the
+    /// transaction is rolled back and an `Err(DbError::DraftChannelMismatch)` is returned.
+    /// Pass `None` to skip the check (all parameterized-replaceable kinds except
+    /// kind:31234 draft wraps).
+    ///
     /// Note: `replace_addressable_event()` keys on `channel_id` because it serves
     /// relay-signed NIP-29 group metadata (kind 39000–39002) where the relay is the
     /// author and channel_id distinguishes groups. User-submitted NIP-33 events use
@@ -2816,6 +2823,7 @@ impl Db {
         event: &nostr::Event,
         d_tag: &str,
         channel_id: Option<Uuid>,
+        expected_channel_id: Option<Option<Uuid>>,
     ) -> Result<(StoredEvent, bool)> {
         let kind_i32 = buzz_core::kind::event_kind_i32(event);
         let pubkey_bytes = event.pubkey.to_bytes();
@@ -2884,17 +2892,33 @@ impl Db {
         // Check the live head and, for NIP-RS, the compact historical ordering
         // watermark. The watermark remains after a NIP-09 coordinate deletion,
         // preventing a previously accepted signed blob from being resurrected.
-        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = sqlx::query_as(
-            "SELECT created_at, id FROM events \
-             WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL \
-             ORDER BY created_at DESC, id ASC LIMIT 1",
-        )
-        .bind(community_id.as_uuid())
-        .bind(kind_i32)
-        .bind(pubkey_bytes.as_slice())
-        .bind(d_tag)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let existing: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>, Option<Uuid>)> =
+            sqlx::query_as(
+                "SELECT created_at, id, channel_id FROM events \
+                 WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 AND deleted_at IS NULL \
+                 ORDER BY created_at DESC, id ASC LIMIT 1",
+            )
+            .bind(community_id.as_uuid())
+            .bind(kind_i32)
+            .bind(pubkey_bytes.as_slice())
+            .bind(d_tag)
+            .fetch_optional(&mut *tx)
+            .await?;
+
+        // Immutable channel-binding check for kind:31234 draft wraps.
+        //
+        // Runs **inside** the advisory lock so the read-then-reject is atomic:
+        // no concurrent writer can slip a different-channel head between the
+        // SELECT and our rollback.
+        if let Some(expected) = expected_channel_id {
+            if let Some((_, _, head_channel_id)) = &existing {
+                if *head_channel_id != expected {
+                    tx.rollback().await?;
+                    return Err(DbError::DraftChannelMismatch);
+                }
+            }
+        }
+
         let watermark: Option<(chrono::DateTime<chrono::Utc>, Vec<u8>)> = if is_nip_rs {
             sqlx::query_as(
                 "SELECT created_at, event_id FROM parameterized_event_watermarks \
@@ -2913,14 +2937,16 @@ impl Db {
         // Stale-write protection: reject if either durable ordering source
         // dominates the incoming tuple. Equal timestamps use lowest event id.
         let incoming_id = event.id.as_bytes().as_slice();
-        let dominated =
-            existing
-                .iter()
-                .chain(watermark.iter())
-                .any(|(accepted_ts, accepted_id)| {
-                    created_at < *accepted_ts
-                        || (created_at == *accepted_ts && incoming_id >= accepted_id.as_slice())
-                });
+        let existing_ordering = existing
+            .as_ref()
+            .map(|(ts, id, _)| (ts.clone(), id.clone()));
+        let dominated = existing_ordering
+            .iter()
+            .chain(watermark.iter())
+            .any(|(accepted_ts, accepted_id)| {
+                created_at < *accepted_ts
+                    || (created_at == *accepted_ts && incoming_id >= accepted_id.as_slice())
+            });
         if dominated {
             tx.rollback().await?;
             let received_at = chrono::Utc::now();
@@ -2953,7 +2979,7 @@ impl Db {
                 .await?;
 
             if is_nip_rs {
-                if let Some((_, existing_id)) = &existing {
+                if let Some((_, existing_id, _)) = &existing {
                     // Event first, mentions second: migration 0009's live-event
                     // fence uses this global lock order to avoid deadlocks.
                     sqlx::query(
@@ -4181,6 +4207,133 @@ mod tests {
         assert!(
             groups_a_after.is_empty(),
             "A's reaction must be gone after A removes it"
+        );
+    }
+
+    // ─── NIP-37 draft-wrap DB tests ──────────────────────────────────────────
+
+    /// Build a minimal signed kind:31234 event for DB-layer tests.
+    fn build_test_draft(keys: &nostr::Keys, d_tag: &str, channel_id: &Uuid) -> nostr::Event {
+        nostr::EventBuilder::new(nostr::Kind::Custom(31234), "")
+            .tags([
+                nostr::Tag::parse(["d", d_tag]).unwrap(),
+                nostr::Tag::parse(["k", "9"]).unwrap(),
+                nostr::Tag::parse(["h", &channel_id.to_string()]).unwrap(),
+            ])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    /// Tenant confinement: a kind:31234 written to community A must NOT be
+    /// visible via community B's `replace_parameterized_event` — the query is
+    /// scoped by `community_id`.
+    ///
+    /// This tests the DB layer directly (two real communities) and does not
+    /// require a second relay instance.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn draft_is_confined_to_its_community() {
+        let db = setup_db().await;
+        let community_a = CommunityId::from_uuid(make_community(&db.pool).await);
+        let community_b = CommunityId::from_uuid(make_community(&db.pool).await);
+
+        let keys = nostr::Keys::generate();
+        let ch_a = Uuid::new_v4();
+        let d_tag = Uuid::new_v4().to_string();
+
+        // Insert a draft into community A.
+        let draft = build_test_draft(&keys, &d_tag, &ch_a);
+        let (_, inserted) = db
+            .replace_parameterized_event(community_a, &draft, &d_tag, Some(ch_a), Some(Some(ch_a)))
+            .await
+            .expect("insert draft into A");
+        assert!(inserted, "draft must be inserted into A");
+
+        // Reading the same (pubkey, d_tag) from community B must see no existing head
+        // → expected_channel_id check must pass (no head → no conflict).
+        let ch_b = Uuid::new_v4();
+        let draft_b = build_test_draft(&keys, &d_tag, &ch_b);
+        let result = db
+            .replace_parameterized_event(
+                community_b,
+                &draft_b,
+                &d_tag,
+                Some(ch_b),
+                Some(Some(ch_b)),
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "same (pubkey, d_tag) in community B must be an independent address; got: {result:?}"
+        );
+        let (_, b_inserted) = result.unwrap();
+        assert!(
+            b_inserted,
+            "draft must be stored as a new independent head in B"
+        );
+    }
+
+    /// Race guard: two concurrent writers trying to bind the same
+    /// (community, author, d_tag) address to *different* channels.
+    ///
+    /// One must win (the first committer) and the second must get
+    /// `DraftChannelMismatch` — never a corrupt split-brain state.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn concurrent_different_channel_drafts_one_wins_one_loses() {
+        let db = setup_db().await;
+        let community = CommunityId::from_uuid(make_community(&db.pool).await);
+
+        let keys = nostr::Keys::generate();
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let d_tag = Uuid::new_v4().to_string();
+
+        // Build distinct events for each channel (different h-tag → different id).
+        let draft_a = build_test_draft(&keys, &d_tag, &ch_a);
+        let draft_b = build_test_draft(&keys, &d_tag, &ch_b);
+
+        // Run both writes concurrently.
+        let db_a = db.clone();
+        let d_a = d_tag.clone();
+        let ev_a = draft_a.clone();
+        let fut_a = async move {
+            db_a.replace_parameterized_event(community, &ev_a, &d_a, Some(ch_a), Some(Some(ch_a)))
+                .await
+        };
+
+        let db_b = db.clone();
+        let d_b = d_tag.clone();
+        let ev_b = draft_b.clone();
+        let fut_b = async move {
+            db_b.replace_parameterized_event(community, &ev_b, &d_b, Some(ch_b), Some(Some(ch_b)))
+                .await
+        };
+
+        let (res_a, res_b) = tokio::join!(fut_a, fut_b);
+
+        // Exactly one must succeed (insert) and the other must fail with
+        // DraftChannelMismatch (advisory lock ensures serialization).
+        let outcomes = [&res_a, &res_b];
+        let successes: Vec<_> = outcomes
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .filter(|(_, inserted)| *inserted)
+            .collect();
+        let mismatches: usize = outcomes
+            .iter()
+            .filter(|r| matches!(r, Err(DbError::DraftChannelMismatch)))
+            .count();
+
+        assert_eq!(
+            successes.len(),
+            1,
+            "exactly one concurrent write must succeed; res_a={res_a:?}, res_b={res_b:?}"
+        );
+        assert_eq!(
+            mismatches, 1,
+            "exactly one concurrent write must fail with DraftChannelMismatch; \
+             res_a={res_a:?}, res_b={res_b:?}"
         );
     }
 }

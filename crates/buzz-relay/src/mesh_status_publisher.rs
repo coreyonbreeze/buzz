@@ -225,7 +225,7 @@ pub async fn publish_mesh_status(
 
     let (stored, was_inserted) = state
         .db
-        .replace_parameterized_event(tenant.community(), &event, &d_tag, None)
+        .replace_parameterized_event(tenant.community(), &event, &d_tag, None, None)
         .await?;
     if was_inserted {
         let relay_pubkey_hex = state.relay_keypair.public_key().to_hex();

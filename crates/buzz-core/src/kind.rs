@@ -106,8 +106,8 @@ pub const KIND_EVENT_REMINDER: u32 = 30300;
 /// Encrypted draft of an unsent message, addressed by `(pubkey, kind=31234, d_tag)`.
 /// Content is NIP-44 v2 ciphertext (to self) containing an unsigned inner event,
 /// or the empty string as a NIP-37 deletion tombstone. The outer envelope carries
-/// no channel scope (`channel_id = NULL`); compose context (channel, reply target,
-/// etc.) lives only inside the encrypted payload.
+/// one `h` UUID binding the draft to a Buzz channel or DM; compose context
+/// (reply target, etc.) lives only inside the encrypted payload.
 ///
 /// Reads are strictly author-only — see [`AUTHOR_ONLY_KINDS`] and the author-only
 /// gate in the REQ/COUNT/fan-out handlers. Draft wraps are excluded from FTS

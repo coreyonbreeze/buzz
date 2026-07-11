@@ -131,12 +131,12 @@ pub async fn filter_fanout_by_access(
         })
         .collect();
 
-    // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
-    // event's own author. This gate lives here — the chokepoint shared by the
-    // ingest fan-out path and the Redis cross-node `subscribe_local` path, the
-    // only paths that route author-only kinds — so no such delivery can bypass
-    // it. It runs before (and independent of) the channel-membership filter
-    // below because author-only kinds are stored globally (channel_id = None).
+    // Author-only kinds (NIP-ER reminders, NIP-37 draft wraps) may only ever
+    // be delivered to the event's own author. This gate lives here — the
+    // chokepoint shared by the ingest fan-out path and the Redis cross-node
+    // `subscribe_local` path, the only paths that route author-only kinds —
+    // so no such delivery can bypass it. It runs before (and independent of)
+    // the channel-membership filter below.
     let matches = if AUTHOR_ONLY_KINDS.contains(&event_kind_u32(&stored_event.event)) {
         let author = stored_event.event.pubkey.to_bytes();
         matches
@@ -507,10 +507,9 @@ async fn dispatch_persistent_event_inner(
         && !buzz_core::kind::is_command_kind(kind_u32)
         && !is_relay_workflow_msg
         && kind_u32 != KIND_GIFT_WRAP
-        // Author-only kinds (NIP-ER reminders, NIP-37 draft wraps) are private per-user
-        // state that must not trigger workspace-level workflows. Excluded here explicitly
-        // because today's channel-less engine no-ops on them, but this guard is the
-        // invariant that must hold for any future workflow expansion.
+        // Author-only kinds (NIP-ER reminders, NIP-37 draft wraps) are private
+        // per-user state that must not trigger workspace-level workflows.
+        // AUTHOR_ONLY_KINDS.contains is the permanent guard at this seam.
         && !AUTHOR_ONLY_KINDS.contains(&kind_u32)
     {
         let workflow_engine = Arc::clone(&state.workflow_engine);
@@ -2425,6 +2424,26 @@ mod tests {
                 out.is_empty(),
                 "Inv_NonInterference: a connection bound to community A \
                  must not receive a community-B event. Got: {out:?}"
+            );
+        }
+
+        /// Tripwire: kind:31234 (NIP-37 draft wrap) MUST appear in
+        /// `AUTHOR_ONLY_KINDS` so the workflow-dispatch guard at
+        /// `event.rs:514` (`!AUTHOR_ONLY_KINDS.contains(&kind_u32)`)
+        /// permanently suppresses workflow triggers for draft events.
+        ///
+        /// A draft must never arrive in the workflow engine, regardless
+        /// of future refactoring in the dispatch path.
+        #[test]
+        fn draft_kind_is_excluded_from_workflow_dispatch_by_author_only_guard() {
+            // This is the exact predicate that gates workflow dispatch in
+            // `dispatch_persistent_event`.  Changing AUTHOR_ONLY_KINDS
+            // without updating this test would turn it red immediately.
+            assert!(
+                buzz_core::kind::AUTHOR_ONLY_KINDS.contains(&buzz_core::kind::KIND_DRAFT),
+                "KIND_DRAFT must be in AUTHOR_ONLY_KINDS — the workflow-dispatch guard \
+                 at event.rs:514 (`!AUTHOR_ONLY_KINDS.contains(&kind_u32)`) relies on \
+                 this to suppress draft events from reaching the workflow engine"
             );
         }
     }
