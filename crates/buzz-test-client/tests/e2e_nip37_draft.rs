@@ -1800,7 +1800,7 @@ async fn test_nip11_advertises_nip37_not_nip40() {
     );
 }
 
-// ─── NIP-09 a-tag deletion guard ─────────────────────────────────────────────
+// ─── NIP-09 deletion guard (a-tag and e-tag) ──────────────────────────────────
 
 #[tokio::test]
 #[ignore]
@@ -1860,6 +1860,279 @@ async fn test_nip09_a_tag_deletion_of_draft_is_rejected() {
         results[0]["id"].as_str().unwrap(),
         draft.id.to_hex(),
         "live head must still be the original draft — kind:5 must not have altered it"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_nip09_e_tag_deletion_of_draft_is_rejected_and_binding_holds() {
+    // Full bypass sequence proving the e-tag deletion path cannot circumvent
+    // the immutable channel binding.
+    //
+    // 1. Publish draft at address `d` on channel h=A (timestamp = base).
+    // 2. Submit kind:5 with a single `e` tag pointing at the draft event id.
+    //    The relay must reject this pre-storage.
+    // 3. Query as the author — the original draft head must still be live.
+    // 4. Attempt to rebind the same `d` address to h=B (timestamp = base+1,
+    //    guaranteed newer) — must be rejected because the ch_a binding is intact.
+    let client = http_client();
+    let owner = Keys::generate();
+
+    // Two distinct channels — owner is a member of both.
+    let ch_a = create_open_channel(&owner).await;
+    let ch_b = create_open_channel(&owner).await;
+    let d = uuid::Uuid::new_v4().to_string();
+    let base = Timestamp::now().as_secs();
+
+    // Step 1: publish draft bound to ch_a.
+    let draft = build_draft_at(
+        &owner,
+        &d,
+        "9",
+        &ch_a,
+        &fake_nip44_v2(),
+        Timestamp::from(base),
+    );
+    let (ok_d, msg_d) = submit_event_http(&client, &owner, &draft).await;
+    assert!(
+        ok_d,
+        "draft must be accepted before the deletion attempt: {msg_d}"
+    );
+
+    // Step 2: submit kind:5 with e-tag pointing at the draft event id.
+    let deletion = EventBuilder::new(Kind::EventDeletion, "")
+        .tags([Tag::parse(["e", &draft.id.to_hex()]).unwrap()])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let (accepted, msg) = submit_event_http(&client, &owner, &deletion).await;
+    assert!(
+        !accepted,
+        "kind:5 e-tag deletion targeting kind:31234 must be rejected; relay said: {msg}"
+    );
+    assert!(
+        msg.contains("31234")
+            || msg.contains("draft")
+            || msg.contains("not supported")
+            || msg.contains("invalid"),
+        "rejection message must explain why; got: {msg}"
+    );
+
+    // Step 3: author queries by address — draft head must still be live.
+    let filter = Filter::new()
+        .kind(nostr::Kind::Custom(KIND_DRAFT))
+        .author(owner.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let results = query_events_http(&client, &owner.public_key().to_hex(), vec![filter]).await;
+    assert_eq!(
+        results.len(),
+        1,
+        "draft must still have one live head after rejected kind:5 e-tag deletion"
+    );
+    assert_eq!(
+        results[0]["id"].as_str().unwrap(),
+        draft.id.to_hex(),
+        "live head must be the original draft — e-tag kind:5 must not have altered it"
+    );
+
+    // Step 4: attempt rebind to ch_b with a strictly newer timestamp — must be
+    // rejected because the ch_a binding is intact (the e-tag delete did not
+    // erase the head row).
+    let rebind = build_draft_at(
+        &owner,
+        &d,
+        "9",
+        &ch_b,
+        &fake_nip44_v2(),
+        Timestamp::from(base + 1),
+    );
+    let (rebind_accepted, rebind_msg) = submit_event_http(&client, &owner, &rebind).await;
+    assert!(
+        !rebind_accepted,
+        "rebind to ch_b must be rejected; relay said: {rebind_msg}"
+    );
+    assert!(
+        rebind_msg.contains("channel")
+            || rebind_msg.contains("mismatch")
+            || rebind_msg.contains("immutable")
+            || rebind_msg.contains("invalid"),
+        "rebind rejection must name the binding invariant; got: {rebind_msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+/// kind:9005 deletion of a kind:31234 draft must be rejected pre-storage and
+/// the immutable channel binding must remain intact.
+///
+/// 1. Publish draft at address `d` on channel h=A (timestamp = base).
+/// 2. Draft author submits kind:9005 with e=<draft event id> and h=A — must
+///    be rejected pre-storage (tombstone-guidance error).
+/// 3. Query as the author — the original draft head must still be live.
+/// 4. Attempt to rebind the same `d` address to h=B (timestamp = base+1) —
+///    must be rejected because the ch_a binding is intact.
+async fn test_nip09_kind9005_deletion_of_draft_is_rejected_and_binding_holds() {
+    let client = http_client();
+    let owner = Keys::generate();
+
+    // Two distinct channels — owner is a member of both.
+    let ch_a = create_open_channel(&owner).await;
+    let ch_b = create_open_channel(&owner).await;
+    let d = uuid::Uuid::new_v4().to_string();
+    let base = Timestamp::now().as_secs();
+
+    // Step 1: publish draft bound to ch_a.
+    let draft = build_draft_at(
+        &owner,
+        &d,
+        "9",
+        &ch_a,
+        &fake_nip44_v2(),
+        Timestamp::from(base),
+    );
+    let (ok_d, msg_d) = submit_event_http(&client, &owner, &draft).await;
+    assert!(
+        ok_d,
+        "draft must be accepted before the deletion attempt: {msg_d}"
+    );
+
+    // Step 2: author submits kind:9005 targeting the draft event id.
+    let del_9005 = EventBuilder::new(Kind::Custom(9005), "")
+        .tags([
+            Tag::parse(["e", &draft.id.to_hex()]).unwrap(),
+            Tag::parse(["h", &ch_a]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let (accepted, msg) = submit_event_http(&client, &owner, &del_9005).await;
+    assert!(
+        !accepted,
+        "kind:9005 deletion targeting kind:31234 must be rejected; relay said: {msg}"
+    );
+    assert!(
+        msg.contains("31234")
+            || msg.contains("draft")
+            || msg.contains("not supported")
+            || msg.contains("invalid"),
+        "rejection message must explain why; got: {msg}"
+    );
+
+    // Step 3: author queries by address — draft head must still be live.
+    let filter = Filter::new()
+        .kind(nostr::Kind::Custom(KIND_DRAFT))
+        .author(owner.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let results = query_events_http(&client, &owner.public_key().to_hex(), vec![filter]).await;
+    assert_eq!(
+        results.len(),
+        1,
+        "draft must still have one live head after rejected kind:9005 deletion"
+    );
+    assert_eq!(
+        results[0]["id"].as_str().unwrap(),
+        draft.id.to_hex(),
+        "live head must be the original draft — kind:9005 must not have altered it"
+    );
+
+    // Step 4: attempt rebind to ch_b with a strictly newer timestamp — must be
+    // rejected because the ch_a binding is intact.
+    let rebind = build_draft_at(
+        &owner,
+        &d,
+        "9",
+        &ch_b,
+        &fake_nip44_v2(),
+        Timestamp::from(base + 1),
+    );
+    let (rebind_accepted, rebind_msg) = submit_event_http(&client, &owner, &rebind).await;
+    assert!(
+        !rebind_accepted,
+        "rebind to ch_b must be rejected; relay said: {rebind_msg}"
+    );
+    assert!(
+        rebind_msg.contains("channel")
+            || rebind_msg.contains("mismatch")
+            || rebind_msg.contains("immutable")
+            || rebind_msg.contains("invalid"),
+        "rebind rejection must name the binding invariant; got: {rebind_msg}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+/// A channel admin who does not own the draft must receive "target event not
+/// found" when attempting kind:9005 deletion — indistinguishable from a
+/// missing-target response (oracle-masking tripwire).
+async fn test_nip09_kind9005_admin_deletion_of_draft_is_masked_as_not_found() {
+    let client = http_client();
+    let owner = Keys::generate();
+    let admin = Keys::generate();
+
+    // Create an open channel, add admin as a channel admin.
+    let ch_id = create_open_channel(&owner).await;
+    let add_admin_event = EventBuilder::new(Kind::Custom(KIND_PUT_USER), "")
+        .tags([
+            Tag::parse(["h", &ch_id]).unwrap(),
+            Tag::parse(["p", &admin.public_key().to_hex()]).unwrap(),
+            Tag::parse(["role", "admin"]).unwrap(),
+        ])
+        .sign_with_keys(&owner)
+        .unwrap();
+    let (ok_add, msg_add) = submit_event_http(&client, &owner, &add_admin_event).await;
+    assert!(ok_add, "add admin must succeed: {msg_add}");
+
+    // Publish a draft as the channel owner.
+    let d = uuid::Uuid::new_v4().to_string();
+    let draft = build_draft_at(&owner, &d, "9", &ch_id, &fake_nip44_v2(), Timestamp::now());
+    let (ok_draft, msg_draft) = submit_event_http(&client, &owner, &draft).await;
+    assert!(ok_draft, "draft must be accepted: {msg_draft}");
+
+    // Admin (non-owner of draft) submits kind:9005 targeting the draft event id.
+    // Must be rejected with "target event not found" — not a draft-specific error.
+    let del_9005 = EventBuilder::new(Kind::Custom(9005), "")
+        .tags([
+            Tag::parse(["e", &draft.id.to_hex()]).unwrap(),
+            Tag::parse(["h", &ch_id]).unwrap(),
+        ])
+        .sign_with_keys(&admin)
+        .unwrap();
+    let (accepted, msg) = submit_event_http(&client, &admin, &del_9005).await;
+    assert!(
+        !accepted,
+        "admin kind:9005 on draft must be rejected; relay said: {msg}"
+    );
+
+    // Control probe: same admin submits kind:9005 with a random nonexistent
+    // event id. This produces the genuine "target event not found" path.
+    // The oracle-masking invariant requires that `msg` (draft target) is
+    // byte-identical to `control_msg` (nonexistent target) and contains no
+    // draft-specific terms.
+    let fake_id = "de".repeat(32);
+    let control_9005 = EventBuilder::new(Kind::Custom(9005), "")
+        .tags([
+            Tag::parse(["e", &fake_id]).unwrap(),
+            Tag::parse(["h", &ch_id]).unwrap(),
+        ])
+        .sign_with_keys(&admin)
+        .unwrap();
+    let (control_accepted, control_msg) = submit_event_http(&client, &admin, &control_9005).await;
+    assert!(
+        !control_accepted,
+        "control probe (nonexistent target) must also be rejected; relay said: {control_msg}"
+    );
+    assert_eq!(
+        msg, control_msg,
+        "draft-target and nonexistent-target must produce byte-identical rejection messages \
+         (oracle mask); draft msg: {msg:?}, control msg: {control_msg:?}"
+    );
+    assert!(
+        !msg.contains("31234") && !msg.contains("draft") && !msg.contains("tombstone"),
+        "rejection must not leak draft-specific terms; got: {msg:?}"
     );
 }
 

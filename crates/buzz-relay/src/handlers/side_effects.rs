@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_u32, is_parameterized_replaceable, KIND_AGENT_PROFILE, KIND_DM_VISIBILITY,
-    KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST, KIND_IA_UNARCHIVED,
-    KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_NIP29_GROUP_ADMINS,
-    KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA, KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION,
-    KIND_THREAD_SUMMARY,
+    KIND_DRAFT, KIND_GIT_REPO_ANNOUNCEMENT, KIND_IA_ARCHIVED, KIND_IA_ARCHIVED_LIST,
+    KIND_IA_UNARCHIVED, KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION,
+    KIND_NIP29_GROUP_ADMINS, KIND_NIP29_GROUP_MEMBERS, KIND_NIP29_GROUP_METADATA,
+    KIND_NIP43_MEMBERSHIP_LIST, KIND_REACTION, KIND_THREAD_SUMMARY,
 };
 use buzz_core::StoredEvent;
 use buzz_db::channel::{MemberRecord, MemberRole};
@@ -225,6 +225,20 @@ pub async fn validate_standard_deletion_event(
                 .await?
         {
             return Err(anyhow::anyhow!("must be event author"));
+        }
+
+        // NIP-37: kind:5 e-tag deletion of kind:31234 draft wraps is not
+        // supported.  Accepting it would erase the live head row, enabling a
+        // subsequent write to rebind the immutable (community, author, kind, d)
+        // address to a different channel.  The correct deletion mechanism is an
+        // empty-content tombstone (kind:31234 with "" content).
+        // Check is placed after authz so the relay does not reveal draft
+        // existence to callers who do not own the target event.
+        if event_kind_u32(&target_event.event) == KIND_DRAFT {
+            return Err(anyhow::anyhow!(
+                "NIP-09 e-tag deletion of kind:31234 draft wraps is not supported; \
+                 use an empty-content tombstone (kind:31234 with empty content) instead"
+            ));
         }
     }
 
@@ -557,6 +571,38 @@ pub async fn validate_admin_event(
                 .await
                 .map_err(|e| anyhow::anyhow!("db error looking up target: {e}"))?
                 .ok_or_else(|| anyhow::anyhow!("target event not found"))?;
+
+            // NIP-37: kind:9005 deletion of kind:31234 draft wraps is not
+            // supported. Accepting it would erase the live head row, enabling a
+            // subsequent write to rebind the immutable (community, author, kind,
+            // d) address to a different channel. The correct deletion mechanism
+            // is an empty-content tombstone (kind:31234 with "" content).
+            //
+            // Placement: before the channel-match and actor-authz checks so that
+            // channel admins cannot probe `e=<id>` to distinguish a draft from a
+            // nonexistent event. Author and agent-owner get the informative
+            // tombstone-guidance error; everyone else gets the generic
+            // "target event not found" response (byte-identical to the
+            // missing-target branch above).
+            if event_kind_u32(&target_event.event) == KIND_DRAFT {
+                let draft_author = effective_message_author(
+                    &target_event.event,
+                    &state.relay_keypair.public_key(),
+                );
+                if draft_author == actor_bytes
+                    || state
+                        .db
+                        .is_agent_owner(tenant.community(), &draft_author, &actor_bytes)
+                        .await?
+                {
+                    return Err(anyhow::anyhow!(
+                        "kind:9005 deletion of kind:31234 draft wraps is not supported; \
+                         use an empty-content tombstone (kind:31234 with empty content) instead"
+                    ));
+                } else {
+                    return Err(anyhow::anyhow!("target event not found"));
+                }
+            }
 
             match target_event.channel_id {
                 Some(target_ch) if target_ch != channel_id => {
