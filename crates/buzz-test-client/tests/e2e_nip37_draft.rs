@@ -3053,3 +3053,400 @@ async fn test_channel_window_cursor_boundary_excludes_draft() {
     // If has_more=false, all 3 messages fit in one page — cursor test skipped,
     // but the no-draft assertion above already passed.
 }
+
+// ─── Q15 oracle-closure e2e — write-path id-oracle guards ────────────────────
+//
+// These four tests prove the author-only target masking actually fires in the
+// live relay, not just that the constant AUTHOR_ONLY_KINDS contains KIND_DRAFT.
+// For each write path, we submit against a REAL draft id and against a RANDOM
+// (guaranteed-nonexistent) 64-hex id, and assert:
+//   - the error strings are BYTE-IDENTICAL between the two submissions (no oracle)
+//   - after each rejected attempt, no public rows referencing the draft id exist
+//
+// The tests are intentionally verbose so a reviewer can follow every assertion.
+
+#[tokio::test]
+#[ignore]
+async fn test_draft_target_reaction_oracle_closed() {
+    // Attacker reacts (kind:7) to:
+    //   (A) a real draft event id authored by `author`
+    //   (B) a random 64-hex id that definitely does not exist
+    //
+    // Both must return the SAME byte-identical error string so an attacker
+    // cannot distinguish "this id is a real draft" from "this id doesn't exist".
+    // After each rejected submission, the attacker queries for kind:7 events
+    // that e-tag the target id and asserts zero are stored.
+    let client = http_client();
+    let author = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    // Author publishes a draft — this is the real id we'll probe with.
+    let draft = build_draft(&author, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id_hex = draft.id.to_hex();
+    let (ok_d, err_d) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    // A guaranteed-nonexistent id: all zeros is an invalid SHA-256 preimage
+    // for any real event on any relay.
+    let random_id_hex = "0".repeat(64);
+
+    // Helper: build a kind:7 reaction with e-tag pointing to `target_id`.
+    // Reactions targeting non-channel events don't carry an h tag — the relay
+    // derives the channel from the target.  We don't include one here to stay
+    // minimal and match the ingest path under test.
+    let build_reaction = |target_hex: &str| {
+        EventBuilder::new(nostr::Kind::Custom(7), "+")
+            .tags([nostr::Tag::parse(["e", target_hex]).unwrap()])
+            .sign_with_keys(&attacker)
+            .unwrap()
+    };
+
+    // (A) Attacker reacts to the real draft id.
+    let reaction_a = build_reaction(&draft_id_hex);
+    let (accepted_a, msg_a) = submit_event_http(&client, &attacker, &reaction_a).await;
+    assert!(
+        !accepted_a,
+        "reaction to a real draft id must be rejected; relay said: {msg_a}"
+    );
+
+    // (B) Attacker reacts to the random (nonexistent) id.
+    let reaction_b = build_reaction(&random_id_hex);
+    let (accepted_b, msg_b) = submit_event_http(&client, &attacker, &reaction_b).await;
+    assert!(
+        !accepted_b,
+        "reaction to a nonexistent id must be rejected; relay said: {msg_b}"
+    );
+
+    // Oracle-closure: error strings must be byte-identical.
+    assert_eq!(
+        msg_a, msg_b,
+        "reaction rejection for real-draft-id vs random-id must be BYTE-IDENTICAL \
+         to prevent an id-oracle attack; \
+         real_draft='{msg_a}', random='{msg_b}'"
+    );
+    assert_eq!(
+        msg_a, "invalid: reaction target event not found",
+        "expected byte-exact masking error; got: '{msg_a}'"
+    );
+
+    // Post-rejection storage check: no kind:7 events e-tagging the draft id
+    // must be stored — neither the attacker's attempt nor any fan-out.
+    let kind7_filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(7))
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::E),
+            draft_id_hex.as_str(),
+        );
+    // Query as attacker (their own events) and as author (would see any fan-out)
+    let kind7_as_attacker = query_events_http(
+        &client,
+        &attacker.public_key().to_hex(),
+        vec![kind7_filter.clone()],
+    )
+    .await;
+    assert!(
+        kind7_as_attacker.is_empty(),
+        "zero kind:7 events referencing the draft id must be stored after attacker's \
+         rejected reaction attempt; found: {kind7_as_attacker:?}"
+    );
+    let kind7_as_author =
+        query_events_http(&client, &author.public_key().to_hex(), vec![kind7_filter]).await;
+    assert!(
+        kind7_as_author.is_empty(),
+        "author-side query must also return zero kind:7 events referencing the draft id; \
+         found: {kind7_as_author:?}"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_draft_target_thread_parent_oracle_closed() {
+    // Attacker posts a kind:9 reply (NIP-10 e-tag) whose parent is:
+    //   (A) a real draft event id authored by `author`
+    //   (B) a random 64-hex id that definitely does not exist
+    //
+    // Both must return the SAME byte-identical error string.  After each
+    // rejected submission, we verify no kind:9 thread-children of the draft
+    // id exist, and that no 39005 thread-summary event was fan-out fired.
+    let url = relay_url();
+    let client = http_client();
+    let author = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+
+    // Attacker must be a channel member to get past membership check and reach
+    // the thread-parent guard.  Add them to the open channel.
+    add_member_http(&client, &author, &ch_id, &attacker).await;
+
+    let d = uuid::Uuid::new_v4().to_string();
+    let draft = build_draft(&author, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id_hex = draft.id.to_hex();
+    let (ok_d, err_d) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    let random_id_hex = "1".repeat(64);
+
+    // Subscribe as a channel watcher to detect any 39005 fan-out.
+    let mut watcher = BuzzTestClient::connect(&url, &author)
+        .await
+        .expect("connect watcher");
+    let sid_39005 = sub_id("thread-39005-watch");
+    let filter_39005 = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(39005))
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::H),
+            ch_id.as_str(),
+        )
+        .limit(0);
+    watcher
+        .subscribe(&sid_39005, vec![filter_39005])
+        .await
+        .expect("subscribe 39005");
+    let _ = watcher
+        .collect_until_eose(&sid_39005, Duration::from_secs(3))
+        .await;
+
+    // Helper: build a kind:9 reply whose parent (and root) is `parent_hex`.
+    // Using a single e-tag with marker "reply" makes it both root and parent
+    // per the NIP-10 two-marker fallback in resolve_nip10_thread_meta.
+    let build_reply = |parent_hex: &str| {
+        EventBuilder::new(nostr::Kind::Custom(9), "reply text")
+            .tags([
+                nostr::Tag::parse(["h", &ch_id]).unwrap(),
+                nostr::Tag::parse(["e", parent_hex, "", "reply"]).unwrap(),
+            ])
+            .sign_with_keys(&attacker)
+            .unwrap()
+    };
+
+    // (A) Attacker replies with real draft id as parent.
+    let reply_a = build_reply(&draft_id_hex);
+    let (accepted_a, msg_a) = submit_event_http(&client, &attacker, &reply_a).await;
+    assert!(
+        !accepted_a,
+        "reply with real draft id as parent must be rejected; relay said: {msg_a}"
+    );
+
+    // (B) Attacker replies with random (nonexistent) id as parent.
+    let reply_b = build_reply(&random_id_hex);
+    let (accepted_b, msg_b) = submit_event_http(&client, &attacker, &reply_b).await;
+    assert!(
+        !accepted_b,
+        "reply with nonexistent id as parent must be rejected; relay said: {msg_b}"
+    );
+
+    // Oracle-closure: error strings must be byte-identical.
+    assert_eq!(
+        msg_a, msg_b,
+        "thread-parent rejection for real-draft-id vs random-id must be BYTE-IDENTICAL; \
+         real_draft='{msg_a}', random='{msg_b}'"
+    );
+    assert_eq!(
+        msg_a, "invalid: reply parent not found",
+        "expected byte-exact masking error; got: '{msg_a}'"
+    );
+
+    // Post-rejection storage check: no kind:9 events e-tagging the draft id
+    // as a parent must be stored.
+    let reply_filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(9))
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::E),
+            draft_id_hex.as_str(),
+        );
+    let replies_stored =
+        query_events_http(&client, &author.public_key().to_hex(), vec![reply_filter]).await;
+    assert!(
+        replies_stored.is_empty(),
+        "zero kind:9 thread-children referencing the draft id must be stored; \
+         found: {replies_stored:?}"
+    );
+
+    // No 39005 fan-out must have fired for this channel during the above
+    // rejected attempts.  Give the relay a short window to deliver anything.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+    let mut received_39005 = false;
+    loop {
+        let remaining = deadline
+            .checked_duration_since(tokio::time::Instant::now())
+            .unwrap_or(Duration::ZERO);
+        if remaining.is_zero() {
+            break;
+        }
+        match watcher.recv_event(remaining).await {
+            Ok(RelayMessage::Event { event, .. }) => {
+                if event.kind == nostr::Kind::Custom(39005) {
+                    received_39005 = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    assert!(
+        !received_39005,
+        "no 39005 thread-summary fan-out must fire when a reply is rejected due to \
+         author-only parent masking"
+    );
+    watcher.disconnect().await.expect("disconnect watcher");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_draft_target_public_reference_author_also_rejected() {
+    // The public-reference paths (reaction, thread-reply) reject drafts as
+    // targets for EVERYONE — including the draft's own author.  This is because
+    // a successful reaction/reply would write the draft id into a public row
+    // (kind:7 or thread metadata), making the draft's existence public state.
+    //
+    // This test uses the author themselves as the submitter to prove the guard
+    // is unconditional on public-reference paths.
+    let client = http_client();
+    let author = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    let draft = build_draft(&author, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id_hex = draft.id.to_hex();
+    let (ok_d, err_d) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    // Author reacts to their own draft.
+    let self_reaction = EventBuilder::new(nostr::Kind::Custom(7), "+")
+        .tags([nostr::Tag::parse(["e", &draft_id_hex]).unwrap()])
+        .sign_with_keys(&author)
+        .unwrap();
+    let (accepted_rxn, msg_rxn) = submit_event_http(&client, &author, &self_reaction).await;
+    assert!(
+        !accepted_rxn,
+        "author reacting to their own draft must be rejected (public-reference path \
+         writes draft id into public kind:7 row); relay said: {msg_rxn}"
+    );
+    assert_eq!(
+        msg_rxn, "invalid: reaction target event not found",
+        "author's self-reaction rejection must use the masking not-found error; got: '{msg_rxn}'"
+    );
+
+    // Author replies with their own draft as parent.
+    let self_reply = EventBuilder::new(nostr::Kind::Custom(9), "author reply")
+        .tags([
+            nostr::Tag::parse(["h", &ch_id]).unwrap(),
+            nostr::Tag::parse(["e", &draft_id_hex, "", "reply"]).unwrap(),
+        ])
+        .sign_with_keys(&author)
+        .unwrap();
+    let (accepted_reply, msg_reply) = submit_event_http(&client, &author, &self_reply).await;
+    assert!(
+        !accepted_reply,
+        "author replying to their own draft as parent must be rejected (public-reference \
+         path writes draft id into thread metadata); relay said: {msg_reply}"
+    );
+    assert_eq!(
+        msg_reply, "invalid: reply parent not found",
+        "author's self-reply rejection must use the masking not-found error; got: '{msg_reply}'"
+    );
+
+    // Verify the draft is still readable by the author (the rejections must
+    // not have altered it).
+    let draft_filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(KIND_DRAFT))
+        .author(author.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let drafts =
+        query_events_http(&client, &author.public_key().to_hex(), vec![draft_filter]).await;
+    assert_eq!(
+        drafts.len(),
+        1,
+        "draft must still be readable by author after rejected self-reaction and self-reply"
+    );
+    assert_eq!(
+        drafts[0]["id"].as_str().unwrap(),
+        draft_id_hex,
+        "draft head must be unchanged"
+    );
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_draft_target_kind5_oracle_closed() {
+    // Non-author submits a kind:5 (NIP-09 e-tag deletion) targeting:
+    //   (A) a real draft event id authored by `author`
+    //   (B) a random 64-hex id that definitely does not exist
+    //
+    // Both must return the SAME byte-identical error string so the attacker
+    // cannot distinguish "this id is a real draft" from "this id doesn't exist".
+    // After each rejected submission, the draft must still be readable by the
+    // author (it was not deleted).
+    let client = http_client();
+    let author = Keys::generate();
+    let attacker = Keys::generate();
+    let ch_id = create_open_channel(&author).await;
+    let d = uuid::Uuid::new_v4().to_string();
+
+    let draft = build_draft(&author, &d, "9", &ch_id, &fake_nip44_v2());
+    let draft_id_hex = draft.id.to_hex();
+    let (ok_d, err_d) = submit_event_http(&client, &author, &draft).await;
+    assert!(ok_d, "draft must be accepted: {err_d}");
+
+    let random_id_hex = "2".repeat(64);
+
+    let build_deletion = |target_hex: &str, signer: &Keys| {
+        EventBuilder::new(nostr::Kind::EventDeletion, "")
+            .tags([nostr::Tag::parse(["e", target_hex]).unwrap()])
+            .sign_with_keys(signer)
+            .unwrap()
+    };
+
+    // (A) Attacker submits kind:5 e-tagging the real draft id.
+    let del_a = build_deletion(&draft_id_hex, &attacker);
+    let (accepted_a, msg_a) = submit_event_http(&client, &attacker, &del_a).await;
+    assert!(
+        !accepted_a,
+        "kind:5 targeting a real draft id must be rejected; relay said: {msg_a}"
+    );
+
+    // (B) Attacker submits kind:5 e-tagging the random (nonexistent) id.
+    let del_b = build_deletion(&random_id_hex, &attacker);
+    let (accepted_b, msg_b) = submit_event_http(&client, &attacker, &del_b).await;
+    assert!(
+        !accepted_b,
+        "kind:5 targeting a nonexistent id must be rejected; relay said: {msg_b}"
+    );
+
+    // Oracle-closure: error strings must be byte-identical.
+    assert_eq!(
+        msg_a, msg_b,
+        "kind:5 rejection for real-draft-id vs random-id must be BYTE-IDENTICAL; \
+         real_draft='{msg_a}', random='{msg_b}'"
+    );
+    assert_eq!(
+        msg_a, "invalid: target event not found",
+        "expected byte-exact masking error; got: '{msg_a}'"
+    );
+
+    // Draft must still be readable by the author — not deleted.
+    let draft_filter = nostr::Filter::new()
+        .kind(nostr::Kind::Custom(KIND_DRAFT))
+        .author(author.public_key())
+        .custom_tag(
+            nostr::SingleLetterTag::lowercase(nostr::Alphabet::D),
+            d.as_str(),
+        );
+    let drafts =
+        query_events_http(&client, &author.public_key().to_hex(), vec![draft_filter]).await;
+    assert_eq!(
+        drafts.len(),
+        1,
+        "draft must still be readable by author after attacker's rejected kind:5 deletion"
+    );
+    assert_eq!(
+        drafts[0]["id"].as_str().unwrap(),
+        draft_id_hex,
+        "draft head must be the original draft — attacker's kind:5 must not have altered it"
+    );
+}
