@@ -62,6 +62,14 @@ function tagValue(event: RelayEvent, name: string): string | null {
   return tag?.[1] ?? null;
 }
 
+function newerHead(
+  left?: RemoteHead,
+  right?: RemoteHead,
+): RemoteHead | undefined {
+  if (!left || !right) return left ?? right;
+  return compareHeads(left, right) >= 0 ? left : right;
+}
+
 export class DraftSyncManager {
   private readonly relayScope: string;
   private readonly state = new Map<string, AddressState>();
@@ -105,9 +113,13 @@ export class DraftSyncManager {
   }
 
   queuePublish(draftKey: string, draft: DraftState): void {
-    if (this.destroyed || draft.pendingImeta.some((media) => !media.uploaded))
+    if (this.destroyed) return;
+    const entry = this.state.get(draftKey) ?? { draftKey };
+    if (draft.pendingImeta.some((media) => !media.uploaded)) {
+      entry.pendingPublish = undefined;
+      this.reschedulePublishes();
       return;
-    const entry = this.state.get(draftKey) ?? {};
+    }
     entry.draftKey = draftKey;
     entry.pendingPublish = { draftKey, draft, channelId: draft.channelId };
     this.state.set(draftKey, entry);
@@ -116,24 +128,20 @@ export class DraftSyncManager {
     void this.deps
       .deriveAddress(draftKey, this.relayScope)
       .then((address) => {
-        const current = this.state.get(draftKey)?.pendingPublish;
-        if (current) current.address = address;
+        const current = this.state.get(draftKey);
+        if (!current) return;
+        const linked = this.linkState(draftKey, address);
+        if (current.pendingPublish)
+          linked.pendingPublish = current.pendingPublish;
+        if (linked.pendingPublish) linked.pendingPublish.address = address;
       })
       .catch(() => {});
-    if (this.timer !== null) window.clearTimeout(this.timer);
-    this.timer = window.setTimeout(() => {
-      this.timer = null;
-      void this.flushPublishes();
-    }, DEBOUNCE_MS);
+    this.reschedulePublishes(true);
   }
 
   async queueDeletion(draftKey: string, channelId: string): Promise<void> {
     if (this.destroyed) return;
-    if (this.timer !== null) {
-      window.clearTimeout(this.timer);
-      this.timer = null;
-    }
-    const entry = this.state.get(draftKey) ?? {};
+    const entry = this.state.get(draftKey) ?? { draftKey };
     entry.draftKey = draftKey;
     const cachedAddress = entry.pendingPublish?.address ?? null;
     const pendingDeletion = {
@@ -145,6 +153,7 @@ export class DraftSyncManager {
     entry.pendingDeletion = pendingDeletion;
     entry.pendingPublish = undefined;
     this.state.set(draftKey, entry);
+    this.reschedulePublishes();
     // Persist the deletion intent synchronously before visible local state is
     // cleared; derive the opaque address afterward if it was not prewarmed.
     this.writeSidecar();
@@ -157,6 +166,9 @@ export class DraftSyncManager {
       } catch {
         return;
       }
+      const linked = this.linkState(draftKey, pendingDeletion.address);
+      linked.pendingDeletion = pendingDeletion;
+      pendingDeletion.base ??= linked.remoteHead;
       this.writeSidecar();
     }
     await this.publishTombstone(pendingDeletion);
@@ -196,11 +208,9 @@ export class DraftSyncManager {
 
   async destroy(): Promise<void> {
     this.destroyed = true;
-    if (this.timer !== null) {
-      window.clearTimeout(this.timer);
-      this.timer = null;
-      await this.flushPublishes();
-    }
+    if (this.timer !== null) window.clearTimeout(this.timer);
+    this.timer = null;
+    await this.flushPublishes();
     this.unsubscribeReconnect?.();
     this.unsubscribeReconnect = null;
     await Promise.all(
@@ -210,7 +220,7 @@ export class DraftSyncManager {
   }
 
   private async flushPublishes(): Promise<void> {
-    for (const state of this.state.values()) {
+    for (const state of new Set(this.state.values())) {
       const pending = state.pendingPublish;
       if (!pending || state.pendingDeletion) continue;
       await this.publishDraft(pending, state);
@@ -225,13 +235,21 @@ export class DraftSyncManager {
       const address =
         pending.address ??
         (await this.deps.deriveAddress(pending.draftKey, this.relayScope));
+      pending.address = address;
+      state = this.linkState(pending.draftKey, address);
       await this.fetchAndMerge({
         kinds: [KIND_DRAFT],
         authors: [this.pubkey],
         "#d": [address],
         limit: 1,
       });
-      if (state.remoteHead?.content === "") return;
+      state = this.state.get(address) ?? state;
+      if (state.remoteHead?.content === "") {
+        state.pendingPublish = undefined;
+        removeRemoteDraftEntry(pending.draftKey);
+        this.reschedulePublishes();
+        return;
+      }
       const content = await this.deps.encrypt(
         serializeDraftPayload(pending.draftKey, pending.draft, this.pubkey),
       );
@@ -264,9 +282,15 @@ export class DraftSyncManager {
   private async publishTombstone(pending: PendingDeletion): Promise<void> {
     if (!pending.address) return;
     try {
+      const state = this.linkState(pending.draftKey, pending.address);
+      const base = pending.base ?? state.remoteHead;
       const event = await this.deps.sign({
         kind: KIND_DRAFT,
         content: "",
+        createdAt: Math.max(
+          Math.floor(Date.now() / 1_000),
+          (base?.created_at ?? 0) + 1,
+        ),
         tags: [
           ["d", pending.address],
           ["h", pending.channelId],
@@ -278,8 +302,7 @@ export class DraftSyncManager {
         "Timed out deleting draft.",
         "Failed to delete draft.",
       );
-      const state = this.state.get(pending.draftKey);
-      if (state?.pendingDeletion?.address === pending.address) {
+      if (state.pendingDeletion?.address === pending.address) {
         state.pendingDeletion = undefined;
         state.remoteHead = event;
         this.writeSidecar();
@@ -291,7 +314,9 @@ export class DraftSyncManager {
 
   private async replayPendingDeletions(): Promise<void> {
     for (const pending of Object.values(this.readSidecar())) {
-      const state = this.state.get(pending.draftKey) ?? {};
+      const state = this.state.get(pending.draftKey) ?? {
+        draftKey: pending.draftKey,
+      };
       state.draftKey = pending.draftKey;
       state.pendingDeletion = pending;
       this.state.set(pending.draftKey, state);
@@ -304,6 +329,8 @@ export class DraftSyncManager {
         } catch {
           continue;
         }
+        this.linkState(pending.draftKey, pending.address).pendingDeletion =
+          pending;
         this.writeSidecar();
       }
       await this.publishTombstone(pending);
@@ -360,10 +387,17 @@ export class DraftSyncManager {
       return;
     if (event.content === "") {
       state.remoteHead = event;
-      this.state.set(address, state);
       const draftKey =
         state.draftKey ?? (await this.findLocalDraftKeyForAddress(address));
-      if (draftKey) removeRemoteDraftEntry(draftKey);
+      if (draftKey) {
+        const linked = this.linkState(draftKey, address, state);
+        linked.remoteHead = event;
+        linked.pendingPublish = undefined;
+        removeRemoteDraftEntry(draftKey);
+        this.reschedulePublishes();
+      } else {
+        this.state.set(address, state);
+      }
       return;
     }
     try {
@@ -380,19 +414,16 @@ export class DraftSyncManager {
         address
       )
         return;
-      const keyedState = this.state.get(decoded.draftKey);
-      const targetState = keyedState ?? state;
+      const targetState = this.linkState(decoded.draftKey, address, state);
       if (
         targetState.remoteHead &&
         compareHeads(event, targetState.remoteHead) < 0
       )
         return;
-      targetState.draftKey = decoded.draftKey;
       targetState.remoteHead = event;
-      this.state.set(address, targetState);
-      this.state.set(decoded.draftKey, targetState);
       if (
         targetState.pendingDeletion ||
+        targetState.pendingPublish ||
         Object.values(this.readSidecar()).some(
           (entry) => entry.draftKey === decoded.draftKey,
         )
@@ -402,6 +433,46 @@ export class DraftSyncManager {
     } catch {
       // Untrusted ciphertext must not affect local drafts.
     }
+  }
+
+  private linkState(
+    draftKey: string,
+    address: string,
+    candidate?: AddressState,
+  ): AddressState {
+    const byKey = this.state.get(draftKey);
+    const byAddress = this.state.get(address);
+    const state = byKey ?? byAddress ?? candidate ?? { draftKey };
+    if (byKey && byAddress && byKey !== byAddress) {
+      state.remoteHead = newerHead(byKey.remoteHead, byAddress.remoteHead);
+      state.base = newerHead(byKey.base, byAddress.base);
+      state.pendingPublish ??= byKey.pendingPublish ?? byAddress.pendingPublish;
+      state.pendingDeletion ??=
+        byKey.pendingDeletion ?? byAddress.pendingDeletion;
+    }
+    state.draftKey = draftKey;
+    this.state.set(draftKey, state);
+    this.state.set(address, state);
+    return state;
+  }
+
+  private reschedulePublishes(reset = false): void {
+    if (this.timer !== null && (reset || !this.hasPendingPublishes())) {
+      window.clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.timer === null && this.hasPendingPublishes()) {
+      this.timer = window.setTimeout(() => {
+        this.timer = null;
+        void this.flushPublishes();
+      }, DEBOUNCE_MS);
+    }
+  }
+
+  private hasPendingPublishes(): boolean {
+    return [...new Set(this.state.values())].some(
+      (state) => state.pendingPublish && !state.pendingDeletion,
+    );
   }
 
   private sidecarKey(): string {

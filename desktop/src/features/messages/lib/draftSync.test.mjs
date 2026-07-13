@@ -20,7 +20,12 @@ Object.defineProperty(globalThis, "localStorage", {
 });
 
 import { DraftSyncManager } from "./draftSync.ts";
-import { clearAllDrafts, initDraftStore, loadDraftEntry } from "./useDrafts.ts";
+import {
+  clearAllDrafts,
+  initDraftStore,
+  loadDraftEntry,
+  saveDraftEntry,
+} from "./useDrafts.ts";
 
 const pubkey = "a".repeat(64);
 const channelA = "550e8400-e29b-41d4-a716-446655440000";
@@ -225,4 +230,152 @@ test("test_remote_tombstone_removes_known_draft", async () => {
   events = [tombstone];
   await manager.fetchAllOwnDrafts();
   assert.equal(loadDraftEntry(channelA), undefined);
+});
+
+function draft(channelId, content, pendingImeta = []) {
+  return {
+    channelId,
+    content,
+    selectionStart: content.length,
+    selectionEnd: content.length,
+    createdAt: new Date(0).toISOString(),
+    updatedAt: new Date(0).toISOString(),
+    pendingImeta,
+    spoileredAttachmentUrls: [],
+    status: "active",
+  };
+}
+
+test("test_pending_local_publish_observing_tombstone_does_not_resurrect_draft", async () => {
+  setup();
+  const tombstone = wrapped({
+    id: "tombstone",
+    createdAt: 2,
+    address: "address-a",
+    channelId: channelA,
+    content: "",
+  });
+  const published = [];
+  const local = draft(channelA, "local edit");
+  const manager = new DraftSyncManager(pubkey, "wss://relay.example", {
+    deriveAddress: async () => "address-a",
+    fetchEvents: async () => [tombstone],
+    sign: async (input) => ({ ...tombstone, ...input, id: "signed" }),
+    publishEvent: async (event) => published.push(event),
+  });
+
+  saveDraftEntry(channelA, local);
+  manager.queuePublish(channelA, local);
+  await manager.destroy();
+
+  assert.equal(published.length, 0);
+  assert.equal(loadDraftEntry(channelA), undefined);
+});
+
+test("test_remote_update_does_not_overwrite_pending_local_edit", async () => {
+  setup();
+  const remote = wrapped({
+    id: "remote",
+    createdAt: 2,
+    address: "address-a",
+    channelId: channelA,
+    content: "remote-cipher",
+  });
+  const local = draft(channelA, "local edit");
+  const manager = new DraftSyncManager(pubkey, "wss://relay.example", {
+    decrypt: async () => payload(channelA, "remote edit"),
+    deriveAddress: async () => "address-a",
+    fetchEvents: async () => [remote],
+  });
+
+  saveDraftEntry(channelA, local);
+  manager.queuePublish(channelA, local);
+  await manager.fetchAllOwnDrafts();
+
+  assert.equal(loadDraftEntry(channelA)?.content, "local edit");
+});
+
+test("test_deleting_one_draft_does_not_strand_another_pending_publish", async () => {
+  setup();
+  const published = [];
+  const manager = new DraftSyncManager(pubkey, "wss://relay.example", {
+    deriveAddress: async (draftKey) =>
+      draftKey === channelA ? "address-a" : "address-b",
+    fetchEvents: async () => [],
+    encrypt: async () => "cipher",
+    sign: async (input) => ({
+      id: `signed-${input.content || "tombstone"}`,
+      created_at: input.createdAt ?? 0,
+      kind: input.kind,
+      pubkey,
+      content: input.content,
+      sig: "",
+      tags: input.tags,
+    }),
+    publishEvent: async (event) => published.push(event),
+  });
+
+  manager.queuePublish(channelA, draft(channelA, "draft A"));
+  await manager.queueDeletion(channelB, channelB);
+  await manager.destroy();
+
+  assert.ok(published.some((event) => event.content === "cipher"));
+});
+
+test("test_tombstone_rebases_after_future_remote_head", async () => {
+  setup();
+  const future = Math.floor(Date.now() / 1_000) + 10_000;
+  const remote = wrapped({
+    id: "remote",
+    createdAt: future,
+    address: "address-a",
+    channelId: channelA,
+    content: "cipher",
+  });
+  const signed = [];
+  const manager = new DraftSyncManager(pubkey, "wss://relay.example", {
+    decrypt: async () => payload(channelA, "draft"),
+    deriveAddress: async () => "address-a",
+    fetchEvents: async () => [remote],
+    sign: async (input) => {
+      signed.push(input);
+      return { ...remote, ...input, id: "tombstone" };
+    },
+    publishEvent: async () => {},
+  });
+
+  await manager.fetchAllOwnDrafts();
+  await manager.queueDeletion(channelA, channelA);
+
+  assert.equal(signed[0].content, "");
+  assert.equal(signed[0].createdAt, future + 1);
+});
+
+test("test_unuploaded_attachment_cancels_stale_text_publish", async () => {
+  setup();
+  const published = [];
+  const manager = new DraftSyncManager(pubkey, "wss://relay.example", {
+    deriveAddress: async () => "address-a",
+    fetchEvents: async () => [],
+    encrypt: async () => "cipher",
+    sign: async (input) => ({
+      id: "signed",
+      created_at: input.createdAt ?? 0,
+      kind: input.kind,
+      pubkey,
+      content: input.content,
+      sig: "",
+      tags: input.tags,
+    }),
+    publishEvent: async (event) => published.push(event),
+  });
+
+  manager.queuePublish(channelA, draft(channelA, "text"));
+  manager.queuePublish(
+    channelA,
+    draft(channelA, "text", [{ uploaded: false }]),
+  );
+  await manager.destroy();
+
+  assert.equal(published.length, 0);
 });
