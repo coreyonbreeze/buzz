@@ -233,7 +233,6 @@ export type RawAcpRuntimeCatalogEntry = {
   install_instructions_url: string;
   can_auto_install: boolean;
   underlying_cli_path: string | null;
-  node_required: boolean;
   /** Tagged union with snake_case status values — same shape as `AuthStatus`. */
   auth_status: AuthStatus;
   login_hint?: string;
@@ -928,7 +927,6 @@ function fromRawAcpRuntimeCatalogEntry(
     installInstructionsUrl: entry.install_instructions_url,
     canAutoInstall: entry.can_auto_install,
     underlyingCliPath: entry.underlying_cli_path,
-    nodeRequired: entry.node_required,
     authStatus: entry.auth_status,
     loginHint: entry.login_hint ?? null,
   };

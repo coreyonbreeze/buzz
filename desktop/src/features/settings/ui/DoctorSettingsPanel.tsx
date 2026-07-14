@@ -83,7 +83,7 @@ function InstallActions({
   onInstall: () => void;
   runtime: AcpRuntimeCatalogEntry;
 }) {
-  const showInstall = runtime.canAutoInstall && !runtime.nodeRequired;
+  const showInstall = runtime.canAutoInstall;
 
   return (
     <div className="mt-2 flex items-center gap-2">
@@ -114,46 +114,6 @@ function InstallActions({
         View instructions
       </button>
     </div>
-  );
-}
-
-/**
- * Node.js callout when required, or the install actions when it is not.
- * Used for both `adapter_missing` and `not_installed` availability states.
- */
-function NodeRequiredOrInstall({
-  hasError,
-  isInstalling,
-  onInstall,
-  runtime,
-}: {
-  hasError: boolean;
-  isInstalling: boolean;
-  onInstall: () => void;
-  runtime: AcpRuntimeCatalogEntry;
-}) {
-  if (runtime.nodeRequired) {
-    return (
-      <p className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1.5 text-sm text-amber-700 dark:text-amber-400">
-        Node.js is required to install this adapter.{" "}
-        <button
-          className="underline underline-offset-2 hover:no-underline"
-          onClick={() => void openUrl("https://nodejs.org")}
-          type="button"
-        >
-          Install Node.js
-        </button>
-        , then click Re-run.
-      </p>
-    );
-  }
-  return (
-    <InstallActions
-      hasError={hasError}
-      isInstalling={isInstalling}
-      onInstall={onInstall}
-      runtime={runtime}
-    />
   );
 }
 
@@ -262,7 +222,7 @@ function RuntimeRow({
             <p className="mt-1 text-sm font-normal text-muted-foreground">
               {runtime.installHint}
             </p>
-            <NodeRequiredOrInstall
+            <InstallActions
               hasError={installError !== null}
               isInstalling={isInstalling}
               onInstall={onInstall}
@@ -277,7 +237,7 @@ function RuntimeRow({
             <p className="mt-1 text-sm font-normal text-muted-foreground">
               {runtime.installHint}
             </p>
-            <NodeRequiredOrInstall
+            <InstallActions
               hasError={installError !== null}
               isInstalling={isInstalling}
               onInstall={onInstall}

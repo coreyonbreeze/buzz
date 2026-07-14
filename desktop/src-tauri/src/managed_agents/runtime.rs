@@ -1321,31 +1321,20 @@ pub fn build_managed_agent_summary(
     // at launch; recompute from current disk state and flag drift. Only a
     // tracked live process can drift — stopped agents spawn fresh, and
     // adopted (runtime_pid-only) processes have no stamped hash to compare.
-    //
-    // Additionally, for runtimes with an adapter version gate (codex only),
-    // check whether the cached adapter availability has drifted from the value
-    // stamped at spawn.  This catches out-of-band adapter changes (manual
-    // npm install/downgrade) that Phase-1 auto-restart doesn't cover.  The
-    // cache is read-only here — no subprocess is spawned.
     let needs_restart = runtimes.get(&record.pubkey).is_some_and(|runtime| {
         use tauri::Manager;
         let state = app.state::<crate::app_state::AppState>();
         let global_for_hash =
             crate::managed_agents::load_global_agent_config(app).unwrap_or_default();
         let teams_for_hash = crate::managed_agents::load_teams(app).unwrap_or_default();
-        let hash_drift = runtime.spawn_config_hash
+        runtime.spawn_config_hash
             != crate::managed_agents::spawn_hash::spawn_config_hash(
                 record,
                 personas,
                 &teams_for_hash,
                 &crate::relay::relay_ws_url_with_override(&state),
                 &global_for_hash,
-            );
-        let availability_drift = super::availability_drift(
-            runtime.adapter_availability.as_ref(),
-            super::adapter_availability_cached(),
-        );
-        hash_drift || availability_drift
+            )
     });
 
     // Resolve the effective harness the same way, then derive args/mcp from it,
@@ -1891,20 +1880,6 @@ pub fn spawn_agent_child(
         &global,
     );
 
-    // Stamp the adapter availability for runtimes with a version gate (codex
-    // only). The summary builder compares this against the current cached value
-    // to detect out-of-band adapter changes after spawn (Phase-2 badge fallback).
-    // Non-codex runtimes get `None` — nothing changes for them.
-    // When the cache is cold (e.g. Doctor just installed and cleared the cache),
-    // `adapter_availability_cached()` returns `None`, so the stamp is `None` and
-    // the drift check is skipped until discovery warms the cache — preventing a
-    // false restart badge immediately after auto-restart.
-    let spawned_adapter_availability = if runtime_meta.is_some_and(|r| r.id == "codex") {
-        super::adapter_availability_cached()
-    } else {
-        None
-    };
-
     let _ = super::write_agent_pid_file(app, &record.pubkey, child.id());
 
     // Windows: assign the harness to a Job Object so its whole tree dies with
@@ -1915,7 +1890,6 @@ pub fn spawn_agent_child(
         log_path,
         spawn_config_hash,
         spawned_setup_mode,
-        spawned_adapter_availability,
         &record.name,
     ));
     #[cfg(not(windows))]
@@ -1924,7 +1898,6 @@ pub fn spawn_agent_child(
         log_path,
         spawn_config_hash,
         setup_mode: spawned_setup_mode,
-        adapter_availability: spawned_adapter_availability,
     })
 }
 

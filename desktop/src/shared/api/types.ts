@@ -587,8 +587,6 @@ export type AcpRuntimeCatalogEntry = {
   installInstructionsUrl: string;
   canAutoInstall: boolean;
   underlyingCliPath: string | null;
-  /** True when an npm adapter step is pending but Node.js / npm is absent. */
-  nodeRequired: boolean;
   /** Login/auth status for CLI-based runtimes. */
   authStatus: AuthStatus;
   /** Hint for completing authentication; null when not applicable or already logged in. */

@@ -435,12 +435,6 @@ pub struct ManagedAgentProcess {
     /// `install_acp_runtime` to target only stuck agents for auto-restart,
     /// excluding healthy in-pool agents.
     pub setup_mode: bool,
-    /// Adapter availability status stamped at spawn time for runtimes with a
-    /// version gate (currently codex only; `None` for all others). Runtime-only
-    /// — never persisted. The summary builder compares this against the current
-    /// cached availability and sets `needs_restart` on drift, catching out-of-
-    /// band adapter changes that Phase-1 auto-restart doesn't cover.
-    pub adapter_availability: Option<AcpAvailabilityStatus>,
     /// Win32 Job Object owning the harness + its entire process tree. Closing
     /// the handle (via `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`) kills the whole
     /// tree — the Windows mirror of the Unix process-group teardown. `None`
@@ -581,9 +575,6 @@ pub struct AcpRuntimeCatalogEntry {
     /// true when at least one automated install step is available
     pub can_auto_install: bool,
     pub underlying_cli_path: Option<String>,
-    /// true when an npm adapter step is pending but Node.js / npm is absent.
-    /// The UI hides the Install button and shows a Node.js install callout.
-    pub node_required: bool,
     /// Login/authentication status for CLI-based runtimes.
     pub auth_status: AuthStatus,
     /// Hint for completing authentication, shown when `auth_status` is not `logged_in`.

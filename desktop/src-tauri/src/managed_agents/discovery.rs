@@ -547,73 +547,6 @@ pub fn resolve_command(command: &str) -> Option<PathBuf> {
 pub fn clear_resolve_cache() {
     let mut guard = resolve_cache().lock().unwrap_or_else(|e| e.into_inner());
     guard.clear();
-    // Also invalidate the adapter-availability cache so a freshly-installed
-    // adapter is reflected the next time the summary builder checks the badge.
-    clear_adapter_availability_cache();
-}
-
-// ── Adapter availability cache (Phase-2 badge fallback) ─────────────────────
-//
-// `build_managed_agent_summary` needs to compare the spawn-time adapter
-// availability against the *current* availability without re-running command
-// resolution on every poll cycle.  This cache stores the last availability
-// status of the codex-acp binary at its resolved path.  It is warmed by
-// `discover_acp_runtimes` (which already resolves), so the badge path reads
-// warm data, and is invalidated by `clear_resolve_cache`
-// (called on every Doctor install and every `discover_acp_providers` call).
-
-fn adapter_availability_cache() -> &'static std::sync::Mutex<Option<AcpAvailabilityStatus>> {
-    use std::sync::{Mutex, OnceLock};
-    static CACHE: OnceLock<Mutex<Option<AcpAvailabilityStatus>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(None))
-}
-
-fn clear_adapter_availability_cache() {
-    if let Ok(mut guard) = adapter_availability_cache().lock() {
-        *guard = None;
-    }
-}
-
-/// Cache the current codex-acp adapter availability status.
-///
-/// Called by `discover_acp_runtimes` after it probes the codex adapter so the
-/// badge path has a warm value without re-probing.
-pub(crate) fn cache_adapter_availability(status: AcpAvailabilityStatus) {
-    if let Ok(mut guard) = adapter_availability_cache().lock() {
-        *guard = Some(status);
-    }
-}
-
-/// Return the most recently cached codex-acp adapter availability, or
-/// `None` if no discovery has run yet.
-///
-/// This is a **read from cache only** — it never spawns a subprocess.  The
-/// value is populated by `discover_acp_runtimes` and invalidated by
-/// `clear_resolve_cache`.  When the cache is cold, returning `None` defers
-/// the drift check until discovery has produced a real value, preventing
-/// a fabricated `AdapterMissing` stamp from triggering a false restart badge
-/// on a newly restarted process.
-pub(crate) fn adapter_availability_cached() -> Option<AcpAvailabilityStatus> {
-    adapter_availability_cache()
-        .lock()
-        .ok()
-        .and_then(|g| g.clone())
-}
-
-/// Pure predicate: does the stamped adapter availability differ from the
-/// current cached availability?
-///
-/// Returns `false` whenever either side is `None` (unknown) — "no data" is
-/// not evidence of drift.  This is extracted for unit testing without global
-/// state and used by `build_managed_agent_summary`.
-pub(crate) fn availability_drift(
-    stamped: Option<&AcpAvailabilityStatus>,
-    current: Option<AcpAvailabilityStatus>,
-) -> bool {
-    match (stamped, current) {
-        (Some(s), Some(c)) => *s != c,
-        _ => false,
-    }
 }
 
 /// Return all candidate basenames for `command` on the current platform.
@@ -943,24 +876,6 @@ pub(crate) fn find_command(command: &str) -> Option<PathBuf> {
     resolve_command(command)
 }
 
-/// Returns true when the runtime has at least one adapter install step that
-/// is an npm global install. Used to determine whether Node.js is required.
-fn runtime_needs_npm(runtime: &KnownAcpRuntime) -> bool {
-    runtime
-        .adapter_install_commands
-        .iter()
-        .any(|cmd| is_npm_global_install(cmd))
-}
-
-/// Returns `true` when `cmd` is an `npm install -g` invocation.
-///
-/// Used by Doctor to determine whether Node.js is required before running an
-/// install step, and by the npm EACCES preflight in the install command path.
-pub(crate) fn is_npm_global_install(cmd: &str) -> bool {
-    let t = cmd.trim_start();
-    t.starts_with("npm install -g ") || t.starts_with("npm i -g ")
-}
-
 /// Resolve the binary for a CLI auth probe (`claude`, `codex`): the pinned
 /// CLI vendored inside the bundled bridge wins — it is the exact binary agent
 /// sessions run and reads the same credential store — falling back to the
@@ -1136,13 +1051,6 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
             let (availability, command, binary_path) =
                 classify_runtime(adapter_result, runtime.underlying_cli, underlying_cli_found);
 
-            // Warm the adapter-availability cache for the badge fallback.
-            // The cache is scoped to the codex runtime; other runtimes leave it
-            // unchanged. Invalidated by `clear_resolve_cache`.
-            if runtime.id == "codex" {
-                cache_adapter_availability(availability.clone());
-            }
-
             let underlying_cli_path = runtime
                 .underlying_cli
                 .and_then(find_command)
@@ -1172,14 +1080,6 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
                 }
             };
 
-            // node_required: an npm adapter step is pending AND node/npm are absent.
-            let node_required = matches!(
-                availability,
-                AcpAvailabilityStatus::AdapterMissing | AcpAvailabilityStatus::NotInstalled
-            ) && runtime_needs_npm(runtime)
-                && resolve_command("npm").is_none()
-                && resolve_command("node").is_none();
-
             PartialEntry {
                 runtime,
                 entry: AcpRuntimeCatalogEntry {
@@ -1196,7 +1096,6 @@ pub fn discover_acp_runtimes() -> Vec<AcpRuntimeCatalogEntry> {
                     install_instructions_url: runtime.install_instructions_url.to_string(),
                     can_auto_install,
                     underlying_cli_path,
-                    node_required,
                     // Filled in by the probe phase below.
                     auth_status: AuthStatus::Unknown,
                     login_hint: None,

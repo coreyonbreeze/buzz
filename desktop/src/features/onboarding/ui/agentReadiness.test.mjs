@@ -19,7 +19,6 @@ function makeRuntime(overrides = {}) {
     installInstructionsUrl: "https://example.com",
     canAutoInstall: false,
     underlyingCliPath: null,
-    nodeRequired: false,
     loginHint: null,
     ...overrides,
   };

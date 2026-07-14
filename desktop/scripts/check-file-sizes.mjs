@@ -121,7 +121,11 @@ const overrides = new Map([
   // record_provider param + applies persona_field_with_record_fallback. +5 lines.
   // global-agent-config: spawn_agent_child loads global config and merges as
   // lowest env layer (+8 lines). Queued to split.
-  ["src-tauri/src/managed_agents/runtime.rs", 2216],
+  // acp-dead-machinery retirement: codex adapter-availability spawn stamp +
+  // the availability_drift half of needs_restart deleted (the bundled bridge
+  // can't drift out-of-band); ratcheted to bank the deletions (main's
+  // team-instructions spawn-hash growth stays).
+  ["src-tauri/src/managed_agents/runtime.rs", 2087],
   // config-bridge setup-payload env-boundary fix adds readiness wiring in
   // spawn_agent_child; load-bearing security fix, queued to split.
   ["src-tauri/src/managed_agents/config_bridge/reader.rs", 1016],
@@ -205,7 +209,9 @@ const overrides = new Map([
   // split with the rest of this file.
   // bundled-adapter-doctor-copy: adapter_bundled field on
   // RawAcpRuntimeCatalogEntry + mapper passthrough (+3 lines).
-  ["src/shared/api/tauri.ts", 1343],
+  // acp-dead-machinery retirement: node_required wire field deleted;
+  // ratcheted 1343 -> 1341.
+  ["src/shared/api/tauri.ts", 1341],
   // doctor-npm-eacces-preflight: hint field added to InstallStepResult (+1 line).
   // doctor-install-reliability: AuthStatus tagged union + nodeRequired/authStatus/
   // loginHint fields on AcpRuntimeCatalogEntry (+14 lines). Load-bearing new feature.
@@ -227,7 +233,9 @@ const overrides = new Map([
   // AcpRuntimeCatalogEntry (+2 lines).
   // bundled-cli-probes: "cli_missing" availability retired; +4 doc lines on
   // AcpAvailabilityStatus explaining why the state no longer exists.
-  ["src/shared/api/types.ts", 1075],
+  // acp-dead-machinery retirement: nodeRequired field deleted;
+  // ratcheted 1075 -> 1073.
+  ["src/shared/api/types.ts", 1073],
   // readiness-gate: PersonaDialog.tsx threads computeLocalModeGate +
   // requiredCredentialEnvKeys + RequiredFieldLabel so the "New agent" dialog
   // shows required markers and credential amber rows (parity with
@@ -294,7 +302,10 @@ const overrides = new Map([
   // bundled-cli-probes: resolve_probe_binary (bundled-CLI-first probe
   // resolution) + classify_runtime/underlying_cli doc rewrites for the
   // CliMissing retirement (+8 lines).
-  ["src-tauri/src/managed_agents/discovery.rs", 1267],
+  // acp-dead-machinery retirement: adapter-availability cache +
+  // availability_drift, runtime_needs_npm/is_npm_global_install, and the
+  // node_required computation deleted; ratcheted 1267 -> 1166.
+  ["src-tauri/src/managed_agents/discovery.rs", 1166],
   // rebase over codex-acp-package-swap: its version-probe tests union with the
   // doctor-install-reliability nvm/login-shell/semver tests — each side alone
   // stayed under the 1000 default; the union exceeds it.
@@ -470,7 +481,12 @@ const overrides = new Map([
   // bundle-acps: adapter_verification_step post-install gate + its test
   // quartet (+120 lines, partly offset by the version-gate retirement's
   // deletions in this file). Queued to split.
-  ["src-tauri/src/commands/agent_discovery.rs", 1576],
+  // acp-dead-machinery retirement: npm EACCES preflight (resolve_npm_prefix,
+  // npm_preflight_check, npm_eacces_hint) + its Phase-2 branches, test
+  // groups, and the availability_drift tests deleted; ratcheted
+  // 1576 -> 1184 to bank the deletions (main's Windows install-shell
+  // machinery and tests stay).
+  ["src-tauri/src/commands/agent_discovery.rs", 1184],
   // draft-persistence predicate: submit-time `loadDraft` check + inline comment
   // + deps-array entry in submitMessage closes the never-persisted-boundary
   // defect (Thufir Pass-3 finding). Load-bearing correctness fix; queued to

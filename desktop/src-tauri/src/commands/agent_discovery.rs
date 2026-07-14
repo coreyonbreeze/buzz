@@ -4,9 +4,9 @@ use tauri::State;
 use crate::{
     app_state::AppState,
     managed_agents::{
-        command_availability, is_npm_global_install, AcpRuntimeCatalogEntry,
-        DiscoverManagedAgentPrereqsRequest, InstallRuntimeResult, InstallStepResult,
-        ManagedAgentPrereqsInfo, RelayAgentInfo, DEFAULT_ACP_COMMAND,
+        command_availability, AcpRuntimeCatalogEntry, DiscoverManagedAgentPrereqsRequest,
+        InstallRuntimeResult, InstallStepResult, ManagedAgentPrereqsInfo, RelayAgentInfo,
+        DEFAULT_ACP_COMMAND,
     },
     nostr_convert,
     relay::query_relay,
@@ -55,8 +55,8 @@ pub(crate) fn plan_adapter_install<'c>(
 /// Returns `None` when there is nothing to verify (`commands` is empty) or any
 /// adapter command resolves. Otherwise returns a failed synthetic "verify"
 /// step whose hint points at reinstalling Buzz when the adapter is bundled
-/// (`bundled`, i.e. the catalog carries no install commands) or at the install
-/// step output otherwise.
+/// (`bundled`, see [`runtime_adapter_is_bundled`]) or at the install step
+/// output otherwise.
 fn adapter_verification_step(
     commands: &[&str],
     label: &str,
@@ -74,7 +74,7 @@ fn adapter_verification_step(
     } else {
         format!(
             "The {label} ACP adapter still could not be found after the install steps completed. \
-             Check the step output above and your npm global prefix."
+             Check the step output above."
         )
     };
     Some(InstallStepResult {
@@ -86,6 +86,14 @@ fn adapter_verification_step(
         exit_code: None,
         hint: Some(hint),
     })
+}
+
+/// A runtime's adapter ships with the Buzz desktop app when its catalog entry
+/// carries no install commands at all — neither CLI nor adapter. Goose has a
+/// curl CLI installer (and its CLI *is* its adapter), so a failed goose verify
+/// must not claim the adapter is bundled and point at reinstalling Buzz.
+fn runtime_adapter_is_bundled(runtime: &crate::managed_agents::KnownAcpRuntime) -> bool {
+    runtime.cli_install_commands.is_empty() && runtime.adapter_install_commands.is_empty()
 }
 
 #[tauri::command]
@@ -184,11 +192,6 @@ fn install_acp_runtime_blocking(runtime_id: &str) -> Result<InstallRuntimeResult
     let mut steps = Vec::new();
 
     // Phase 1: Install CLI if missing and commands are available.
-    // NOTE: the npm EACCES preflight and `npm_eacces_hint` classifier only run
-    // in Phase 2 below. Today every entry in `cli_install_commands` is a
-    // curl-pipe; all `npm install -g` commands live in `adapter_install_commands`.
-    // If a future runtime adds an npm-global CLI install it must also add the
-    // preflight and classifier to this loop.
     if let Some(cli) = runtime.underlying_cli {
         if crate::managed_agents::resolve_command(cli).is_none() {
             for cmd in runtime.cli_install_commands_for_os() {
@@ -218,21 +221,7 @@ fn install_acp_runtime_blocking(runtime_id: &str) -> Result<InstallRuntimeResult
         plan_adapter_install(adapter_path.as_deref(), runtime.adapter_install_commands)
     {
         for cmd in cmds {
-            if is_npm_global_install(cmd) {
-                if let Some(step) = npm_preflight_check("adapter", cmd) {
-                    steps.push(step);
-                    return Ok(InstallRuntimeResult {
-                        success: false,
-                        steps,
-                        restarted_count: 0,
-                        failed_restart_count: 0,
-                    });
-                }
-            }
-            let mut result = run_install_command("adapter", cmd);
-            if !result.success && result.hint.is_none() && is_npm_global_install(cmd) {
-                result.hint = npm_eacces_hint(&result.stderr, cmd);
-            }
+            let result = run_install_command("adapter", cmd);
             let success = result.success;
             steps.push(result);
             if !success {
@@ -255,7 +244,7 @@ fn install_acp_runtime_blocking(runtime_id: &str) -> Result<InstallRuntimeResult
     if let Some(step) = adapter_verification_step(
         runtime.commands,
         runtime.label,
-        runtime.adapter_install_commands.is_empty(),
+        runtime_adapter_is_bundled(runtime),
         crate::managed_agents::resolve_command,
     ) {
         steps.push(step);
@@ -591,10 +580,8 @@ fn persist_last_error_on_install(
 }
 
 /// Build a login-shell `Command` for `command` with the hermit env vars
-/// stripped and the user's PATH set. This is the single source of truth for
-/// the shell selection and environment cleanup shared by `run_install_command`
-/// and `resolve_npm_prefix` — keeping them in sync so the hermit-strip list
-/// can't drift between the two paths.
+/// stripped and the user's PATH set, so install scripts run against the
+/// user's normal environment rather than the project-local hermit paths.
 ///
 /// On Windows, resolves Git Bash via `resolve_bash_path` (skips `BUZZ_SHELL`
 /// since install commands require bash syntax). Returns `Err` when no shell
@@ -844,233 +831,6 @@ fn floor_char_boundary(s: &str, mut index: usize) -> usize {
     index
 }
 
-// ── npm EACCES preflight ──────────────────────────────────────────────────────
-
-/// Guidance text for the EACCES / unwritable-prefix case.
-fn npm_eacces_guidance(command: &str) -> String {
-    format!(
-        "npm's global install directory isn't writable by your user.\n\
-\n\
-Fix (no sudo):\n\
-  1. Run:  npm config set prefix ~/.npm-global\n\
-  2. Add to ~/.zprofile:  export PATH=\"$HOME/.npm-global/bin:$PATH\"\n\
-  3. Restart Buzz, then click Install again.\n\
-\n\
-Or install manually, then click Refresh:\n\
-  sudo {command}"
-    )
-}
-
-/// Guidance text shown when npm / Node.js is not found in the login-shell PATH.
-const NPM_MISSING_HINT: &str = "Node.js / npm was not found. Install Node.js \
-(https://nodejs.org or your version manager), restart Buzz, then click Install again.\n\
-If npm works in your terminal, make sure your Node version manager is initialized in \
-~/.zprofile (not only ~/.zshrc) — Buzz resolves tools via non-interactive login shells.";
-
-/// Result of probing `npm prefix -g` in the hermit-stripped login shell.
-#[cfg(unix)]
-enum NpmPrefix {
-    /// npm responded with a parseable prefix path.
-    Found(std::path::PathBuf),
-    /// npm was not found, the spawn failed, the command returned a non-zero
-    /// exit, or the output could not be parsed.
-    Unavailable,
-    /// The probe exceeded the 30-second deadline (e.g. a version-manager init
-    /// that blocks on `/dev/tty`). The install should proceed so the stderr
-    /// classifier remains the backstop.
-    TimedOut,
-}
-
-/// Spawn the same login shell used by `run_install_command` and run
-/// `npm prefix -g` to discover where npm would install global packages.
-#[cfg(unix)]
-fn resolve_npm_prefix() -> NpmPrefix {
-    let mut cmd = match install_shell_command("npm prefix -g") {
-        Ok(cmd) => cmd,
-        Err(_) => return NpmPrefix::Unavailable,
-    };
-    let mut child = match cmd
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return NpmPrefix::Unavailable,
-    };
-
-    // Drain stdout/stderr on background threads to prevent pipe-buffer deadlock.
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
-    let stdout_thread = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(mut pipe) = stdout_pipe {
-            let _ = pipe.read_to_end(&mut buf);
-        }
-        buf
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        // Drain stderr so the child doesn't block on a full pipe.
-        if let Some(mut pipe) = stderr_pipe {
-            let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        }
-    });
-
-    let child_pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    let wait_thread = std::thread::spawn(move || {
-        let status = child.wait();
-        let _ = tx.send(status);
-    });
-
-    // 30-second timeout — plenty for `npm prefix -g`; intentionally shorter
-    // than the 5-minute install budget in `run_install_command`.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let raw_bytes: Option<Vec<u8>> = loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            // Timed out: send SIGTERM, clean up threads, signal the caller to
-            // fall through to the install path rather than abort.
-            unsafe { libc::kill(child_pid as i32, libc::SIGTERM) };
-            drop(rx);
-            let _ = wait_thread.join();
-            let _ = stdout_thread.join();
-            let _ = stderr_thread.join();
-            eprintln!(
-                "buzz: npm prefix probe timed out after 30s; \
-                 proceeding to install (stderr classifier is the backstop)"
-            );
-            return NpmPrefix::TimedOut;
-        }
-        match rx.recv_timeout(std::time::Duration::from_millis(200).min(remaining)) {
-            Ok(Ok(status)) => {
-                let _ = wait_thread.join();
-                let stdout = stdout_thread.join().unwrap_or_default();
-                let _ = stderr_thread.join();
-                break if status.success() { Some(stdout) } else { None };
-            }
-            Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                let _ = wait_thread.join();
-                let _ = stdout_thread.join();
-                let _ = stderr_thread.join();
-                break None;
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-        }
-    };
-
-    let bytes = match raw_bytes {
-        Some(b) => b,
-        None => return NpmPrefix::Unavailable,
-    };
-    let raw = String::from_utf8_lossy(&bytes).into_owned();
-    // Version managers can print banner lines before the real prefix — take the
-    // last non-empty line to skip any preamble.
-    let prefix = match raw.lines().rfind(|l| !l.trim().is_empty()) {
-        Some(l) => l.trim().to_string(),
-        None => return NpmPrefix::Unavailable,
-    };
-    if prefix.is_empty() {
-        return NpmPrefix::Unavailable;
-    }
-    NpmPrefix::Found(std::path::PathBuf::from(prefix))
-}
-
-/// Check write access to a file-system path using the POSIX `access(2)` syscall.
-#[cfg(unix)]
-fn unix_is_writable(path: &std::path::Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let bytes = path.as_os_str().as_bytes();
-    let Ok(c_path) = std::ffi::CString::new(bytes) else {
-        return false;
-    };
-    // SAFETY: `access` is a pure read-only syscall; we pass a valid NUL-terminated
-    // path and a standard flag constant.  This mirrors the existing `setsid`/`kill`
-    // usage in this file.
-    unsafe { libc::access(c_path.as_ptr(), libc::W_OK) == 0 }
-}
-
-/// Returns true when the directory where npm would write global packages is
-/// writable by the current process user.
-///
-/// On non-unix platforms always returns `true` — the EACCES preflight is a
-/// no-op there; the stderr classifier still applies.
-fn npm_install_target_is_writable(prefix: &std::path::Path) -> bool {
-    #[cfg(unix)]
-    {
-        // Probe the most specific candidate that exists; fall back up the tree.
-        for candidate in &[
-            prefix.join("lib/node_modules"),
-            prefix.join("lib"),
-            prefix.to_path_buf(),
-        ] {
-            if candidate.exists() {
-                return unix_is_writable(candidate);
-            }
-        }
-        // Nothing exists — npm couldn't create it either.
-        unix_is_writable(prefix)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = prefix;
-        true
-    }
-}
-
-/// Inspect `stderr` for known npm EACCES patterns and return actionable
-/// guidance if matched, or `None` when the error is unrelated.
-fn npm_eacces_hint(stderr: &str, command: &str) -> Option<String> {
-    if stderr.contains("EACCES: permission denied") || stderr.contains("npm error EACCES") {
-        Some(npm_eacces_guidance(command))
-    } else {
-        None
-    }
-}
-
-/// Run the npm preflight before executing an npm global install command.
-/// Returns `Some(failed InstallStepResult)` to abort, or `None` to proceed.
-fn npm_preflight_check(step: &str, command: &str) -> Option<InstallStepResult> {
-    #[cfg(unix)]
-    {
-        match resolve_npm_prefix() {
-            NpmPrefix::Unavailable => Some(InstallStepResult {
-                step: step.to_string(),
-                command: command.to_string(),
-                success: false,
-                stdout: String::new(),
-                stderr: String::new(),
-                exit_code: None,
-                hint: Some(NPM_MISSING_HINT.to_string()),
-            }),
-            NpmPrefix::Found(prefix) if !npm_install_target_is_writable(&prefix) => {
-                Some(InstallStepResult {
-                    step: step.to_string(),
-                    command: command.to_string(),
-                    success: false,
-                    stdout: String::new(),
-                    stderr: format!(
-                        "npm global prefix '{}' is not writable by the current user.",
-                        prefix.display()
-                    ),
-                    exit_code: None,
-                    hint: Some(npm_eacces_guidance(command)),
-                })
-            }
-            // `Found` + writable, or `TimedOut` — proceed; let the install run and
-            // the stderr classifier serve as the backstop.
-            _ => None,
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (step, command);
-        None
-    }
-}
-
-// ── end npm preflight ─────────────────────────────────────────────────────────
-
 #[tauri::command]
 pub async fn discover_managed_agent_prereqs(
     input: DiscoverManagedAgentPrereqsRequest,
@@ -1122,124 +882,6 @@ pub async fn list_relay_agents(state: State<'_, AppState>) -> Result<Vec<RelayAg
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── is_npm_global_install ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_is_npm_global_install_accepts_catalog_claude_command() {
-        assert!(is_npm_global_install(
-            "npm install -g @agentclientprotocol/claude-agent-acp"
-        ));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_accepts_catalog_codex_command() {
-        assert!(is_npm_global_install(
-            "npm install -g @agentclientprotocol/codex-acp"
-        ));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_accepts_short_flag() {
-        assert!(is_npm_global_install("npm i -g some-package"));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_accepts_leading_whitespace() {
-        assert!(is_npm_global_install("  npm install -g foo"));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_rejects_curl_pipe() {
-        assert!(!is_npm_global_install(
-            "curl -fsSL https://example.com/install.sh | bash"
-        ));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_rejects_non_global_install() {
-        assert!(!is_npm_global_install("npm install foo"));
-    }
-
-    #[test]
-    fn test_is_npm_global_install_rejects_unrelated_command() {
-        assert!(!is_npm_global_install("cargo install some-tool"));
-    }
-
-    // ── npm_eacces_hint ───────────────────────────────────────────────────────
-
-    #[test]
-    fn test_npm_eacces_hint_detects_old_format() {
-        let stderr = "npm ERR! code EACCES\nnpm ERR! syscall mkdir\nnpm ERR! path /usr/local/lib/node_modules\nnpm ERR! errno -13\nnpm ERR! Error: EACCES: permission denied, mkdir '/usr/local/lib/node_modules'";
-        assert!(npm_eacces_hint(stderr, "npm install -g foo").is_some());
-    }
-
-    #[test]
-    fn test_npm_eacces_hint_detects_new_format() {
-        let stderr = "npm error EACCES: permission denied, mkdir '/usr/local/lib/node_modules'";
-        assert!(npm_eacces_hint(stderr, "npm install -g foo").is_some());
-    }
-
-    #[test]
-    fn test_npm_eacces_hint_returns_none_for_404_stderr() {
-        let stderr = "npm error 404 Not Found - GET https://registry.npmjs.org/no-such-pkg";
-        assert!(npm_eacces_hint(stderr, "npm install -g no-such-pkg").is_none());
-    }
-
-    #[test]
-    fn test_npm_eacces_hint_guidance_contains_npm_global_path() {
-        let hint = npm_eacces_hint("EACCES: permission denied", "npm install -g foo").unwrap();
-        assert!(hint.contains("~/.npm-global"), "hint: {hint}");
-    }
-
-    #[test]
-    fn test_npm_eacces_hint_guidance_contains_zprofile() {
-        let hint = npm_eacces_hint("EACCES: permission denied", "npm install -g foo").unwrap();
-        assert!(hint.contains("~/.zprofile"), "hint: {hint}");
-    }
-
-    #[test]
-    fn test_npm_eacces_hint_guidance_contains_sudo_command() {
-        let hint = npm_eacces_hint("EACCES: permission denied", "npm install -g foo").unwrap();
-        assert!(hint.contains("sudo npm install -g foo"), "hint: {hint}");
-    }
-
-    // ── npm_install_target_is_writable ────────────────────────────────────────
-
-    #[cfg(unix)]
-    #[test]
-    fn test_npm_install_target_is_writable_true_on_writable_dir() {
-        let dir = tempfile::tempdir().unwrap();
-        assert!(npm_install_target_is_writable(dir.path()));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_npm_install_target_is_writable_false_when_lib_node_modules_unwritable() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
-        let lib = dir.path().join("lib");
-        let node_modules = lib.join("node_modules");
-        std::fs::create_dir_all(&node_modules).unwrap();
-        // Make node_modules read-only.
-        std::fs::set_permissions(&node_modules, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let result = npm_install_target_is_writable(dir.path());
-        // Restore before the dir is dropped so cleanup can delete it.
-        std::fs::set_permissions(&node_modules, std::fs::Permissions::from_mode(0o755)).unwrap();
-        // Skip this assertion when running as root (root can write to 0o555).
-        if unsafe { libc::getuid() } != 0 {
-            assert!(!result);
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn test_npm_install_target_is_writable_walks_up_to_lib() {
-        let dir = tempfile::tempdir().unwrap();
-        // Create only `lib/` — no `lib/node_modules`.
-        std::fs::create_dir(dir.path().join("lib")).unwrap();
-        assert!(npm_install_target_is_writable(dir.path()));
-    }
 
     // ── plan_adapter_install ──────────────────────────────────────────────────
 
@@ -1332,68 +974,6 @@ mod tests {
         assert!(
             !should_restart_after_install(true, false, true, true, true),
             "agent whose process is no longer running must NOT be restarted"
-        );
-    }
-
-    // ── badge availability-drift (Phase 2) ───────────────────────────────────
-    //
-    // `availability_drift` is a pure predicate over two `Option` values —
-    // no global state, no parallelism hazard.
-
-    /// Both sides known and different → drift detected.
-    #[test]
-    fn test_availability_drift_detected_when_stamped_differs_from_current() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
-        assert!(
-            availability_drift(
-                Some(&AcpAvailabilityStatus::Available),
-                Some(AcpAvailabilityStatus::AdapterMissing),
-            ),
-            "Available stamped vs AdapterMissing current must be detected as drift"
-        );
-    }
-
-    /// Both sides known and equal → no drift.
-    #[test]
-    fn test_availability_drift_no_drift_when_stamped_equals_current() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
-        assert!(
-            !availability_drift(
-                Some(&AcpAvailabilityStatus::Available),
-                Some(AcpAvailabilityStatus::Available),
-            ),
-            "matching stamped and current must not show drift"
-        );
-    }
-
-    /// Stamped is None (cold cache at spawn) → no drift regardless of current.
-    #[test]
-    fn test_availability_drift_none_stamp_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
-        assert!(
-            !availability_drift(None, Some(AcpAvailabilityStatus::Available)),
-            "None stamp (cold cache at spawn) must never signal drift"
-        );
-    }
-
-    /// Current is None (cache cold now) → no drift regardless of stamp.
-    #[test]
-    fn test_availability_drift_none_current_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
-        assert!(
-            !availability_drift(Some(&AcpAvailabilityStatus::Available), None),
-            "None current (cache cold) must never signal drift"
-        );
-    }
-
-    /// Non-codex agent (stamp is None) → no drift (None case).
-    #[test]
-    fn test_availability_drift_non_codex_none_never_drifts() {
-        use crate::managed_agents::{availability_drift, AcpAvailabilityStatus};
-        // Non-codex agents have `adapter_availability = None` — must never flip.
-        assert!(
-            !availability_drift(None, Some(AcpAvailabilityStatus::AdapterMissing)),
-            "non-codex agent (None stamp) must never trigger drift badge"
         );
     }
 
@@ -1561,6 +1141,34 @@ mod tests {
             step.is_none(),
             "no adapter commands means nothing to verify"
         );
+    }
+
+    // ── runtime_adapter_is_bundled ────────────────────────────────────────────
+    //
+    // Guards the Phase-3 hint selection against catalog drift: goose installs
+    // via a curl script (its CLI is its adapter), so a failed goose verify must
+    // get the check-the-step-output hint, never the reinstall-Buzz one.
+
+    #[test]
+    fn test_runtime_adapter_is_bundled_false_for_goose() {
+        let goose = crate::managed_agents::known_acp_runtime_exact("goose")
+            .expect("goose must be in the catalog");
+        assert!(
+            !runtime_adapter_is_bundled(goose),
+            "goose has a curl CLI installer — its adapter is not bundled with Buzz"
+        );
+    }
+
+    #[test]
+    fn test_runtime_adapter_is_bundled_true_for_bundled_bridges() {
+        for id in ["claude", "codex", "buzz-agent"] {
+            let runtime = crate::managed_agents::known_acp_runtime_exact(id)
+                .unwrap_or_else(|| panic!("{id} must be in the catalog"));
+            assert!(
+                runtime_adapter_is_bundled(runtime),
+                "{id} carries no install commands — its adapter ships with Buzz"
+            );
+        }
     }
 }
 

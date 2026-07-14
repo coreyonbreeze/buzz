@@ -25,7 +25,6 @@ const GOOSE_AVAILABLE = {
   install_instructions_url: "https://block.github.io/goose/",
   can_auto_install: false,
   underlying_cli_path: null,
-  node_required: false,
   auth_status: { status: "not_applicable" },
 };
 
@@ -43,7 +42,6 @@ const BUZZ_AGENT_AVAILABLE = {
   install_instructions_url: "https://github.com/block/buzz",
   can_auto_install: false,
   underlying_cli_path: null,
-  node_required: false,
   auth_status: { status: "not_applicable" },
 };
 
@@ -68,13 +66,12 @@ const CLAUDE_AVAILABLE_LOGGED_IN = {
     "https://github.com/agentclientprotocol/claude-agent-acp",
   can_auto_install: false,
   underlying_cli_path: null,
-  node_required: false,
   auth_status: { status: "logged_in" },
 };
 
 /**
- * Codex not-installed base — tweak `availability`, `auth_status`, and
- * `node_required` in each test as needed.
+ * Codex not-installed base — tweak `availability` and `auth_status` in each
+ * test as needed.
  */
 const CODEX_NOT_INSTALLED = {
   id: "codex",
@@ -89,7 +86,6 @@ const CODEX_NOT_INSTALLED = {
   install_instructions_url: "https://github.com/zed-industries/codex-acp",
   can_auto_install: true,
   underlying_cli_path: null,
-  node_required: false,
   auth_status: { status: "unknown" },
 };
 
@@ -206,43 +202,12 @@ test.describe("Doctor panel state screenshots", () => {
     await row.screenshot({ path: `${SHOTS}/03-auth-config-error.png` });
   });
 
-  /**
-   * 04 — adapter_missing runtime with node_required: true: the amber "Node.js
-   * is required…" callout replaces the Install button so the user cannot
-   * inadvertently trigger a doomed npm install.
+  /*
+   * 04-node-required retired with the per-row `node_required` install gate:
+   * no runtime carries npm adapter install commands anymore, so the amber
+   * "Node.js is required…" callout has no trigger. The Node.js requirement
+   * for the bundled bridges is covered by 07-node-runtime-warn below.
    */
-  test("04-node-required", async ({ page }) => {
-    await installMockBridge(page, {
-      acpRuntimesCatalog: [
-        GOOSE_AVAILABLE,
-        CLAUDE_AVAILABLE_LOGGED_IN,
-        {
-          ...CODEX_NOT_INSTALLED,
-          availability: "adapter_missing",
-          underlying_cli_path: "/usr/local/bin/codex",
-          node_required: true,
-          install_hint:
-            "Install the Codex ACP adapter: npm install -g @zed-industries/codex-acp",
-        },
-        BUZZ_AGENT_AVAILABLE,
-      ],
-    });
-
-    await page.goto("/", { waitUntil: "domcontentloaded" });
-    await openSettings(page, "doctor");
-
-    const row = page.getByTestId("doctor-runtime-codex");
-    await expect(row).toBeVisible({ timeout: 10_000 });
-    await expect(row).toContainText("Node.js is required");
-    // Exact-name match so "Install Node.js" (inside the callout) is not counted.
-    await expect(
-      row.getByRole("button", { name: "Install", exact: true }),
-    ).toHaveCount(0);
-
-    await row.scrollIntoViewIfNeeded();
-    await waitForAnimations(page);
-    await row.screenshot({ path: `${SHOTS}/04-node-required.png` });
-  });
 
   /**
    * 05 — a failed install renders a "Retry" button; clicking Retry succeeds.
@@ -261,7 +226,6 @@ test.describe("Doctor panel state screenshots", () => {
         {
           ...CODEX_NOT_INSTALLED,
           can_auto_install: true,
-          node_required: false,
         },
         BUZZ_AGENT_AVAILABLE,
       ],
