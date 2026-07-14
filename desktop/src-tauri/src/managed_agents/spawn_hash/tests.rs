@@ -152,11 +152,13 @@ fn buzz_agent_mcp_edit_changes_hash_but_other_runtime_ignores_it() {
         spawn_config_hash(
             &buzz_agent,
             &[],
+            &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
         ),
         spawn_config_hash(
             &edited,
+            &[],
             &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
@@ -171,11 +173,13 @@ fn buzz_agent_mcp_edit_changes_hash_but_other_runtime_ignores_it() {
         spawn_config_hash(
             &goose,
             &[],
+            &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
         ),
         spawn_config_hash(
             &goose_edited,
+            &[],
             &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
@@ -196,12 +200,14 @@ fn definition_mcp_edit_changes_buzz_agent_hash_without_becoming_agent_override()
         spawn_config_hash(
             &record,
             &[persona],
+            &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
         ),
         spawn_config_hash(
             &record,
             &[edited_persona],
+            &[],
             "wss://ws.example",
             &GlobalAgentConfig::default()
         )

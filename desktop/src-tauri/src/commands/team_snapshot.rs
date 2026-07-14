@@ -573,6 +573,9 @@ pub async fn confirm_team_snapshot_import(
             provider: member.definition.provider.clone(),
             persona_source_version: None,
             env_vars: std::collections::BTreeMap::new(),
+            // MCP configuration is local-only, never part of a shared team snapshot.
+            // Imported instances therefore inherit no local override.
+            mcp_servers: Vec::new(),
             start_on_app_launch: false,
             auto_restart_on_config_change: true,
             runtime_pid: None,
