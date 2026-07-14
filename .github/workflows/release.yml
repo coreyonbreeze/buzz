@@ -757,6 +757,9 @@ jobs:
           cargo build --release --target "$TARGET" -p buzz-acp -p buzz-agent -p buzz-dev-mcp -p git-credential-nostr -p buzz-cli
           ./scripts/bundle-sidecars.sh "$TARGET"
 
+      # Also builds the buzz-acp-node-launcher shim for the target with the
+      # toolchain installed above (Windows targets stage it as the bridges'
+      # <binary>.exe).
       - name: Stage bundled ACP tools
         shell: bash
         run: ./desktop/scripts/prepare-acp-tools-resource.sh "$TARGET"

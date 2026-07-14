@@ -13,6 +13,7 @@ const SUPPORTED_TARGETS = [
   "x86_64-apple-darwin",
   "aarch64-unknown-linux-gnu",
   "x86_64-unknown-linux-gnu",
+  "x86_64-pc-windows-msvc",
 ];
 
 // The Codex ACP executable stays `codex-acp`, but bundled installs must come
@@ -87,6 +88,18 @@ const NPM_TARGET_CONFIG = {
     nativeExecutables: {
       claudeAgentSdk: "claude",
       openaiCodex: "vendor/x86_64-unknown-linux-musl/bin/codex",
+    },
+  },
+  "x86_64-pc-windows-msvc": {
+    npmOs: "win32",
+    npmCpu: "x64",
+    nativePackages: {
+      claudeAgentSdk: "@anthropic-ai/claude-agent-sdk-win32-x64",
+      openaiCodex: "@openai/codex-win32-x64",
+    },
+    nativeExecutables: {
+      claudeAgentSdk: "claude.exe",
+      openaiCodex: "vendor/x86_64-pc-windows-msvc/bin/codex.exe",
     },
   },
 };

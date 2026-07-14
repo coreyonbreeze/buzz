@@ -14,8 +14,10 @@ Usage: desktop/scripts/prepare-acp-tools-resource.sh [target-triple]
 
 Stages the locked ACP bridge tools into src-tauri/resources/acp so Tauri can
 bundle them as application resources: vendored npm package trees under
-resources/acp/node and executable wrappers under resources/acp/bin. The
-optional target triple defaults to the Rust host target.
+resources/acp/node and executable wrappers under resources/acp/bin (bash
+shims on Unix targets; the compiled buzz-acp-node-launcher plus
+<binary>.shim.json manifests on Windows targets). The optional target triple
+defaults to the Rust host target.
 
 Note: resources/acp/bin holds a single target at a time, so staging must stay
 tied to the build target.
@@ -41,6 +43,12 @@ fi
 
 cache_bin_dir="$("$script_dir/ensure-acp-tools.sh" ${ensure_args[@]+"${ensure_args[@]}"} --print-bin-dir)"
 cache_root="$(dirname "$(dirname "$cache_bin_dir")")"
+
+# Windows targets stage the compiled launcher shim instead of a bash
+# wrapper. Resolved lazily at first use so a target with no locked tools
+# stays a no-op stage; ensure-acp-tools.sh above already built the launcher
+# for any target that has them, so resolution hits a warm target dir.
+launcher_exe=""
 resource_root="$app_root/src-tauri/resources/acp"
 resource_bin_dir="$resource_root/bin"
 resource_node_dir="$resource_root/node"
@@ -101,7 +109,14 @@ while IFS=$'\t' read -r id binary package version node_engine native_package nat
     echo "Failed to stage npm ACP tool: $package@$version" >&2
     exit 1
   fi
-  write_node_wrapper "$resource_bin_dir/$binary" "../node/$id/node_modules/$package/dist/index.js" "$node_engine"
+  if acp_target_is_windows "$target"; then
+    if [[ -z "$launcher_exe" ]]; then
+      launcher_exe="$(acp_node_launcher_exe "$target")"
+    fi
+    write_windows_node_launcher "$resource_bin_dir/$(acp_staged_binary_name "$binary" "$target")" "$launcher_exe" "../node/$id/node_modules/$package/dist/index.js" "$node_engine"
+  else
+    write_node_wrapper "$resource_bin_dir/$binary" "../node/$id/node_modules/$package/dist/index.js" "$node_engine"
+  fi
   node_runtime_entries+=("$id"$'\t'"$binary"$'\t'"$node_engine"$'\t'"$(acp_required_node_major "$node_engine")")
   # Record the vendored native harness CLI (relative to the acp resource
   # root) for the auth-probe manifest. Fail loudly if the lock names one
@@ -115,7 +130,12 @@ while IFS=$'\t' read -r id binary package version node_engine native_package nat
       exit 1
     fi
     chmod +x "$cli_abspath"
-    harness_cli_entries+=("$id"$'\t'"$(basename "$native_executable")"$'\t'"$cli_relpath")
+    # The manifest keys CLIs by the bare probe name the app resolves
+    # ("claude", "codex"), so the Windows vendored executables drop their
+    # .exe suffix here.
+    cli_name="$(basename "$native_executable")"
+    cli_name="${cli_name%.exe}"
+    harness_cli_entries+=("$id"$'\t'"$cli_name"$'\t'"$cli_relpath")
   fi
   # Ad-hoc sign every Mach-O in the staged package, not just the main CLIs:
   # the codex native package also vendors executables like rg and zsh, and

@@ -859,6 +859,12 @@ jobs:
         # Serial: windows_resolver_tests mutate process-global env
         # (BUZZ_SHELL/GIT_BASH/SystemRoot) that SharedState::new reads.
         run: cargo test -p buzz-dev-mcp --target $env:TARGET -- --test-threads=1
+      - name: Test (buzz-acp-node-launcher)
+        # The compiled launcher shim staged as the bundled ACP bridges'
+        # <binary>.exe on Windows; its spawn path (Job Object, exit-code
+        # proxying) only gates if tested ON Windows. The end-to-end tests use
+        # the node preinstalled on windows-latest runners.
+        run: cargo test -p buzz-acp-node-launcher --target $env:TARGET
       # Smoke-test the new host-prereq contract: Git for Windows (which provides
       # bash) is available on the runner, a shell command round-trips, and bash
       # does NOT resolve from System32 (so WSL's launcher is never picked up).

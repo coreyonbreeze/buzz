@@ -16,7 +16,10 @@ Installs the ACP bridge tools pinned in acp-tools.lock.json into the shared
 Buzz dev cache. The lockfile is target-specific; only entries matching the
 requested target are prepared. Each tool is installed as a vendored npm
 package tree with a small executable wrapper, validated against the locked
-versions and integrity hashes.
+versions and integrity hashes. Unix targets get a bash wrapper shim; Windows
+targets get the compiled buzz-acp-node-launcher staged as <binary>.exe next
+to a <binary>.shim.json manifest (built with cargo, override with
+ACP_NODE_LAUNCHER_EXE).
 
 Environment variables:
   ACP_TOOLS_LOCK_FILE    lockfile path (default: desktop/acp-tools.lock.json)
@@ -139,6 +142,15 @@ if [[ "$entry_count" == "0" ]]; then
     printf '%s\n' "$bin_dir"
   fi
   exit 0
+fi
+
+# Windows targets stage the compiled launcher shim instead of a bash
+# wrapper; it needs the repo's Rust toolchain. Built once up front — the
+# per-tool loop below runs in a pipeline subshell.
+launcher_exe=""
+if acp_target_is_windows "$target"; then
+  require_tool cargo
+  launcher_exe="$(acp_node_launcher_exe "$target")"
 fi
 
 validate_npm_install() {
@@ -285,7 +297,11 @@ for (const entry of entries) {
   package_dir="$install_dir/node_modules/$package"
   entrypoint="$package_dir/dist/index.js"
   native_binary="$install_dir/node_modules/$native_package/$native_executable"
-  staged_bin="$bin_dir/$binary"
+  staged_bin="$bin_dir/$(acp_staged_binary_name "$binary" "$target")"
+  # Windows shims embed a bin-dir-relative entrypoint: under Git Bash the
+  # absolute cache path is POSIX-style (/c/Users/...), which the native
+  # launcher cannot resolve.
+  entrypoint_from_bin_dir="../../$target/$id/$version/npm/node_modules/$package/dist/index.js"
   # The staged output is shared across lock versions, so its freshness stamp
   # must live next to it, not in the per-version tool_dir: a per-version stamp
   # stays self-consistent after a lock revert and would skip re-staging.
@@ -294,6 +310,12 @@ for (const entry of entries) {
     # shellcheck disable=SC1090
     source "$stamp"
     if [[ "${STAMP_PACKAGE:-}" == "$package" && "${STAMP_VERSION:-}" == "$version" && "${STAMP_INTEGRITY:-}" == "$integrity" && "${STAMP_DEPENDENCY_PACKAGE:-}" == "$dependency_package" && "${STAMP_DEPENDENCY_VERSION:-}" == "$dependency_version" && "${STAMP_DEPENDENCY_INTEGRITY:-}" == "$dependency_integrity" && "${STAMP_NATIVE_PACKAGE:-}" == "$native_package" && "${STAMP_NATIVE_PACKAGE_NAME:-}" == "$native_package_name" && "${STAMP_NATIVE_VERSION:-}" == "$native_version" && "${STAMP_NATIVE_INTEGRITY:-}" == "$native_integrity" && "${STAMP_NATIVE_EXECUTABLE:-}" == "$native_executable" ]]; then
+      # The npm tree is fresh, but the compiled launcher tracks the crate,
+      # not the lock, so the stamp cannot see it change — refresh it every
+      # run (the copy no-ops when already identical).
+      if acp_target_is_windows "$target"; then
+        write_windows_node_launcher "$staged_bin" "$launcher_exe" "$entrypoint_from_bin_dir" "$node_engine"
+      fi
       continue
     fi
   fi
@@ -319,7 +341,11 @@ for (const entry of entries) {
   npm "${npm_args[@]}" >&2
 
   validate_npm_install "$install_dir" "$package" "$version" "$integrity" "$dependency_package" "$dependency_version" "$dependency_integrity" "$native_package" "$native_package_name" "$native_version" "$native_integrity" "$native_executable" "$claude_code_version"
-  write_node_wrapper "$staged_bin" "$entrypoint" "$node_engine"
+  if acp_target_is_windows "$target"; then
+    write_windows_node_launcher "$staged_bin" "$launcher_exe" "$entrypoint_from_bin_dir" "$node_engine"
+  else
+    write_node_wrapper "$staged_bin" "$entrypoint" "$node_engine"
+  fi
   {
     printf 'STAMP_TARGET=%q\n' "$target"
     printf 'STAMP_PACKAGE=%q\n' "$package"
@@ -354,7 +380,12 @@ for (const entry of entries) console.log(entry.binary);
 ' "$lock_entries" | sort -u)"
 find "$bin_dir" -type f -print0 | while IFS= read -r -d '' staged_file; do
   name="$(basename "$staged_file")"
-  if ! printf '%s\n' "$locked_binaries" | grep -Fxq -- "${name%.stamp}"; then
+  # Reduce every staged artifact shape to the lock's bare binary name:
+  # <binary>[.exe][.stamp] and the Windows launcher's <binary>.shim.json.
+  base="${name%.stamp}"
+  base="${base%.shim.json}"
+  base="${base%.exe}"
+  if ! printf '%s\n' "$locked_binaries" | grep -Fxq -- "$base"; then
     rm -f -- "$staged_file"
   fi
 done
