@@ -900,6 +900,22 @@ pub async fn update_managed_agent(
             record.respond_to_allowlist = prospective_allowlist;
         }
 
+        // Effective-merge cap: the record now carries the updated fields —
+        // validate that the three-layer merge stays within the cap. A rename
+        // can un-mask an inherited server, pushing the effective count over.
+        {
+            let personas = load_personas(&app).unwrap_or_default();
+            let effective_command = crate::managed_agents::record_agent_command(record, &personas);
+            let global_config =
+                crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+            crate::managed_agents::validate_effective_mcp_cap(
+                record,
+                &personas,
+                &global_config.mcp_servers,
+                &effective_command,
+            )?;
+        }
+
         record.updated_at = now_iso();
 
         save_managed_agents(&app, &records)?;

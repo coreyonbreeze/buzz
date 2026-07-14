@@ -1,6 +1,6 @@
 use super::{
-    merge_mcp_servers, replace_mcp_servers, validate_mcp_servers, AgentDefinition,
-    ManagedAgentRecord, McpServerConfig, McpServerEnvVar, MAX_USER_MCP_SERVERS,
+    merge_mcp_servers, replace_mcp_servers, validate_effective_mcp_cap, validate_mcp_servers,
+    AgentDefinition, ManagedAgentRecord, McpServerConfig, McpServerEnvVar, MAX_USER_MCP_SERVERS,
 };
 use std::path::PathBuf;
 
@@ -791,4 +791,79 @@ fn validate_mcp_servers_allows_fifteen_enabled_in_one_layer() {
         .map(|i| mcp_server(&format!("server-{i}"), "cmd", true))
         .collect();
     assert!(validate_mcp_servers(&servers).is_ok());
+}
+
+// ── validate_effective_mcp_cap — save-time effective merge cap ──────────
+
+/// Build a minimal buzz-agent ManagedAgentRecord with the given mcp_servers
+/// layer. `agent_command = "buzz-agent"` so the effective check fires.
+fn buzz_agent_record(mcp_servers: Vec<McpServerConfig>) -> ManagedAgentRecord {
+    serde_json::from_value(serde_json::json!({
+        "pubkey": "aabbccdd",
+        "name": "test",
+        "relay_url": "",
+        "acp_command": "buzz-acp",
+        "agent_command": "buzz-agent",
+        "agent_args": [],
+        "mcp_command": "",
+        "turn_timeout_seconds": 320,
+        "system_prompt": null,
+        "mcp_servers": mcp_servers,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+    }))
+    .expect("minimal record should deserialize")
+}
+
+#[test]
+fn effective_cap_rejects_15_global_plus_1_local() {
+    let global: Vec<_> = (0..MAX_USER_MCP_SERVERS)
+        .map(|i| mcp_server(&format!("global-{i}"), "cmd", true))
+        .collect();
+    let record = buzz_agent_record(vec![mcp_server("local-0", "cmd", true)]);
+    let err = validate_effective_mcp_cap(&record, &[], &global, "buzz-agent")
+        .expect_err("effective cap must reject 16 enabled");
+    assert!(err.contains("effective MCP server count"), "error: {err}");
+}
+
+#[test]
+fn effective_cap_allows_at_cap() {
+    let global: Vec<_> = (0..MAX_USER_MCP_SERVERS - 1)
+        .map(|i| mcp_server(&format!("global-{i}"), "cmd", true))
+        .collect();
+    let record = buzz_agent_record(vec![mcp_server("local-0", "cmd", true)]);
+    validate_effective_mcp_cap(&record, &[], &global, "buzz-agent")
+        .expect("15 effective should pass");
+}
+
+#[test]
+fn effective_cap_rejects_rename_unmask() {
+    // Global has 15 enabled. The agent has a same-name override that masks
+    // one of them. If the override is "renamed" (simulated by changing the
+    // name to something unique), the masked global server is un-masked and
+    // the effective count goes to 16.
+    let global: Vec<_> = (0..MAX_USER_MCP_SERVERS)
+        .map(|i| mcp_server(&format!("global-{i}"), "cmd", true))
+        .collect();
+    // Agent overrides global-0 (masks it) — effective = 15.
+    let record_masked = buzz_agent_record(vec![mcp_server("global-0", "", false)]);
+    validate_effective_mcp_cap(&record_masked, &[], &global, "buzz-agent")
+        .expect("masked state should be at-cap and valid");
+
+    // Agent renamed its override → unique name, un-masks global-0 → effective = 16.
+    let record_unmasked = buzz_agent_record(vec![mcp_server("unique-name", "cmd", true)]);
+    let err = validate_effective_mcp_cap(&record_unmasked, &[], &global, "buzz-agent")
+        .expect_err("rename-unmask must reject");
+    assert!(err.contains("effective MCP server count"), "error: {err}");
+}
+
+#[test]
+fn effective_cap_skips_non_buzz_agent_runtime() {
+    let global: Vec<_> = (0..=MAX_USER_MCP_SERVERS)
+        .map(|i| mcp_server(&format!("global-{i}"), "cmd", true))
+        .collect();
+    let record = buzz_agent_record(vec![mcp_server("local-0", "cmd", true)]);
+    // Non-buzz-agent runtime → effective check returns Ok (skip).
+    validate_effective_mcp_cap(&record, &[], &global, "goose")
+        .expect("non-buzz-agent runtime should skip the cap");
 }

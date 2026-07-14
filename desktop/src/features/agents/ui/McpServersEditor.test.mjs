@@ -23,7 +23,9 @@ import assert from "node:assert/strict";
 import {
   validateMcpServerName,
   validateMcpServerRow,
+  validateMcpServerArg,
   validateMcpServerEnvEntry,
+  validateMcpServerListPayload,
   toRows,
   toServers,
   serversEqual,
@@ -31,6 +33,7 @@ import {
   effectiveEnabledCount,
   MAX_USER_MCP_SERVERS,
   MAX_ENV_VALUE_BYTES,
+  MAX_ENV_TOTAL_BYTES,
   MCP_SERVER_NAME_MAX_LEN,
   MCP_RESERVED_SERVER_NAME,
   RESERVED_ENV_KEYS,
@@ -463,4 +466,101 @@ test("validateMcpServerEnvEntry_all_reserved_keys_are_rejected", () => {
     const err = validateMcpServerEnvEntry({ name: key, value: "" });
     assert.ok(err, `Expected "${key}" to be rejected as reserved`);
   }
+});
+
+// ── Invariant 7: validateMcpServerRow — command NUL + size ──────────────
+
+test("validateMcpServerRow_command_nul_rejected", () => {
+  const err = validateMcpServerRow(
+    { name: "srv", command: "npx\0bad", enabled: true },
+    new Set(),
+  );
+  assert.match(err, /NUL/);
+});
+
+test("validateMcpServerRow_command_oversize_rejected", () => {
+  const err = validateMcpServerRow(
+    {
+      name: "srv",
+      command: "x".repeat(MAX_ENV_VALUE_BYTES + 1),
+      enabled: true,
+    },
+    new Set(),
+  );
+  assert.match(err, /exceeds/);
+});
+
+test("validateMcpServerRow_command_at_limit_accepted", () => {
+  assert.equal(
+    validateMcpServerRow(
+      { name: "srv", command: "x".repeat(MAX_ENV_VALUE_BYTES), enabled: true },
+      new Set(),
+    ),
+    null,
+  );
+});
+
+// ── Invariant 8: validateMcpServerArg — arg NUL + size ──────────────────
+
+test("validateMcpServerArg_nul_rejected", () => {
+  assert.match(validateMcpServerArg("arg\0val"), /NUL/);
+});
+
+test("validateMcpServerArg_oversize_rejected", () => {
+  assert.match(
+    validateMcpServerArg("x".repeat(MAX_ENV_VALUE_BYTES + 1)),
+    /exceeds/,
+  );
+});
+
+test("validateMcpServerArg_valid_accepted", () => {
+  assert.equal(validateMcpServerArg("--flag"), null);
+});
+
+// ── Invariant 9: validateMcpServerListPayload — aggregate cap ───────────
+
+test("validateMcpServerListPayload_under_limit_accepted", () => {
+  assert.equal(
+    validateMcpServerListPayload([
+      { name: "srv", command: "npx", args: ["-y"], env: [], enabled: true },
+    ]),
+    null,
+  );
+});
+
+test("validateMcpServerListPayload_over_limit_rejected", () => {
+  // Nine servers, each with an env value just under 32KB → total > 256KB.
+  const servers = Array.from({ length: 9 }, (_, i) => ({
+    name: `srv-${i}`,
+    command: "npx",
+    args: [],
+    env: [{ name: "DATA", value: "x".repeat(MAX_ENV_VALUE_BYTES - 1) }],
+    enabled: true,
+  }));
+  const err = validateMcpServerListPayload(servers);
+  assert.ok(err, "aggregate payload should be rejected");
+  assert.match(err, /limit/);
+});
+
+test("validateMcpServerListPayload_at_limit_accepted", () => {
+  // A single server whose total payload is exactly at the limit.
+  // Total = name + command + env-key + env-value bytes.
+  const budget = MAX_ENV_TOTAL_BYTES;
+  const name = "s";
+  const command = "c";
+  const envKey = "K";
+  const overhead = name.length + command.length + envKey.length;
+  const value = "x".repeat(budget - overhead);
+  assert.equal(
+    validateMcpServerListPayload([
+      {
+        name,
+        command,
+        args: [],
+        env: [{ name: envKey, value }],
+        enabled: true,
+      },
+    ]),
+    null,
+  );
 });

@@ -252,3 +252,20 @@ pub(crate) fn effective_buzz_agent_mcp_servers(
         .unwrap_or_default();
     merge_mcp_servers(global, definition, &record.mcp_servers)
 }
+
+/// Validate that the prospective effective-merge count stays within the
+/// [`MAX_USER_MCP_SERVERS`] cap. Called at agent create/update to prevent a
+/// record that passes per-layer validation but exceeds the cap after the
+/// global < definition < agent merge. Non–buzz-agent runtimes skip the check
+/// (they don't use `BUZZ_ACP_MCP_SERVERS`).
+pub(crate) fn validate_effective_mcp_cap(
+    record: &super::ManagedAgentRecord,
+    personas: &[super::AgentDefinition],
+    global: &[McpServerConfig],
+    effective_command: &str,
+) -> Result<(), String> {
+    // effective_buzz_agent_mcp_servers returns Ok(empty) for non-buzz-agent
+    // runtimes, so the cap check only fires for buzz-agent.
+    effective_buzz_agent_mcp_servers(record, personas, global, effective_command)?;
+    Ok(())
+}

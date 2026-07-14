@@ -42,6 +42,9 @@ export const MAX_USER_MCP_SERVERS = 15;
 /** Per-value byte cap. Mirrors `MAX_ENV_VALUE_BYTES` in `env_vars.rs`. */
 export const MAX_ENV_VALUE_BYTES = 32 * 1024;
 
+/** Aggregate payload cap across all servers. Mirrors `MAX_ENV_TOTAL_BYTES`. */
+export const MAX_ENV_TOTAL_BYTES = 256 * 1024;
+
 /**
  * Reserved env keys (case-insensitive). Mirrors `RESERVED_ENV_KEYS` in
  * `env_vars.rs`. Keys that override agent identity, code-execution surface,
@@ -95,9 +98,9 @@ export function validateMcpServerName(name: string): string | null {
 
 /**
  * Full per-row validation: name grammar + uniqueness within the layer +
- * command-required-when-enabled. `otherNames` is every OTHER row's name in
- * the same layer (excluding this row), so a collision flags both rows.
- * Exported for unit tests.
+ * command-required-when-enabled + command NUL/size. `otherNames` is every
+ * OTHER row's name in the same layer (excluding this row), so a collision
+ * flags both rows. Exported for unit tests.
  */
 export function validateMcpServerRow(
   row: { name: string; command: string; enabled: boolean },
@@ -108,6 +111,58 @@ export function validateMcpServerRow(
   if (otherNames.has(row.name)) return "Server names must be unique.";
   if (row.enabled && row.command.trim().length === 0) {
     return "Command is required for an enabled server.";
+  }
+  if (row.command.includes("\0")) {
+    return "Command cannot contain NUL bytes.";
+  }
+  if (
+    row.command.length > 0 &&
+    new TextEncoder().encode(row.command).length > MAX_ENV_VALUE_BYTES
+  ) {
+    return `Command exceeds the ${MAX_ENV_VALUE_BYTES}-byte limit.`;
+  }
+  return null;
+}
+
+/**
+ * Validate a single arg value. Mirrors `validate_mcp_servers`'s per-arg
+ * NUL + size check (`mcp_servers.rs:141-157`). Returns `null` when valid.
+ * Exported for unit tests.
+ */
+export function validateMcpServerArg(value: string): string | null {
+  if (value.includes("\0")) return "Argument cannot contain NUL bytes.";
+  if (new TextEncoder().encode(value).length > MAX_ENV_VALUE_BYTES) {
+    return `Argument exceeds the ${MAX_ENV_VALUE_BYTES}-byte limit.`;
+  }
+  return null;
+}
+
+/**
+ * Validate aggregate payload across all servers. Mirrors the Rust
+ * `validate_mcp_servers` total-payload cap (`mcp_servers.rs:186-190`):
+ * sum of name+command+args+env-key+env-value bytes must stay under
+ * `MAX_ENV_TOTAL_BYTES`. Returns `null` when valid. Exported for unit tests.
+ */
+export function validateMcpServerListPayload(
+  servers: McpServersValue,
+): string | null {
+  const encoder = new TextEncoder();
+  let total = 0;
+  for (const server of servers) {
+    total += encoder.encode(server.name).length;
+    if (server.command.length > 0) {
+      total += encoder.encode(server.command).length;
+    }
+    for (const arg of server.args) {
+      total += encoder.encode(arg).length;
+    }
+    for (const entry of server.env) {
+      total += encoder.encode(entry.name).length;
+      total += encoder.encode(entry.value).length;
+    }
+  }
+  if (total > MAX_ENV_TOTAL_BYTES) {
+    return `Total MCP server payload is ${total} bytes; limit is ${MAX_ENV_TOTAL_BYTES}.`;
   }
   return null;
 }
@@ -427,8 +482,10 @@ export function McpServersEditor({
   const inheritedEnabledCount = visibleInherited.filter(
     (s) => s.enabled,
   ).length;
-  const atCap =
-    localEnabledCount + inheritedEnabledCount >= MAX_USER_MCP_SERVERS;
+  const currentEffective = localEnabledCount + inheritedEnabledCount;
+  const atCap = currentEffective >= MAX_USER_MCP_SERVERS;
+  const overCap = currentEffective > MAX_USER_MCP_SERVERS;
+  const payloadError = validateMcpServerListPayload(toServers(rows));
 
   return (
     <div className="space-y-2" data-testid="mcp-servers-editor">
@@ -564,41 +621,58 @@ export function McpServersEditor({
                 <p className="text-xs font-medium text-muted-foreground">
                   Args
                 </p>
-                {row.args.map((arg) => (
-                  <div className="flex items-center gap-2" key={arg.id}>
-                    <div
-                      className={cn(
-                        "flex min-h-9 flex-1 items-center px-3",
-                        PERSONA_FIELD_SHELL_CLASS,
-                      )}
-                    >
-                      <Input
-                        aria-label="Argument"
-                        className={cn(
-                          "h-7 px-0 py-0 font-mono text-xs leading-6",
-                          PERSONA_FIELD_CONTROL_CLASS,
-                        )}
-                        data-testid="mcp-servers-arg"
-                        disabled={disabled}
-                        onChange={(event) =>
-                          updateArg(row.id, arg.id, event.target.value)
-                        }
-                        value={arg.value}
-                      />
+                {row.args.map((arg) => {
+                  const argError = validateMcpServerArg(arg.value);
+                  return (
+                    <div key={arg.id}>
+                      <div className="flex items-center gap-2">
+                        <div
+                          className={cn(
+                            "flex min-h-9 flex-1 items-center px-3",
+                            PERSONA_FIELD_SHELL_CLASS,
+                          )}
+                        >
+                          <Input
+                            aria-label="Argument"
+                            className={cn(
+                              "h-7 px-0 py-0 font-mono text-xs leading-6",
+                              PERSONA_FIELD_CONTROL_CLASS,
+                            )}
+                            data-testid="mcp-servers-arg"
+                            disabled={disabled}
+                            onChange={(event) =>
+                              updateArg(row.id, arg.id, event.target.value)
+                            }
+                            value={arg.value}
+                          />
+                        </div>
+                        <Button
+                          aria-label="Remove argument"
+                          data-testid="mcp-servers-arg-remove"
+                          disabled={disabled}
+                          onClick={() => removeArg(row.id, arg.id)}
+                          size="icon"
+                          type="button"
+                          variant="ghost"
+                        >
+                          <X className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                      {argError ? (
+                        <p
+                          className="ml-1 mt-0.5 flex items-center gap-1 text-xs text-destructive"
+                          data-testid="mcp-servers-arg-error"
+                        >
+                          <AlertCircle
+                            className="h-3 w-3 shrink-0"
+                            aria-hidden
+                          />
+                          {argError}
+                        </p>
+                      ) : null}
                     </div>
-                    <Button
-                      aria-label="Remove argument"
-                      data-testid="mcp-servers-arg-remove"
-                      disabled={disabled}
-                      onClick={() => removeArg(row.id, arg.id)}
-                      size="icon"
-                      type="button"
-                      variant="ghost"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </Button>
-                  </div>
-                ))}
+                  );
+                })}
                 <Button
                   data-testid="mcp-servers-arg-add"
                   disabled={disabled}
@@ -723,9 +797,28 @@ export function McpServersEditor({
             <Plus className="mr-1 h-4 w-4" />
             Add server
           </Button>
-          {atCap ? (
+          {overCap ? (
+            <p
+              className="ml-1 flex items-center gap-1 text-xs text-destructive"
+              data-testid="mcp-servers-cap-error"
+            >
+              <AlertCircle className="h-3 w-3 shrink-0" aria-hidden />
+              {currentEffective} enabled servers exceed the{" "}
+              {MAX_USER_MCP_SERVERS}-server limit (including inherited). Save
+              will be rejected.
+            </p>
+          ) : atCap ? (
             <p className="ml-1 text-xs text-muted-foreground">
               {MAX_USER_MCP_SERVERS}-server limit reached (including inherited).
+            </p>
+          ) : null}
+          {payloadError ? (
+            <p
+              className="ml-1 flex items-center gap-1 text-xs text-destructive"
+              data-testid="mcp-servers-payload-error"
+            >
+              <AlertCircle className="h-3 w-3 shrink-0" aria-hidden />
+              {payloadError}
             </p>
           ) : null}
         </div>

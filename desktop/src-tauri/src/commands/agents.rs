@@ -741,6 +741,19 @@ pub async fn create_managed_agent(
             relay_mesh: relay_mesh.clone(),
         };
 
+        // Effective-merge cap: validate the prospective three-layer merge
+        // (global < definition < agent) stays within MAX_USER_MCP_SERVERS.
+        // Per-layer validation already ran, but a per-layer-valid agent can
+        // still exceed the cap when layered on top of inherited servers.
+        let global_config =
+            crate::managed_agents::load_global_agent_config(&app).unwrap_or_default();
+        crate::managed_agents::validate_effective_mcp_cap(
+            &record,
+            &personas,
+            &global_config.mcp_servers,
+            &record.agent_command,
+        )?;
+
         records.push(record);
 
         save_managed_agents(&app, &records)?;
