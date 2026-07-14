@@ -129,6 +129,7 @@ class ChannelsPage extends HookConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final channelsAsync = ref.watch(channelsProvider);
     final sessionState = ref.watch(relaySessionProvider);
+    final relayHost = Uri.parse(ref.watch(relayConfigProvider).baseUrl).host;
     final currentPubkey = ref
         .watch(profileProvider)
         .whenData((value) => value?.pubkey)
@@ -152,6 +153,11 @@ class ChannelsPage extends HookConsumerWidget {
       cachedChannels.value = data;
     }
     final channels = cachedChannels.value;
+
+    Future<void> retryConnection() async {
+      await ref.read(relaySessionProvider.notifier).reconnect();
+      if (context.mounted) ref.invalidate(channelsProvider);
+    }
 
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
@@ -269,10 +275,12 @@ class ChannelsPage extends HookConsumerWidget {
         channels: channels,
         channelsAsync: channelsAsync,
         showError: showError.value,
-        sessionStatus: sessionState.status,
+        sessionState: sessionState,
+        relayHost: relayHost,
         showConnectionBanner: showConnectionBanner.value,
         currentPubkey: currentPubkey,
         onRefresh: () => ref.read(channelsProvider.notifier).refresh(),
+        onRetryConnection: retryConnection,
         onSelectChannel: openChannel,
       ),
     );
