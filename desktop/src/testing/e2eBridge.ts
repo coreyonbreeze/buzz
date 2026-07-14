@@ -73,6 +73,10 @@ type MockManagedAgentSeed = {
   autoRestartOnConfigChange?: boolean;
   respondTo?: RawManagedAgent["respond_to"];
   respondToAllowlist?: string[];
+  /** Override the default "goose" agent command (e.g. "buzz-agent"). */
+  agentCommand?: string;
+  /** Pre-seeded MCP server layer for the agent record. */
+  mcpServers?: McpServerConfig[];
 };
 
 type MockRelayAgentSeed = {
@@ -1768,7 +1772,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     persona_id: seed.personaId ?? null,
     relay_url: DEFAULT_RELAY_WS_URL,
     acp_command: "buzz-acp",
-    agent_command: "goose",
+    agent_command: seed.agentCommand ?? "goose",
     agent_args: ["acp"],
     mcp_command: "",
     turn_timeout_seconds: 320,
@@ -1779,6 +1783,7 @@ function buildSeededManagedAgent(seed: MockManagedAgentSeed): MockManagedAgent {
     avatar_url: seed.avatarUrl ?? null,
     model: null,
     env_vars: {},
+    mcp_servers: (seed.mcpServers ?? []).map(cloneMcpServer),
     status,
     pid: status === "running" ? 42000 + mockManagedAgents.length : null,
     created_at: now,
