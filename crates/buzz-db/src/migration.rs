@@ -549,7 +549,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 21);
+        assert_eq!(migrations.len(), 22);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -834,6 +834,14 @@ mod tests {
         assert!(push_admission.contains("queued_jobs < max_queued_jobs"));
         assert!(push_admission.contains("FROM push_leases"));
         assert!(push_admission.contains("WHERE singleton AND enabled"));
+
+        // The production outbox reaper walks old rows in creation order and
+        // then applies its terminal/undeliverable predicate to a bounded batch.
+        assert_eq!(migrations[21].version, 22);
+        let wake_retention = migrations[21].sql.as_str();
+        assert!(wake_retention.contains("CREATE INDEX push_wake_outbox_retention"));
+        assert!(wake_retention.contains("CREATE TABLE push_wake_outbox_community_state"));
+        assert!(wake_retention.contains("retained_rows < max_retained_rows"));
     }
 
     #[test]

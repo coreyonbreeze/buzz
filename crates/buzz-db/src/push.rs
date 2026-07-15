@@ -1,7 +1,9 @@
 //! Community-scoped NIP-PL lease and durable wake-outbox persistence.
 //!
-//! Every operation requires a server-resolved [`CommunityId`]. Client-provided
-//! origins never select rows in this module.
+//! Every request operation requires a server-resolved [`CommunityId`].
+//! Client-provided origins never select rows in this module. The sole
+//! deployment-wide operation is the fixed-size retention sweep, which selects
+//! tenant keys only from persisted rows.
 
 use buzz_core::CommunityId;
 use chrono::{DateTime, Utc};
@@ -17,6 +19,9 @@ pub const MAX_MATCH_ATTEMPTS: i32 = 8;
 
 /// Maximum number of matcher rows removed in one disabled-mode transaction.
 pub const MATCH_DRAIN_BATCH: i64 = 1_000;
+
+/// Hard ceiling for one wake-outbox retention transaction.
+pub const MAX_WAKE_PRUNE_BATCH_SIZE: u32 = 1_000;
 
 /// Common signed-event ordering fields for a lease replacement.
 #[derive(Debug, Clone, Copy)]
@@ -66,6 +71,8 @@ pub enum EnqueueWakeOutcome {
     Duplicate(Uuid),
     /// No current active, unexpired lease matched the supplied generation.
     InactiveLease,
+    /// The community's durable wake budget is full.
+    CapacityExceeded,
 }
 
 /// Durable wake fields not copied from the effective lease.
@@ -537,13 +544,41 @@ pub async fn enqueue_wake(
     };
     let endpoint_hash: Vec<u8> = endpoint_hash.try_get("endpoint_hash")?;
 
+    // Serialize enqueue and duplicate detection within this community. The
+    // admission trigger uses the same row to enforce the retained-row budget,
+    // so concurrent endpoints cannot cross the cap or leak accounting.
+    sqlx::query(
+        "INSERT INTO push_wake_outbox_community_state (community_id) VALUES ($1) \
+         ON CONFLICT (community_id) DO NOTHING",
+    )
+    .bind(community.as_uuid())
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("SELECT retained_rows FROM push_wake_outbox_community_state WHERE community_id=$1 FOR UPDATE")
+        .bind(community.as_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+
+    let duplicate: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM push_wake_outbox \
+         WHERE community_id=$1 AND endpoint_hash=$2 AND event_id=$3",
+    )
+    .bind(community.as_uuid())
+    .bind(&endpoint_hash)
+    .bind(wake.event_id)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if let Some(id) = duplicate {
+        tx.commit().await?;
+        return Ok(EnqueueWakeOutcome::Duplicate(id));
+    }
+
     let inserted = sqlx::query(
         r#"
         INSERT INTO push_wake_outbox (
             community_id, author, installation_id, lease_generation,
             endpoint_hash, event_id, class, expires_at
         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-        ON CONFLICT (community_id, endpoint_hash, event_id) DO NOTHING
         RETURNING id
         "#,
     )
@@ -558,21 +593,9 @@ pub async fn enqueue_wake(
     .fetch_optional(&mut *tx)
     .await?;
 
-    let outcome = if let Some(row) = inserted {
-        EnqueueWakeOutcome::Enqueued(row.try_get("id")?)
-    } else {
-        // This is a separate statement so READ COMMITTED observes a competing
-        // transaction whose unique-key insert completed while ours waited.
-        let row = sqlx::query(
-            "SELECT id FROM push_wake_outbox \
-             WHERE community_id = $1 AND endpoint_hash = $2 AND event_id = $3",
-        )
-        .bind(community.as_uuid())
-        .bind(&endpoint_hash)
-        .bind(wake.event_id)
-        .fetch_one(&mut *tx)
-        .await?;
-        EnqueueWakeOutcome::Duplicate(row.try_get("id")?)
+    let outcome = match inserted {
+        Some(row) => EnqueueWakeOutcome::Enqueued(row.try_get("id")?),
+        None => EnqueueWakeOutcome::CapacityExceeded,
     };
     tx.commit().await?;
     Ok(outcome)
@@ -990,28 +1013,64 @@ pub async fn disable_endpoint_generation(
     Ok(result.rows_affected() == 1)
 }
 
-/// Delete terminal/expired outbox rows older than a retention cutoff.
+/// Delete a deployment-wide, bounded batch of terminal or undeliverable
+/// outbox rows older than a retention cutoff.
 ///
 /// NIP-RS hard purge only targets kind 30078, which is not push-eligible and
 /// therefore cannot have a matcher row; any other absent source is handled by
 /// the matcher's fenced load-miss deletion.
 pub async fn prune_wake_outbox(
     pool: &PgPool,
-    community: CommunityId,
     before: DateTime<Utc>,
+    batch_size: u32,
 ) -> Result<u64> {
+    if batch_size == 0 {
+        return Ok(0);
+    }
+    let batch_size = i64::from(batch_size.min(MAX_WAKE_PRUNE_BATCH_SIZE));
     let result = sqlx::query(
-        "DELETE FROM push_wake_outbox o \
-         WHERE o.community_id = $1 AND o.created_at < $2 \
-           AND (o.state IN ('delivered', 'failed') \
-                OR o.expires_at <= EXTRACT(EPOCH FROM now())::bigint) \
-           AND NOT EXISTS ( \
-               SELECT 1 FROM push_match_queue q \
-               WHERE q.community_id = o.community_id AND q.event_id = o.event_id \
-           )",
+        r#"
+        WITH candidates AS (
+            SELECT o.community_id, o.id
+            FROM push_wake_outbox o
+            WHERE o.created_at < $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM push_match_queue q
+                  WHERE q.community_id = o.community_id
+                    AND q.event_id = o.event_id
+              )
+              AND (
+                  o.state IN ('delivered', 'failed')
+                  OR o.expires_at <= EXTRACT(EPOCH FROM now())::bigint
+                  OR (
+                      o.state = 'sending'
+                      AND COALESCE(o.lease_until, o.created_at) < $1
+                  )
+                  OR NOT EXISTS (
+                      SELECT 1
+                      FROM push_leases l
+                      WHERE l.community_id = o.community_id
+                        AND l.author = o.author
+                        AND l.installation_id = o.installation_id
+                        AND l.generation = o.lease_generation
+                        AND l.endpoint_hash = o.endpoint_hash
+                        AND l.active
+                        AND l.endpoint_enabled
+                        AND l.expires_at > EXTRACT(EPOCH FROM now())::bigint
+                  )
+              )
+            ORDER BY o.created_at, o.community_id, o.id
+            FOR UPDATE OF o SKIP LOCKED
+            LIMIT $2
+        )
+        DELETE FROM push_wake_outbox o
+        USING candidates c
+        WHERE o.community_id = c.community_id AND o.id = c.id
+        "#,
     )
-    .bind(community.as_uuid())
     .bind(before)
+    .bind(batch_size)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -1316,6 +1375,7 @@ mod tests {
             ids.push(match task.await.expect("join") {
                 EnqueueWakeOutcome::Enqueued(id) | EnqueueWakeOutcome::Duplicate(id) => id,
                 EnqueueWakeOutcome::InactiveLease => panic!("lease unexpectedly inactive"),
+                EnqueueWakeOutcome::CapacityExceeded => panic!("wake budget unexpectedly full"),
             });
         }
         assert!(ids.iter().all(|id| *id == ids[0]));
@@ -1358,6 +1418,83 @@ mod tests {
         .await
         .expect("count all jobs");
         assert_eq!(total, 2, "same dedup key is independent per community");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn wake_admission_caps_each_community_and_delete_releases_capacity() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let author = [71; 32];
+        activate(&pool, community, &author, "install", &[72; 32], 1).await;
+        sqlx::query(
+            "INSERT INTO push_wake_outbox_community_state \
+             (community_id, max_retained_rows) VALUES ($1, 1) \
+             ON CONFLICT (community_id) DO UPDATE SET max_retained_rows=1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("set a small outbox budget");
+
+        assert!(matches!(
+            enqueue_wake(
+                &pool,
+                community,
+                &author,
+                "install",
+                NewWake {
+                    lease_generation: 1,
+                    event_id: &[73; 32],
+                    class: "default",
+                    expires_at: i64::MAX / 2,
+                },
+            )
+            .await
+            .expect("first wake"),
+            EnqueueWakeOutcome::Enqueued(_)
+        ));
+        assert_eq!(
+            enqueue_wake(
+                &pool,
+                community,
+                &author,
+                "install",
+                NewWake {
+                    lease_generation: 1,
+                    event_id: &[74; 32],
+                    class: "default",
+                    expires_at: i64::MAX / 2,
+                },
+            )
+            .await
+            .expect("capacity result"),
+            EnqueueWakeOutcome::CapacityExceeded
+        );
+
+        let state: (i64, i64) = sqlx::query_as(
+            "SELECT retained_rows, dropped_wakes \
+             FROM push_wake_outbox_community_state WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read outbox admission state");
+        assert_eq!(state, (1, 1));
+
+        sqlx::query("DELETE FROM push_wake_outbox WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("release outbox capacity");
+        let retained: i64 = sqlx::query_scalar(
+            "SELECT retained_rows FROM push_wake_outbox_community_state WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("read released capacity");
+        assert_eq!(retained, 0);
     }
 
     async fn enqueue_one(
@@ -1758,6 +1895,120 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn wake_reaper_prunes_only_retained_undeliverable_rows_in_bounded_batches() {
+        let pool = setup_pool().await;
+        let community = make_community(&pool).await;
+        let author = [60; 32];
+        activate(&pool, community, &author, "install", &[61; 32], 1).await;
+
+        let delivered = enqueue_one(&pool, community, &author, &[62; 32], 1).await;
+        let failed = enqueue_one(&pool, community, &author, &[63; 32], 1).await;
+        let expired_pending = enqueue_one(&pool, community, &author, &[64; 32], 1).await;
+        let abandoned_sending = enqueue_one(&pool, community, &author, &[65; 32], 1).await;
+        let live_pending = enqueue_one(&pool, community, &author, &[66; 32], 1).await;
+
+        let inactive_author = [67; 32];
+        activate(
+            &pool,
+            community,
+            &inactive_author,
+            "inactive-install",
+            &[68; 32],
+            1,
+        )
+        .await;
+        let inactive = sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO push_wake_outbox (
+                community_id, author, installation_id, lease_generation,
+                endpoint_hash, event_id, class, expires_at
+            ) VALUES ($1, $2, 'inactive-install', 1, $3, $4, 'default', $5)
+            RETURNING id
+            "#,
+        )
+        .bind(community.as_uuid())
+        .bind(inactive_author)
+        .bind([68; 32])
+        .bind([69; 32])
+        .bind(i64::MAX / 2)
+        .fetch_one(&pool)
+        .await
+        .expect("insert inactive-lease wake");
+        assert_eq!(
+            revoke_lease(
+                &pool,
+                community,
+                &inactive_author,
+                "inactive-install",
+                version(70, 20, 2),
+            )
+            .await
+            .expect("revoke wake lease"),
+            ReplaceLeaseOutcome::Accepted
+        );
+
+        // The event trigger queues matcher work. Once matching completes, the
+        // retained outbox rows are eligible for production cleanup.
+        sqlx::query("DELETE FROM push_match_queue WHERE community_id=$1")
+            .bind(community.as_uuid())
+            .execute(&pool)
+            .await
+            .expect("complete matcher jobs");
+        sqlx::query(
+            "UPDATE push_wake_outbox SET created_at=now()-interval '2 days' \
+             WHERE community_id=$1",
+        )
+        .bind(community.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("age wake rows");
+        sqlx::query(
+            "UPDATE push_wake_outbox SET state='delivered' WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(delivered)
+        .execute(&pool)
+        .await
+        .expect("mark delivered");
+        sqlx::query("UPDATE push_wake_outbox SET state='failed' WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(failed)
+            .execute(&pool)
+            .await
+            .expect("mark failed");
+        sqlx::query("UPDATE push_wake_outbox SET expires_at=0 WHERE community_id=$1 AND id=$2")
+            .bind(community.as_uuid())
+            .bind(expired_pending)
+            .execute(&pool)
+            .await
+            .expect("expire pending wake");
+        sqlx::query(
+            "UPDATE push_wake_outbox SET state='sending', claim_id=$3, \
+             lease_until=now()-interval '2 days' WHERE community_id=$1 AND id=$2",
+        )
+        .bind(community.as_uuid())
+        .bind(abandoned_sending)
+        .bind(Uuid::new_v4())
+        .execute(&pool)
+        .await
+        .expect("abandon claimed wake");
+
+        let cutoff = Utc::now() - chrono::Duration::days(1);
+        assert_eq!(prune_wake_outbox(&pool, cutoff, 3).await.unwrap(), 3);
+        assert_eq!(prune_wake_outbox(&pool, cutoff, 3).await.unwrap(), 2);
+
+        let remaining: Vec<Uuid> =
+            sqlx::query_scalar("SELECT id FROM push_wake_outbox WHERE community_id=$1")
+                .bind(community.as_uuid())
+                .fetch_all(&pool)
+                .await
+                .expect("load retained wake rows");
+        assert_eq!(remaining, vec![live_pending]);
+        assert!(!remaining.contains(&inactive));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn delivered_wake_is_retained_while_rematch_is_queued() {
         let pool = setup_pool().await;
         let community = make_community(&pool).await;
@@ -1777,7 +2028,9 @@ mod tests {
 
         let cutoff = Utc::now() - chrono::Duration::days(1);
         assert_eq!(
-            prune_wake_outbox(&pool, community, cutoff).await.unwrap(),
+            prune_wake_outbox(&pool, cutoff, MAX_WAKE_PRUNE_BATCH_SIZE)
+                .await
+                .unwrap(),
             0
         );
         sqlx::query("DELETE FROM push_match_queue WHERE community_id=$1 AND event_id=$2")
@@ -1787,7 +2040,9 @@ mod tests {
             .await
             .expect("complete rematch");
         assert_eq!(
-            prune_wake_outbox(&pool, community, cutoff).await.unwrap(),
+            prune_wake_outbox(&pool, cutoff, MAX_WAKE_PRUNE_BATCH_SIZE)
+                .await
+                .unwrap(),
             1
         );
     }
@@ -1834,7 +2089,9 @@ mod tests {
         .expect("mark old wake delivered");
         let cutoff = Utc::now() - chrono::Duration::days(1);
         assert_eq!(
-            prune_wake_outbox(&pool, community, cutoff).await.unwrap(),
+            prune_wake_outbox(&pool, cutoff, MAX_WAKE_PRUNE_BATCH_SIZE)
+                .await
+                .unwrap(),
             0
         );
         sqlx::query(
@@ -1863,7 +2120,9 @@ mod tests {
         .unwrap();
         assert_eq!(remaining, 0);
         assert_eq!(
-            prune_wake_outbox(&pool, community, cutoff).await.unwrap(),
+            prune_wake_outbox(&pool, cutoff, MAX_WAKE_PRUNE_BATCH_SIZE)
+                .await
+                .unwrap(),
             1,
             "reaped poison job must release delivered-wake retention"
         );

@@ -1136,6 +1136,19 @@ impl Db {
         push::fail_wake(&self.pool, community, id, claim_id).await
     }
 
+    /// Delete one deployment-wide bounded batch of retained terminal or
+    /// undeliverable wakes.
+    ///
+    /// `batch_size` is capped at [`push::MAX_WAKE_PRUNE_BATCH_SIZE`] so callers
+    /// cannot turn a maintenance tick into an unbounded delete transaction.
+    pub async fn prune_push_wake_outbox(
+        &self,
+        before: DateTime<Utc>,
+        batch_size: u32,
+    ) -> Result<u64> {
+        push::prune_wake_outbox(&self.pool, before, batch_size).await
+    }
+
     /// Disable an endpoint only if the specified lease generation is current.
     pub async fn disable_push_endpoint(
         &self,

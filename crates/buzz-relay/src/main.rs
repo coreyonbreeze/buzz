@@ -641,6 +641,14 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Retention runs even while delivery is disabled so a configuration change
+    // cannot strand terminal or expired rows from an earlier enabled period.
+    let push_reaper_cancel = CancellationToken::new();
+    tokio::spawn(buzz_relay::push_runtime::run_wake_outbox_reaper(
+        Arc::clone(&state),
+        push_reaper_cancel.clone(),
+    ));
+
     // NIP-PL matcher and worker are enabled as one unit. Lease acceptance is
     // already disabled without the exact gateway URL, so discovery and runtime
     // cannot advertise or accumulate work for an undeliverable configuration.
@@ -986,6 +994,7 @@ async fn main() -> anyhow::Result<()> {
 
     serve(router, health_router, Arc::clone(&state)).await?;
     state.community_revalidator_cancel.cancel();
+    push_reaper_cancel.cancel();
 
     // Signal the audit worker to stop accepting, flush buffered entries, and
     // exit. Uses a CancellationToken so it works regardless of how many

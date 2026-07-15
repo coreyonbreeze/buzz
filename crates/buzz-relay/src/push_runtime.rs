@@ -8,6 +8,7 @@ use chrono::{TimeDelta, Utc};
 use nostr::{EventBuilder, Filter, Kind, Tag};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{handlers::push_lease::Subscription, state::AppState};
@@ -15,6 +16,15 @@ use crate::{handlers::push_lease::Subscription, state::AppState};
 const CLAIM_SECS: i64 = 30;
 const EVENT_USEFUL_SECS: i64 = 3600;
 const MAX_ATTEMPTS: i32 = 8;
+
+// Never delete a wake until at least one day after it was created, then delete
+// at most 1,000 terminal or undeliverable rows per minute. These are fixed
+// safety bounds rather than deployment knobs so an accidental value cannot
+// turn a maintenance tick into an unbounded transaction or indefinite
+// retention.
+const WAKE_REAPER_INTERVAL: Duration = Duration::from_secs(60);
+const WAKE_RETENTION_SECS: i64 = 24 * 60 * 60;
+const WAKE_REAPER_BATCH_SIZE: u32 = 1_000;
 
 #[derive(Serialize)]
 struct DeliveryRequest<'a> {
@@ -150,7 +160,7 @@ async fn process_match(state: &AppState, job: &buzz_db::push::ClaimedMatch) -> a
         if expires_at <= Utc::now().timestamp() {
             continue;
         }
-        let _ = state
+        let outcome = state
             .db
             .enqueue_push_wake(
                 job.community,
@@ -164,6 +174,9 @@ async fn process_match(state: &AppState, job: &buzz_db::push::ClaimedMatch) -> a
                 },
             )
             .await?;
+        if matches!(outcome, buzz_db::push::EnqueueWakeOutcome::CapacityExceeded) {
+            metrics::counter!("buzz_push_wake_admission_drops_total").increment(1);
+        }
     }
     Ok(())
 }
@@ -218,6 +231,74 @@ pub async fn run_delivery_worker(state: Arc<AppState>) {
         }
         if !found {
             tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+}
+
+/// Reap retained push wakes until relay shutdown is signalled.
+///
+/// A tick runs immediately and then once per minute. Each transaction deletes
+/// at most 1,000 rows whose creation time is over 24 hours old and whose state
+/// is terminal, expired, abandoned, or no longer backed by an effective lease.
+pub async fn run_wake_outbox_reaper(state: Arc<AppState>, cancel: CancellationToken) {
+    info!(
+        interval_secs = WAKE_REAPER_INTERVAL.as_secs(),
+        retention_secs = WAKE_RETENTION_SECS,
+        batch_size = WAKE_REAPER_BATCH_SIZE,
+        "push wake outbox reaper started"
+    );
+    run_wake_outbox_reaper_loop(WAKE_REAPER_INTERVAL, cancel, move || {
+        let state = Arc::clone(&state);
+        async move { run_wake_outbox_reaper_tick(&state).await }
+    })
+    .await;
+    info!("push wake outbox reaper stopped");
+}
+
+async fn run_wake_outbox_reaper_loop<Tick, TickFuture>(
+    period: Duration,
+    cancel: CancellationToken,
+    mut tick: Tick,
+) where
+    Tick: FnMut() -> TickFuture,
+    TickFuture: std::future::Future<Output = ()>,
+{
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break,
+            _ = interval.tick() => tick().await,
+        }
+    }
+}
+
+async fn run_wake_outbox_reaper_tick(state: &AppState) {
+    let before = Utc::now() - TimeDelta::seconds(WAKE_RETENTION_SECS);
+    match state
+        .db
+        .prune_push_wake_outbox(before, WAKE_REAPER_BATCH_SIZE)
+        .await
+    {
+        Ok(deleted) => {
+            metrics::counter!(
+                "buzz_push_wake_reaper_ticks_total",
+                "outcome" => "success"
+            )
+            .increment(1);
+            metrics::counter!("buzz_push_wake_reaper_rows_total").increment(deleted);
+            if deleted > 0 {
+                info!(deleted, "pruned retained push wake rows");
+            }
+        }
+        Err(error) => {
+            metrics::counter!(
+                "buzz_push_wake_reaper_ticks_total",
+                "outcome" => "error"
+            )
+            .increment(1);
+            warn!(%error, "push wake outbox reaper tick failed");
         }
     }
 }
@@ -455,8 +536,39 @@ mod tests {
     use super::*;
     use axum::{extract::State, routing::post, Json, Router};
     use serde_json::Value;
-    use std::{future::IntoFuture, sync::Arc};
+    use std::{
+        future::IntoFuture,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+    };
     use tokio::sync::Mutex;
+
+    #[tokio::test(start_paused = true)]
+    async fn wake_reaper_ticks_immediately_and_cancels_without_waiting() {
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let task_ticks = Arc::clone(&ticks);
+        let task = tokio::spawn(async move {
+            run_wake_outbox_reaper_loop(Duration::from_secs(60), task_cancel, move || {
+                let ticks = Arc::clone(&task_ticks);
+                async move {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        assert_eq!(ticks.load(Ordering::Relaxed), 1);
+        cancel.cancel();
+        tokio::time::timeout(Duration::from_millis(1), task)
+            .await
+            .expect("reaper cancellation must not wait for the next interval")
+            .expect("join reaper task");
+    }
 
     #[test]
     fn gift_wrap_match_requires_self_p_filter_and_recipient() {

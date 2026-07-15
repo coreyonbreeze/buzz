@@ -89,6 +89,19 @@ rotate claims by the least recently served community. When a community reaches
 its queue limit, Buzz keeps the accepted event but skips its push match job; the
 per-community `dropped_jobs` counter records that degradation for operators.
 
+The relay runs wake-outbox retention even when delivery is disabled, so jobs
+from an earlier enabled period cannot remain permanently. A row is never
+eligible for deletion until 24 hours after its creation; after that, the relay
+checks once per minute and deletes at most 1,000 terminal or otherwise
+undeliverable rows in one transaction. Monitor
+`buzz_push_wake_reaper_ticks_total{outcome="error"}` and
+`buzz_push_wake_reaper_rows_total`; repeated errors or a sustained full-batch
+deletion rate indicate the outbox is growing faster than retention can drain it.
+Each community may retain at most 100,000 wake rows. When that budget is full,
+the relay keeps the source event but skips additional wakes and increments
+`buzz_push_wake_admission_drops_total`; this prevents one tenant from consuming
+unbounded durable outbox capacity while old rows await retention.
+
 ## Relay integration status
 
 The operational relay integration is complete: per-origin event matching with
