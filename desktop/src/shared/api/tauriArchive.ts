@@ -1,3 +1,5 @@
+import { KIND_AGENT_TURN_METRIC } from "@/shared/constants/kinds";
+
 import { invokeTauri } from "./tauri";
 
 // ── Wire-shape types (raw Tauri responses) ───────────────────────────────────
@@ -32,8 +34,32 @@ export type SaveSubscription = {
 
 export type ArchiveBatchResult = {
   persisted: number;
+  /**
+   * Newly-indexed `agent_metric_index` rows (valid or invalid) written by
+   * this call. A re-ingested duplicate event does not increment this even
+   * when `persisted` counts it, because the index row for that id was
+   * already written by whichever earlier batch first saw it. Missing on
+   * the wire (older/mocked responses) decodes as `0` — see
+   * `decodeArchiveBatchResult`.
+   */
+  persistedAgentMetrics: number;
   dropped: number;
 };
+
+/**
+ * Rust sends camelCase (`#[serde(rename_all = "camelCase")]` on
+ * `ArchiveBatchResult`), but decode defensively rather than trust every
+ * caller (including mocks/tests) to supply every field.
+ */
+function decodeArchiveBatchResult(
+  raw: Partial<ArchiveBatchResult>,
+): ArchiveBatchResult {
+  return {
+    persisted: raw.persisted ?? 0,
+    persistedAgentMetrics: raw.persistedAgentMetrics ?? 0,
+    dropped: raw.dropped ?? 0,
+  };
+}
 
 // ── Subscription-change notifier ─────────────────────────────────────────────
 
@@ -51,6 +77,28 @@ export function onSubscriptionChange(listener: () => void): () => void {
 
 function notifySubscriptionChange(): void {
   for (const listener of subscriptionChangeListeners) {
+    listener();
+  }
+}
+
+// ── Agent-metrics-change notifier ────────────────────────────────────────────
+
+/**
+ * Module-level notifier for newly persisted agent turn metrics (kind 44200).
+ * `useAgentUsageSeries` subscribes to this to invalidate its query without
+ * polling. Fired only when the backend confirms `persistedAgentMetrics > 0`
+ * for a successful `archiveEvents` call, or when a kind-44200 subscription
+ * mutation succeeds (`collectionEnabled` is part of the usage query result).
+ */
+const agentMetricsChangeListeners = new Set<() => void>();
+
+export function onAgentMetricsChanged(listener: () => void): () => void {
+  agentMetricsChangeListeners.add(listener);
+  return () => agentMetricsChangeListeners.delete(listener);
+}
+
+export function notifyAgentMetricsChanged(): void {
+  for (const listener of agentMetricsChangeListeners) {
     listener();
   }
 }
@@ -124,6 +172,12 @@ export async function agentMetricArchiveDefaultEnabled(): Promise<boolean> {
 export async function mergeSaveSubscriptionKinds(kind: number): Promise<void> {
   await invokeTauri("merge_save_subscription_kinds", { kind });
   notifySubscriptionChange();
+  // `collectionEnabled` is part of the usage query result — toggling kind
+  // 44200 on must invalidate mounted usage queries. Other kinds don't affect
+  // usage state.
+  if (kind === KIND_AGENT_TURN_METRIC) {
+    notifyAgentMetricsChanged();
+  }
 }
 
 /**
@@ -142,6 +196,9 @@ export async function mergeSaveSubscriptionKinds(kind: number): Promise<void> {
 export async function removeSaveSubscriptionKind(kind: number): Promise<void> {
   await invokeTauri("remove_save_subscription_kind", { kind });
   notifySubscriptionChange();
+  if (kind === KIND_AGENT_TURN_METRIC) {
+    notifyAgentMetricsChanged();
+  }
 }
 
 /**
@@ -209,7 +266,7 @@ export async function archiveEvents(
     matchedScope: { scopeType: ScopeType; scopeValue: string };
   }>,
 ): Promise<ArchiveBatchResult> {
-  return invokeTauri<ArchiveBatchResult>("archive_events", {
+  const raw = await invokeTauri<Partial<ArchiveBatchResult>>("archive_events", {
     candidates: candidates.map((c) => ({
       raw_event_json: c.rawEventJson,
       matched_scope: {
@@ -218,6 +275,7 @@ export async function archiveEvents(
       },
     })),
   });
+  return decodeArchiveBatchResult(raw);
 }
 
 /**
