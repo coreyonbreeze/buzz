@@ -6,6 +6,9 @@ import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../../shared/relay/nostr_models.dart';
 
+const _desktopPairingAuthChallengeGrace = Duration(seconds: 3);
+const _pairingAuthOkTimeout = Duration(seconds: 5);
+
 /// Ephemeral WebSocket connection for NIP-AB pairing.
 ///
 /// Uses ephemeral keys for NIP-42 auth (not the stored user keys).
@@ -35,7 +38,7 @@ class PairingSocket {
 
   bool get isConnected => _connected;
 
-  /// Connect and authenticate via NIP-42.
+  /// Connect to the pairing relay and answer NIP-42 auth when requested.
   Future<void> connect() async {
     try {
       _channel = WebSocketChannel.connect(Uri.parse(_wsUrl));
@@ -59,23 +62,27 @@ class PairingSocket {
       },
     );
 
-    // Wait for auth with 8s timeout.
-    _authTimeout = Timer(const Duration(seconds: 8), () {
+    // Pairing relay auth is optional: the dedicated pairing relay is
+    // intentionally authless, while main relays may still request NIP-42.
+    // Match desktop's grace window: if no challenge arrives, proceed
+    // unauthenticated; if one arrives, wait for the auth OK below.
+    _authTimeout = Timer(_desktopPairingAuthChallengeGrace, () {
       if (_authCompleter != null && !_authCompleter!.isCompleted) {
-        _authCompleter!.completeError(
-          TimeoutException('NIP-42 auth timed out'),
-        );
+        _authCompleter!.complete();
       }
     });
 
     try {
       await _authCompleter!.future;
       _authTimeout?.cancel();
+      _authTimeout = null;
       _connected = true;
     } catch (e) {
       _authTimeout?.cancel();
+      _authTimeout = null;
       await disconnect();
       _onDisconnected(e);
+      rethrow;
     }
   }
 
@@ -106,6 +113,7 @@ class PairingSocket {
     _subscription?.cancel();
     _subscription = null;
     _authTimeout?.cancel();
+    _authTimeout = null;
     final channel = _channel;
     _channel = null;
     if (channel != null) {
@@ -154,6 +162,15 @@ class PairingSocket {
   void _handleAuthChallenge(List<dynamic> data) {
     if (data.length < 2) return;
     final challenge = data[1] as String;
+
+    // If a relay did challenge, keep waiting for the matching OK instead of
+    // falling through as unauthenticated at the grace deadline.
+    _authTimeout?.cancel();
+    _authTimeout = Timer(_pairingAuthOkTimeout, () {
+      if (_authCompleter != null && !_authCompleter!.isCompleted) {
+        _failAuth(TimeoutException('NIP-42 auth OK timed out'));
+      }
+    });
 
     try {
       // Build NIP-42 auth event (kind:22242) with ephemeral keys.
