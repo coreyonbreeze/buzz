@@ -202,7 +202,7 @@ These Terms and any dispute arising out of or relating to them or the Service ar
 
 **Disputes, Governing Law, and Jurisdiction (Non-US residents).**  Section 18 (Dispute Resolution; Arbitration; Class-Action Waiver) and Section 19 (Governing Law; Venue) do not apply to you to the extent that they would deprive you of mandatory rights available to you under applicable laws as a consumer. You may bring proceedings relating to these Terms or the Service in any competent court of the country in which you habitually reside, and the laws of that country will apply, only to the extent required by applicable mandatory consumer law. 
 
-How to Contact Us.  You may contact us regarding the Service or these Terms at: Block, Inc., Attn: Buzz Support, 1955 Broadway, Suite 600, Oakland, CA 94612, or by e-mail at [ ⬤ ].
+How to Contact Us.  You may contact us regarding the Service or these Terms at: Block, Inc., Attn: Buzz Support, 1955 Broadway, Suite 600, Oakland, CA 94612, or by e-mail at help@buzz.xyz.
 
 **UK and EEA Addendum**
 
