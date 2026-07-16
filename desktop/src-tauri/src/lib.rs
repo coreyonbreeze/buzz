@@ -526,7 +526,7 @@ pub fn run() {
             // Backfill the pinned persona snapshot for any pre-existing agent
             // that predates the record-authoritative-spawn cutover (persona_id
             // set but no source_version). Must run before
-            // restore_managed_agents_on_launch so no agent spawns from an empty
+            // activate_workspace_agents so no agent spawns from an empty
             // snapshot. Synchronous and best-effort — a failure here must not
             // block launch, but a missing persona is logged loudly inside.
             if let Err(e) = backfill_persona_snapshots(&app_handle) {
@@ -655,15 +655,21 @@ pub fn run() {
                 });
             }
 
-            // Defer launch-time agent restoration until `apply_workspace` has
-            // installed the active workspace relay and identity. Starting here
-            // would race React initialization and send agents whose saved record
-            // has no relay override to the localhost fallback. Preserve the
-            // boot-time repos and identity recovery safety gates by only marking
-            // restoration pending when both allow it.
+            // Defer agent activation until `apply_workspace` has installed a
+            // workspace relay and identity. Starting here would race React
+            // initialization and send agents whose saved record has no relay
+            // override to the localhost fallback. Each workspace's agents then
+            // lazily activate on its first visit (`activate_workspace_agents`);
+            // the boot restore is simply the first activation. Preserve the
+            // boot-time repos and identity recovery safety gates by only
+            // enabling activation (and the one-shot mesh-llm restore) when
+            // both allow it.
             if restore_agents && !recovery_mode {
                 state
                     .managed_agent_restore_pending
+                    .store(true, Ordering::Release);
+                state
+                    .managed_agent_activation_enabled
                     .store(true, Ordering::Release);
             }
 

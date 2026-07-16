@@ -3,10 +3,11 @@ use super::relay_mesh_model_id;
 use super::{
     find_managed_agent_mut, kill_stale_tracked_processes, load_managed_agents, load_personas,
     save_managed_agents, spawn_agent_child, sync_managed_agent_processes, BackendKind,
-    ManagedAgentProcess,
+    ManagedAgentProcess, ManagedAgentRecord,
 };
 use crate::app_state::AppState;
 use crate::util;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tauri::Manager;
 
@@ -15,7 +16,7 @@ type AgentSpawnResult = (String, SpawnResult);
 
 /// Backfill the pinned persona snapshot for pre-existing agents created before
 /// the record became the spawn source of truth. Runs once at launch, before
-/// `restore_managed_agents_on_launch` spawns anything, so no agent boots from an
+/// `activate_workspace_agents` spawns anything, so no agent boots from an
 /// empty snapshot.
 ///
 /// Only records with a `persona_id` but no `persona_source_version` are touched.
@@ -73,15 +74,73 @@ pub fn backfill_persona_snapshots(app: &tauri::AppHandle) -> Result<(), String> 
     Ok(())
 }
 
-/// Restore managed agents that were running before the app was closed.
+/// Scope of a relay activation granted by [`begin_relay_activation`].
+pub(crate) struct RelayActivation {
+    /// True only for the session's very first activation (the boot restore):
+    /// the one-shot stale-process and orphan sweeps run only then. Later
+    /// activations must not re-sweep — a concurrent activation's freshly
+    /// spawned children are not yet tracked and would read as orphans.
+    pub run_boot_sweeps: bool,
+}
+
+/// Record `relay_url` as activated for this app session, deciding whether the
+/// caller may start its agents.
+///
+/// Returns `None` when the URL is blank or this relay was already activated
+/// this session — the caller must not start agents again, so bouncing A→B→A
+/// never resurrects an agent the user manually stopped in A. Activation is
+/// marked at attempt time (a failed attempt is not retried until relaunch),
+/// matching the old one-shot restore flag. Relays are keyed normalized
+/// (trailing slash, scheme/host case), so cosmetic URL differences cannot
+/// re-activate a workspace.
+pub(crate) fn begin_relay_activation(
+    activated_relays: &mut HashSet<String>,
+    relay_url: &str,
+) -> Option<RelayActivation> {
+    let normalized = crate::relay::normalize_relay_url(relay_url);
+    if normalized.is_empty() {
+        return None;
+    }
+    let run_boot_sweeps = activated_relays.is_empty();
+    if !activated_relays.insert(normalized) {
+        return None;
+    }
+    Some(RelayActivation { run_boot_sweeps })
+}
+
+/// Whether `record` auto-starts when `workspace_relay_url` is activated:
+/// a local start-on-launch agent pinned to this relay. A blank pin matches
+/// the workspace being activated — mirroring `effective_agent_relay_url`'s
+/// defense-in-depth fallback — so a record that somehow escaped relay
+/// stamping still auto-starts against the relay it resolves to at spawn.
+pub(crate) fn record_activates_on_relay(
+    record: &ManagedAgentRecord,
+    workspace_relay_url: &str,
+) -> bool {
+    if !record.start_on_app_launch || record.backend != BackendKind::Local {
+        return false;
+    }
+    let pinned = record.relay_url.trim();
+    pinned.is_empty() || crate::relay::relay_urls_equivalent(pinned, workspace_relay_url)
+}
+
+/// Lazily activate a workspace's managed agents.
+///
+/// Called from every `apply_workspace`: starts local `start_on_app_launch`
+/// agents pinned to `workspace_relay_url` that are not already running — the
+/// launch restore is simply the session's first activation. Each workspace
+/// activates at most once per app session ([`begin_relay_activation`]), and
+/// nothing is ever stopped here: switching away leaves the previous
+/// workspace's agents running against their own relay.
 ///
 /// Split into three phases to minimise lock contention with the frontend:
 ///   A (under lock): sync process state, cleanup, collect agents to start
 ///   B (no locks):   resolve commands and spawn processes in parallel
 ///   C (re-lock):    write back PIDs and status to records on disk
-pub async fn restore_managed_agents_on_launch(
+pub async fn activate_workspace_agents(
     app: &tauri::AppHandle,
     shutdown_started: &AtomicBool,
+    workspace_relay_url: &str,
 ) -> Result<(), String> {
     if shutdown_started.load(Ordering::SeqCst) {
         return Ok(());
@@ -89,7 +148,27 @@ pub async fn restore_managed_agents_on_launch(
 
     let state = app.state::<AppState>();
 
-    // ── Phase A (under lock): housekeeping + collect agents to restore ──
+    // Session-wide boot gate: repos-dir resolution and identity recovery are
+    // decided once at launch. When either fails closed, no workspace may
+    // auto-start agents this session.
+    if !state
+        .managed_agent_activation_enabled
+        .load(Ordering::Acquire)
+    {
+        return Ok(());
+    }
+
+    let Some(activation) = ({
+        let mut activated_relays = state
+            .activated_agent_relays
+            .lock()
+            .map_err(|error| error.to_string())?;
+        begin_relay_activation(&mut activated_relays, workspace_relay_url)
+    }) else {
+        return Ok(());
+    };
+
+    // ── Phase A (under lock): housekeeping + collect agents to activate ──
     let mut agents_to_start: Vec<super::ManagedAgentRecord>;
     {
         let _store_guard = state
@@ -111,40 +190,51 @@ pub async fn restore_managed_agents_on_launch(
             &mut runtimes,
             &super::current_instance_id(app),
         );
-        changed |=
-            kill_stale_tracked_processes(&mut records, &runtimes, &super::current_instance_id(app));
 
-        let tracked_pids: Vec<u32> = records
-            .iter()
-            .filter_map(|r| r.runtime_pid)
-            .chain(runtimes.values().map(|rt| rt.child.id()))
-            .collect();
-        super::sweep_orphaned_agent_processes(app, &tracked_pids);
+        // One-shot boot cleanup: previous-session leftovers and orphans are
+        // swept only on the session's first activation. Later activations
+        // must not sweep — a concurrent activation's or UI start's freshly
+        // spawned children are not yet in the tracked set and would be killed
+        // as orphans.
+        if activation.run_boot_sweeps {
+            changed |= kill_stale_tracked_processes(
+                &mut records,
+                &runtimes,
+                &super::current_instance_id(app),
+            );
 
-        // System-wide sweep: enumerate all user processes and kill any known
-        // agent binaries not tracked by this session. Catches orphans whose
-        // PID files were already cleaned up (e.g. agent workers in their own
-        // process group whose parent harness exited).
-        super::sweep_system_agent_processes(&super::current_instance_id(app), &tracked_pids);
+            let tracked_pids: Vec<u32> = records
+                .iter()
+                .filter_map(|r| r.runtime_pid)
+                .chain(runtimes.values().map(|rt| rt.child.id()))
+                .collect();
+            super::sweep_orphaned_agent_processes(app, &tracked_pids);
 
-        // Dead-instance reaping: find agents belonging to Buzz instances
-        // whose desktop process is no longer running and reap them.
-        super::reap_dead_instance_agents(&super::current_instance_id(app), &tracked_pids);
+            // System-wide sweep: enumerate all user processes and kill any known
+            // agent binaries not tracked by this session. Catches orphans whose
+            // PID files were already cleaned up (e.g. agent workers in their own
+            // process group whose parent harness exited).
+            super::sweep_system_agent_processes(&super::current_instance_id(app), &tracked_pids);
 
-        // Exact-path sweep: kill any buzz-acp process whose executable path
-        // matches this bundle's harness binary but is not in the tracked set.
-        // Complements the env-var sweep above — catches orphans that predate
-        // BUZZ_MANAGED_AGENT injection or lost their PID-file receipt.
-        //
-        // TODO: the three sweeps above each walk the PID table independently.
-        // A future consolidation should collect a single shared process snapshot
-        // at the top of this block and thread it through all sweep functions,
-        // replacing the three separate kernel enumerations.
-        super::sweep_untracked_bundle_harnesses(&tracked_pids);
+            // Dead-instance reaping: find agents belonging to Buzz instances
+            // whose desktop process is no longer running and reap them.
+            super::reap_dead_instance_agents(&super::current_instance_id(app), &tracked_pids);
+
+            // Exact-path sweep: kill any buzz-acp process whose executable path
+            // matches this bundle's harness binary but is not in the tracked set.
+            // Complements the env-var sweep above — catches orphans that predate
+            // BUZZ_MANAGED_AGENT injection or lost their PID-file receipt.
+            //
+            // TODO: the three sweeps above each walk the PID table independently.
+            // A future consolidation should collect a single shared process snapshot
+            // at the top of this block and thread it through all sweep functions,
+            // replacing the three separate kernel enumerations.
+            super::sweep_untracked_bundle_harnesses(&tracked_pids);
+        }
 
         let candidates: Vec<String> = records
             .iter()
-            .filter(|record| record.start_on_app_launch && record.backend == BackendKind::Local)
+            .filter(|record| record_activates_on_relay(record, workspace_relay_url))
             .map(|record| record.pubkey.clone())
             .collect();
 
@@ -379,4 +469,126 @@ fn persist_restore_error(
     record.updated_at = util::now_iso();
     record.last_error = Some(error);
     save_managed_agents(app, &records)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{begin_relay_activation, record_activates_on_relay, ManagedAgentRecord};
+    use std::collections::HashSet;
+
+    /// Minimal record with the fields the activation filter reads. Everything
+    /// else takes its serde default (`start_on_app_launch` defaults to true,
+    /// `backend` to Local).
+    fn record_on_relay(relay_url: &str) -> ManagedAgentRecord {
+        serde_json::from_str(&format!(
+            r#"{{
+                "pubkey": "agent-pubkey",
+                "name": "test-agent",
+                "private_key_nsec": "nsec1fake",
+                "relay_url": "{relay_url}",
+                "acp_command": "buzz-acp",
+                "agent_command": "goose",
+                "agent_args": [],
+                "mcp_command": "",
+                "turn_timeout_seconds": 320,
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z"
+            }}"#
+        ))
+        .expect("sample record")
+    }
+
+    // ── begin_relay_activation: once per relay per session ──────────────────
+
+    #[test]
+    fn first_activation_of_session_runs_boot_sweeps() {
+        let mut activated = HashSet::new();
+
+        let activation = begin_relay_activation(&mut activated, "wss://relay-a.example")
+            .expect("first visit must activate");
+
+        assert!(activation.run_boot_sweeps, "boot restore sweeps orphans");
+    }
+
+    #[test]
+    fn second_workspace_activates_without_boot_sweeps() {
+        let mut activated = HashSet::new();
+        begin_relay_activation(&mut activated, "wss://relay-a.example");
+
+        let activation = begin_relay_activation(&mut activated, "wss://relay-b.example")
+            .expect("a new workspace must activate");
+
+        assert!(
+            !activation.run_boot_sweeps,
+            "sweeps are one-shot: a later activation could kill a concurrent \
+             activation's untracked children"
+        );
+    }
+
+    #[test]
+    fn revisiting_a_workspace_does_not_reactivate() {
+        // A→B→A: the second visit to A must not restart agents the user
+        // stopped there, even when the URL differs only cosmetically.
+        let mut activated = HashSet::new();
+        begin_relay_activation(&mut activated, "wss://relay-a.example");
+        begin_relay_activation(&mut activated, "wss://relay-b.example");
+
+        assert!(begin_relay_activation(&mut activated, "wss://relay-a.example").is_none());
+        assert!(
+            begin_relay_activation(&mut activated, "WSS://Relay-A.Example/").is_none(),
+            "normalized matching: cosmetic URL differences must not re-activate"
+        );
+    }
+
+    #[test]
+    fn blank_relay_never_activates_nor_consumes_the_boot_sweep() {
+        let mut activated = HashSet::new();
+
+        assert!(begin_relay_activation(&mut activated, "   ").is_none());
+
+        // The blank no-op must not have claimed the session's boot sweep.
+        let activation = begin_relay_activation(&mut activated, "wss://relay-a.example")
+            .expect("real relay still activates");
+        assert!(activation.run_boot_sweeps);
+    }
+
+    // ── record_activates_on_relay: relay-filtered candidate selection ───────
+
+    #[test]
+    fn record_activates_only_on_its_pinned_relay() {
+        let record = record_on_relay("wss://relay-a.example");
+
+        assert!(record_activates_on_relay(&record, "wss://relay-a.example"));
+        assert!(
+            record_activates_on_relay(&record, "WSS://Relay-A.Example/"),
+            "pin matching is normalized"
+        );
+        assert!(
+            !record_activates_on_relay(&record, "wss://relay-b.example"),
+            "visiting another workspace must not start this agent"
+        );
+    }
+
+    #[test]
+    fn blank_pin_activates_on_the_visited_workspace() {
+        // Defense-in-depth for a record that escaped relay stamping: it spawns
+        // against the active workspace relay (`effective_agent_relay_url`), so
+        // it activates with the workspace being visited.
+        let record = record_on_relay("");
+        assert!(record_activates_on_relay(&record, "wss://relay-a.example"));
+    }
+
+    #[test]
+    fn opted_out_and_provider_records_never_activate() {
+        let mut record = record_on_relay("wss://relay-a.example");
+        record.start_on_app_launch = false;
+        assert!(!record_activates_on_relay(&record, "wss://relay-a.example"));
+
+        let mut record = record_on_relay("wss://relay-a.example");
+        record.backend = super::BackendKind::Provider {
+            id: "blox".to_string(),
+            config: serde_json::Value::Null,
+        };
+        assert!(!record_activates_on_relay(&record, "wss://relay-a.example"));
+    }
 }

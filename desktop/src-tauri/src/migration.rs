@@ -104,7 +104,7 @@ fn copy_dir_all(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Run every data migration that must complete before identity resolution and
 /// agent restore. Ordering is load-bearing: `migrate_legacy_app_data_dir` must
 /// precede any disk read, and `sync_shared_agent_data` must precede
-/// `restore_managed_agents_on_launch` (which reads `managed-agents.json`).
+/// `activate_workspace_agents` (which reads `managed-agents.json`).
 /// Identity-dependent migrations (persona/team event signing) run separately in
 /// boot setup after the persisted identity is resolved.
 ///

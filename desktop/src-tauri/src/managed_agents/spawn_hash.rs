@@ -11,7 +11,7 @@
 //! - Inputs mirror what a start would actually run: the start/restore paths
 //!   re-snapshot the linked persona's prompt/model/provider/env onto the
 //!   record immediately before spawning (`start_local_agent_with_preflight`,
-//!   `restore_managed_agents_on_launch`), so persona edits to those fields DO
+//!   `activate_workspace_agents`), so persona edits to those fields DO
 //!   apply on a plain restart and are hashed via the same prospective
 //!   re-snapshot. Harness command, args/mcp, env layering, and the record
 //!   fields the spawn env writes read are hashed as spawn resolves them.

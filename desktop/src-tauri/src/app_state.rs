@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::Write,
     sync::{
         atomic::{AtomicBool, AtomicU16},
@@ -18,26 +18,29 @@ use crate::managed_agents::ManagedAgentProcess;
 pub struct AppState {
     pub keys: Mutex<Keys>,
     pub http_client: reqwest::Client,
-    /// A no-redirect client for authenticated relay media fetches (download,
-    /// clipboard copy, snapshot, editor). Every caller pre-validates the URL
-    /// origin, but the app-wide `http_client` follows redirects by default, so
-    /// a relay `/media/` URL returning a 3xx to an off-origin or private host
-    /// would forward the minted media Authorization header across origins —
-    /// a redirect-hop SSRF. This client treats any 3xx as a non-success
-    /// response (surfaced as an error) so the auth token never leaves the
-    /// validated relay origin.
-    pub media_fetch_client: reqwest::Client,
     /// Workspace-provided relay URL override. Set by `apply_workspace` on app
     /// init and takes priority over env vars and compile-time defaults.
     pub relay_url_override: Mutex<Option<String>>,
-    /// Set during backend setup when managed agents are eligible for launch
-    /// restore. `apply_workspace` consumes it after installing the workspace
-    /// relay and identity, so agents never start against the fallback relay.
+    /// One-shot gate consumed by the first `apply_workspace` after boot to
+    /// restore Share Compute (mesh-llm). Agent activation itself is governed
+    /// by `managed_agent_activation_enabled` + `activated_agent_relays` and
+    /// runs on every `apply_workspace`.
     pub managed_agent_restore_pending: AtomicBool,
     /// Whether desktop may repair managed-agent kind:0 profiles from its local
     /// records. Disabled by the agent-managed profiles experiment so an agent's
     /// own profile updates are not overwritten on start or restore.
     pub managed_agent_profile_reconcile_enabled: AtomicBool,
+    /// Session-wide gate for lazy agent activation. Set during backend setup
+    /// only when the boot-time repos-dir and identity-recovery safety checks
+    /// allow agents to start; when false, no `apply_workspace` may auto-start
+    /// agents this session.
+    pub managed_agent_activation_enabled: AtomicBool,
+    /// Normalized relay URLs whose workspaces were already activated this app
+    /// session. A workspace's agents lazily start on the first visit and at
+    /// most once per session — bouncing A→B→A must not resurrect agents the
+    /// user manually stopped in A. Never stops agents: switching away leaves
+    /// the other workspace's agents running against their own relay.
+    pub activated_agent_relays: Mutex<HashSet<String>>,
     /// One-shot gate: first `apply_workspace` runs `pin_blank_agent_relays`.
     pub agent_relay_stamp_pending: AtomicBool,
     /// Shared shutdown signal checked by launch-time agent restoration.
@@ -152,27 +155,6 @@ fn identity_from_env() -> Option<Keys> {
     }
 }
 
-/// Build the no-redirect HTTP client used for authenticated relay media
-/// fetches (download / copy).
-///
-/// This client is a security boundary, not a convenience: it carries a minted
-/// media `Authorization` header, so it MUST NOT follow redirects. A relay 3xx
-/// to an off-origin or private host would otherwise forward that header across
-/// origins (a redirect-hop SSRF). `redirect::Policy::none()` returns the 3xx
-/// verbatim so the caller can reject it.
-///
-/// Returned as a `Result` so the fail-closed invariant is testable — callers
-/// must never substitute a redirect-following client on build failure. Shares
-/// the localhost `resolve`/pool config with the app-wide `http_client`.
-pub fn build_media_fetch_client() -> reqwest::Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .resolve("localhost", std::net::SocketAddr::from(([127, 0, 0, 1], 0)))
-        .pool_idle_timeout(std::time::Duration::from_secs(10))
-        .pool_max_idle_per_host(1)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-}
-
 pub fn build_app_state() -> AppState {
     // Env var takes precedence (dev/CI). If absent, resolve_persisted_identity()
     // in setup() will replace the ephemeral placeholder with a persisted key.
@@ -195,14 +177,11 @@ pub fn build_app_state() -> AppState {
             .pool_max_idle_per_host(1)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new()),
-        media_fetch_client: build_media_fetch_client().expect(
-            "media_fetch_client must build with redirect::Policy::none(); a \
-             redirect-following fallback would forward the minted media auth \
-             header across origins (redirect-hop SSRF)",
-        ),
         relay_url_override: Mutex::new(None),
         managed_agent_restore_pending: AtomicBool::new(false),
         managed_agent_profile_reconcile_enabled: AtomicBool::new(true),
+        managed_agent_activation_enabled: AtomicBool::new(false),
+        activated_agent_relays: Mutex::new(HashSet::new()),
         agent_relay_stamp_pending: AtomicBool::new(true),
         shutdown_started: AtomicBool::new(false),
         managed_agent_restore_transition: Mutex::new(()),
