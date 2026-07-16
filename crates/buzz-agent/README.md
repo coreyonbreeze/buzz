@@ -192,7 +192,7 @@ By default (`OPENAI_COMPAT_API=auto`) the agent picks **Responses** when `OPENAI
 - `reasoning.effort` and `provider.require_parameters` are set on the request when reasoning effort or tools are configured, so OpenRouter only routes to endpoints that actually honor them.
 - The response's `reasoning_details` array (opaque extended-thinking payload) is captured and replayed byte-for-byte on the next turn's assistant message, so multi-turn tool use keeps the model's chain-of-thought.
 - `anthropic/*` models get Anthropic-style `cache_control` breakpoints injected on the system message and the last two user messages.
-- Retryable statuses (429, 502, 503) honor the documented `Retry-After` header (clamped to a small ceiling — see `RETRY_AFTER_CAP_SECS` in `llm.rs` — since the sleep happens outside `BUZZ_AGENT_LLM_TIMEOUT_SECS`); `401` is treated as an expired/invalid key and refreshed once, while `402` (no credits) and `403` (guardrail/moderation/permission) fail immediately without retry.
+- Retryable statuses (429 and typed `provider_overloaded` 503) honor the documented `Retry-After` header (clamped to a small ceiling — see `RETRY_AFTER_CAP_SECS` in `llm.rs` — since the sleep happens outside `BUZZ_AGENT_LLM_TIMEOUT_SECS`); 502 and untyped 503 retry with jittered backoff instead. `401` is treated as an expired/invalid key and refreshed once, while `402` (no credits) and `403` (guardrail/moderation/permission) fail immediately without retry.
 
 `Provider` is a Rust `enum` with one `match` in `Llm::complete`. There is no trait, no `Box<dyn>`, no async-trait. Adding a provider is a `match` arm and one `body`/`parse` pair in `llm.rs`.
 

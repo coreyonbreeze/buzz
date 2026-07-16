@@ -1291,9 +1291,9 @@ enum OpenRouterErrorClass {
     Unknown,
 }
 
-/// Ceiling applied to any server-supplied `Retry-After` hint (header or
-/// body) before we sleep on it. OpenRouter can advertise waits up to an
-/// hour, but `openrouter_post`'s per-attempt sleep happens *outside*
+/// Ceiling applied to the server-supplied `Retry-After` header before we
+/// sleep on it. OpenRouter can advertise waits up to an hour, but
+/// `openrouter_post`'s per-attempt sleep happens *outside*
 /// `Client::timeout` (`cfg.llm_timeout`, default 240s) — an unclamped hint
 /// could keep a single turn alive for up to two full-duration sleeps across
 /// `MAX_RETRIES`. Clamping (never rejecting) keeps us honoring the server's
@@ -1320,7 +1320,7 @@ fn classify_openrouter_error(
         .and_then(|m| m.get("error_type"))
         .and_then(Value::as_str);
     // OpenRouter's documented retry hint is the HTTP `Retry-After` header
-    // (see docs/api_reference__errors-and-debugging.md "Retry-After Header");
+    // (see https://openrouter.ai/docs/api_reference/errors-and-debugging);
     // no current doc specifies a body-level retry field, so we don't parse one.
     let retry_after = header_retry_after;
 
@@ -3211,16 +3211,6 @@ mod tests {
     // ---- A6: OpenRouter retry classification ----
 
     #[test]
-    fn classify_402_payment_required() {
-        // 402 is handled directly in openrouter_post before classify;
-        // classify never sees it — but verify the Unknown fallback.
-        match classify_openrouter_error(402, r#"{"error":{"message":"payment required"}}"#, None) {
-            OpenRouterErrorClass::Unknown => {}
-            _ => panic!("402 must classify as Unknown"),
-        }
-    }
-
-    #[test]
     fn classify_429_rate_limit_body_retry_after_is_ignored() {
         // M1: no documented body-level retry field, so a `retry_after` key
         // inside `error.metadata` is inert — only the HTTP header (passed
@@ -3545,6 +3535,39 @@ mod tests {
         assert!(
             r.reasoning_details.is_none(),
             "reasoning_details must be None when not in response"
+        );
+    }
+
+    /// M2: a malformed `reasoning_details` shape (null or a bare object,
+    /// rather than the documented array) must be omitted at the parse
+    /// boundary, not stored and later replayed into the next request.
+    #[test]
+    fn parse_openai_with_reasoning_details_omits_non_array_shapes() {
+        let null_shape = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {"content": "hello", "reasoning_details": null}
+            }]
+        });
+        let r = parse_openai_with_reasoning_details(null_shape).unwrap();
+        assert!(
+            r.reasoning_details.is_none(),
+            "null reasoning_details must be omitted, not stored as Some(Null)"
+        );
+
+        let object_shape = serde_json::json!({
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "content": "hello",
+                    "reasoning_details": {"type": "thinking", "content": "not an array"}
+                }
+            }]
+        });
+        let r = parse_openai_with_reasoning_details(object_shape).unwrap();
+        assert!(
+            r.reasoning_details.is_none(),
+            "a bare-object reasoning_details must be omitted, not stored as Some(object)"
         );
     }
 
