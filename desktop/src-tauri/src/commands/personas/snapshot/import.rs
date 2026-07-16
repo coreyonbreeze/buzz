@@ -434,7 +434,7 @@ pub async fn confirm_agent_snapshot_import(
             persona_id: Some(persona_id.clone()),
             private_key_nsec: private_key_nsec.clone(),
             auth_tag: auth_tag.clone(),
-            relay_url: String::new(), // resolves to workspace relay at runtime
+            relay_url: relay_ws_url_with_override(&state), // pinned to the importing workspace
             avatar_url: effective_avatar.clone(),
             // Machine-local commands: derive from the runtime catalog at
             // spawn time — never manufacture from snapshot data.

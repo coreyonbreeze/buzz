@@ -57,10 +57,11 @@ pub fn relay_api_base_url_with_override(state: &AppState) -> String {
 /// Selects the relay a managed agent should use for a relay operation.
 ///
 /// An explicit per-agent `relay_url` always wins (highest precedence), pinning
-/// the agent to that relay regardless of the active workspace. An empty or
-/// whitespace-only `relay_url` falls back to the active workspace relay, which
-/// resolves at read-time so a never-set record reconciles, spawns, and re-syncs
-/// on the session's relay instead of a stale stored value. Uniform for both
+/// the agent to that relay regardless of the active workspace. Every record is
+/// stamped with its home relay at create (and legacy blank records on the
+/// first `apply_workspace` after boot), so the empty/whitespace fallback to
+/// the active workspace relay is defense-in-depth only — it keeps a record
+/// that somehow escaped stamping operational instead of dead. Uniform for both
 /// Local and Provider backends.
 pub fn effective_agent_relay_url(record_relay: &str, workspace_relay: &str) -> String {
     let pinned = record_relay.trim();
@@ -69,6 +70,38 @@ pub fn effective_agent_relay_url(record_relay: &str, workspace_relay: &str) -> S
     } else {
         pinned.to_string()
     }
+}
+
+/// Canonical form of a relay URL for identity comparisons — NOT for
+/// connecting (callers keep the stored value for actual I/O).
+///
+/// Agent records are pinned to their home relay by URL, so "is this record's
+/// relay the workspace's relay" must not be defeated by cosmetic differences:
+/// surrounding whitespace, trailing slashes, or scheme/host case (both are
+/// case-insensitive per RFC 3986). Any path or query is preserved
+/// case-sensitively.
+pub fn normalize_relay_url(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    match trimmed.split_once("://") {
+        Some((scheme, rest)) => {
+            let (authority, path) = match rest.find('/') {
+                Some(index) => rest.split_at(index),
+                None => (rest, ""),
+            };
+            format!(
+                "{}://{}{}",
+                scheme.to_ascii_lowercase(),
+                authority.to_ascii_lowercase(),
+                path
+            )
+        }
+        None => trimmed.to_string(),
+    }
+}
+
+/// Whether two relay URLs identify the same relay after normalization.
+pub fn relay_urls_equivalent(a: &str, b: &str) -> bool {
+    normalize_relay_url(a) == normalize_relay_url(b)
 }
 
 pub fn relay_http_base_url(relay_url: &str) -> String {
@@ -611,7 +644,8 @@ pub async fn submit_event_with_keys(
 mod tests {
     use super::{
         build_profile_event, classify_intercepted_response, effective_agent_relay_url,
-        parse_command_response, relay_http_base_url, MALFORMED_RESPONSE_MESSAGE,
+        normalize_relay_url, parse_command_response, relay_http_base_url, relay_urls_equivalent,
+        MALFORMED_RESPONSE_MESSAGE,
     };
     use serde::Deserialize;
 
@@ -653,6 +687,56 @@ mod tests {
             effective_agent_relay_url("   ", "wss://staging.example.com"),
             "wss://staging.example.com"
         );
+    }
+
+    // ── normalize_relay_url / relay_urls_equivalent ──────────────────────────
+
+    #[test]
+    fn normalize_strips_whitespace_and_trailing_slashes() {
+        assert_eq!(
+            normalize_relay_url("  wss://relay.example.com//  "),
+            "wss://relay.example.com"
+        );
+    }
+
+    #[test]
+    fn normalize_lowercases_scheme_and_host_only() {
+        // Scheme and authority are case-insensitive (RFC 3986); a path is not.
+        assert_eq!(
+            normalize_relay_url("WSS://Relay.Example.COM:3000/Path"),
+            "wss://relay.example.com:3000/Path"
+        );
+    }
+
+    #[test]
+    fn normalize_passes_through_schemeless_values() {
+        // Not a URL — nothing to case-fold beyond trim/slash cleanup.
+        assert_eq!(normalize_relay_url("not-a-url/"), "not-a-url");
+    }
+
+    #[test]
+    fn equivalence_ignores_cosmetic_differences() {
+        assert!(relay_urls_equivalent(
+            "wss://Relay.Example/",
+            " wss://relay.example"
+        ));
+    }
+
+    #[test]
+    fn equivalence_distinguishes_real_differences() {
+        // Different host, port, or scheme = a different relay.
+        assert!(!relay_urls_equivalent(
+            "wss://relay-a.example",
+            "wss://relay-b.example"
+        ));
+        assert!(!relay_urls_equivalent(
+            "ws://relay.example:3000",
+            "ws://relay.example:3001"
+        ));
+        assert!(!relay_urls_equivalent(
+            "ws://relay.example",
+            "wss://relay.example"
+        ));
     }
 
     // ── relay_http_base_url scheme conversion ────────────────────────────────

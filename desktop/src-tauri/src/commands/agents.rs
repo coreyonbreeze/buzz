@@ -468,15 +468,16 @@ pub async fn create_managed_agent(
             .to_bech32()
             .map_err(|error| format!("failed to encode private key: {error}"))?;
 
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty stays empty and resolves to the active
-        // workspace relay at read-time. Uniform for Local and Provider.
-        let resolved_relay_url = input
-            .relay_url
-            .as_deref()
-            .map(str::trim)
-            .unwrap_or("")
-            .to_string();
+        // Pin the agent to its home relay at create. An explicit value wins
+        // (trimmed, as supplied); a blank input is stamped with the active
+        // workspace relay so the record never floats to whichever workspace
+        // is active at a later read. Uniform for Local and Provider.
+        // (`effective_agent_relay_url`'s blank fallback remains as
+        // defense-in-depth for legacy records that predate stamping.)
+        let resolved_relay_url = crate::relay::effective_agent_relay_url(
+            input.relay_url.as_deref().unwrap_or(""),
+            &relay_ws_url_with_override(&state),
+        );
 
         (keys, private_key_nsec, pubkey, resolved_relay_url, input)
     };

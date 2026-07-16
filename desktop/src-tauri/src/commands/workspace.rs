@@ -5,8 +5,9 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::app_state::AppState;
 use crate::managed_agents::{
-    effective_repos_dir, ensure_repos_symlink, nest_dir, restore_managed_agents_on_launch,
-    try_regenerate_nest, write_persisted_repos_dir,
+    effective_repos_dir, ensure_repos_symlink, load_managed_agents, nest_dir,
+    rebind_agent_relay_urls, restore_managed_agents_on_launch, save_managed_agents,
+    stamp_blank_agent_relay_urls, try_regenerate_nest, write_persisted_repos_dir,
 };
 use crate::relay;
 
@@ -140,12 +141,28 @@ pub async fn apply_workspace(
         // ── Apply all state changes (nothing below can fail) ──────────────────
         {
             let mut override_guard = state.relay_url_override.lock().map_err(|e| e.to_string())?;
-            *override_guard = Some(relay_url);
+            *override_guard = Some(relay_url.clone());
         }
 
         if let Some(keys) = parsed_keys {
             let mut keys_guard = state.keys.lock().map_err(|e| e.to_string())?;
             *keys_guard = keys;
+        }
+
+        // ── One-shot legacy migration (non-fatal) ─────────────────────────────
+        // Pin any blank-relay agent record to the first workspace applied
+        // after boot — exactly what blank would have resolved to at boot
+        // restore, so this is behavior-preserving while stopping the record
+        // from floating to a later workspace switch. Runs before the restore
+        // trigger below so restored agents spawn from stamped records. A
+        // failure is logged and retried on the next boot.
+        if state
+            .agent_relay_stamp_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            if let Err(error) = pin_blank_agent_relays(&app, &state, &relay_url) {
+                eprintln!("buzz-desktop: blank agent relay migration failed: {error}");
+            }
         }
 
         // ── Filesystem side-effect (non-fatal) ────────────────────────────────
@@ -197,4 +214,58 @@ pub async fn apply_workspace(
     }
 
     Ok(())
+}
+
+/// Stamp legacy blank-relay agent records with the applied workspace relay.
+///
+/// Store-lock + load/save wrapper around [`stamp_blank_agent_relay_urls`];
+/// returns the number of records stamped.
+fn pin_blank_agent_relays(
+    app: &AppHandle,
+    state: &AppState,
+    relay_url: &str,
+) -> Result<usize, String> {
+    let _store_guard = state
+        .managed_agents_store_lock
+        .lock()
+        .map_err(|e| e.to_string())?;
+    let mut records = load_managed_agents(app)?;
+    let changed = stamp_blank_agent_relay_urls(&mut records, relay_url);
+    if changed > 0 {
+        save_managed_agents(app, &records)?;
+    }
+    Ok(changed)
+}
+
+/// Re-pin managed-agent records from `old_relay_url` onto `new_relay_url`.
+///
+/// Called by the frontend when a community's relay URL is edited. Every agent
+/// record is pinned to its home relay, so without this rebind the edited
+/// community's agents would stay pinned to — and orphan on — the old URL.
+/// Matching is normalized (trailing slash, scheme/host case). Returns the
+/// number of records rebound.
+#[tauri::command]
+pub async fn rebind_agent_relay(
+    old_relay_url: String,
+    new_relay_url: String,
+    app: AppHandle,
+) -> Result<usize, String> {
+    tokio::task::spawn_blocking(move || {
+        if new_relay_url.trim().is_empty() {
+            return Err("new relay URL is required".to_string());
+        }
+        let state = app.state::<AppState>();
+        let _store_guard = state
+            .managed_agents_store_lock
+            .lock()
+            .map_err(|e| e.to_string())?;
+        let mut records = load_managed_agents(&app)?;
+        let changed = rebind_agent_relay_urls(&mut records, &old_relay_url, &new_relay_url);
+        if changed > 0 {
+            save_managed_agents(&app, &records)?;
+        }
+        Ok(changed)
+    })
+    .await
+    .map_err(|e| format!("spawn_blocking failed: {e}"))?
 }

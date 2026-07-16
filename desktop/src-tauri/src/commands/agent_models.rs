@@ -819,11 +819,16 @@ pub async fn update_managed_agent(
         // turn_timeout_seconds is intentionally not applied here —
         // BUZZ_ACP_TURN_TIMEOUT is deprecated and ignored by the harness.
         // Use idle_timeout_seconds or max_turn_duration_seconds instead.
-        // Store the relay override exactly as supplied (trimmed). An explicit
-        // value pins the agent; empty falls back to the workspace relay at
-        // read-time. A name-only edit (relay_url == None) leaves the pin intact.
+        // Re-pin the relay on an explicit edit. An explicit value pins the
+        // agent there (trimmed, as supplied); clearing the field re-pins to
+        // the active workspace relay — blank is never persisted, so a record
+        // can't float to whichever workspace is active at a later read. A
+        // name-only edit (relay_url == None) leaves the pin intact.
         if let Some(relay_url) = input.relay_url {
-            record.relay_url = relay_url.trim().to_string();
+            record.relay_url = crate::relay::effective_agent_relay_url(
+                &relay_url,
+                &relay_ws_url_with_override(&state),
+            );
         }
         if let Some(acp_command) = input.acp_command {
             record.acp_command = acp_command;

@@ -25,6 +25,8 @@ pub struct AppState {
     /// restore. `apply_workspace` consumes it after installing the workspace
     /// relay and identity, so agents never start against the fallback relay.
     pub managed_agent_restore_pending: AtomicBool,
+    /// One-shot gate: first `apply_workspace` runs `pin_blank_agent_relays`.
+    pub agent_relay_stamp_pending: AtomicBool,
     /// Shared shutdown signal checked by launch-time agent restoration.
     pub shutdown_started: AtomicBool,
     /// Serializes the restore spawn/register transition with shutdown cleanup,
@@ -161,6 +163,7 @@ pub fn build_app_state() -> AppState {
             .unwrap_or_else(|_| reqwest::Client::new()),
         relay_url_override: Mutex::new(None),
         managed_agent_restore_pending: AtomicBool::new(false),
+        agent_relay_stamp_pending: AtomicBool::new(true),
         shutdown_started: AtomicBool::new(false),
         managed_agent_restore_transition: Mutex::new(()),
         identity_mutation: Mutex::new(()),

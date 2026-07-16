@@ -46,3 +46,16 @@ export async function setManagedAgentAutoRestart(
   );
   return fromRawManagedAgent(response);
 }
+
+// Re-pin managed-agent records from oldRelayUrl onto newRelayUrl. Called when
+// a community's relay URL is edited so its agents don't orphan on the old URL.
+// Returns the number of records rebound.
+export async function rebindAgentRelay(
+  oldRelayUrl: string,
+  newRelayUrl: string,
+): Promise<number> {
+  return invokeTauri<number>("rebind_agent_relay", {
+    oldRelayUrl,
+    newRelayUrl,
+  });
+}

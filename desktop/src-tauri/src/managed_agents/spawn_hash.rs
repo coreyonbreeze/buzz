@@ -15,9 +15,11 @@
 //!   apply on a plain restart and are hashed via the same prospective
 //!   re-snapshot. Harness command, args/mcp, env layering, and the record
 //!   fields the spawn env writes read are hashed as spawn resolves them.
-//! - The relay URL is hashed in resolved form (`effective_agent_relay_url`):
-//!   a record with a blank relay spawns against the active workspace relay,
-//!   so a workspace relay change means a restart would change what runs.
+//! - The relay URL is hashed in resolved, normalized form
+//!   (`effective_agent_relay_url` + `normalize_relay_url`): a record with a
+//!   blank relay spawns against the active workspace relay, so a workspace
+//!   relay change means a restart would change what runs — while a cosmetic
+//!   URL difference (trailing slash, scheme/host case) does not.
 //! - Channel membership is not an input: agents pick up channel changes live
 //!   (#1468), never via restart.
 //!
@@ -105,9 +107,15 @@ pub(crate) fn spawn_config_hash(
     effective.env.hash(&mut hasher);
 
     // Record fields the spawn env writes read directly. The relay is hashed
-    // resolved: a blank record relay spawns on the workspace relay, so a
-    // workspace relay change must trip the badge.
-    crate::relay::effective_agent_relay_url(&record.relay_url, workspace_relay).hash(&mut hasher);
+    // resolved AND normalized: a blank record relay spawns on the workspace
+    // relay, so a workspace relay change must trip the badge — but a cosmetic
+    // difference (trailing slash, scheme/host case) between a stamped record
+    // and a re-entered workspace URL must not.
+    crate::relay::normalize_relay_url(&crate::relay::effective_agent_relay_url(
+        &record.relay_url,
+        workspace_relay,
+    ))
+    .hash(&mut hasher);
     // Prompt and runtime-layered team instructions use the same resolver as spawn.
     effective_spawn_prompt(record).hash(&mut hasher);
     effective_team_instructions(record, teams).hash(&mut hasher);

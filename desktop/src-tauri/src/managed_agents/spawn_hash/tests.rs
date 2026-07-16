@@ -201,6 +201,38 @@ fn workspace_relay_change_ignored_for_pinned_record_relay() {
 }
 
 #[test]
+fn cosmetic_pin_difference_does_not_change_hash() {
+    // The relay is hashed normalized: trailing slash and scheme/host case are
+    // the same relay, so re-entering a pin in a cosmetically different form
+    // must not badge.
+    let mut slashed = record();
+    slashed.relay_url = "WS://Localhost:3000/".into();
+    assert_eq!(
+        spawn_config_hash(&record(), &[], &[], "wss://ws.example", &Default::default()),
+        spawn_config_hash(&slashed, &[], &[], "wss://ws.example", &Default::default())
+    );
+}
+
+#[test]
+fn cosmetic_workspace_relay_difference_ignored_for_blank_record_relay() {
+    // Post-migration stability: a record stamped with the workspace relay (or
+    // a legacy blank one resolving to it) must not badge when the frontend
+    // later supplies the same relay with a trailing slash or different case.
+    let mut rec = record();
+    rec.relay_url = String::new();
+    assert_eq!(
+        spawn_config_hash(&rec, &[], &[], "wss://relay-a.example", &Default::default()),
+        spawn_config_hash(
+            &rec,
+            &[],
+            &[],
+            "WSS://Relay-A.Example/",
+            &Default::default()
+        )
+    );
+}
+
+#[test]
 fn respond_to_allowlist_edit_changes_hash() {
     let rec = record();
     let mut edited = record();

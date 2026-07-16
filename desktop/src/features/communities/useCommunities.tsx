@@ -16,6 +16,7 @@ import {
   saveActiveCommunityId,
   saveCommunities,
 } from "./communityStorage";
+import { rebindAgentRelay } from "@/shared/api/tauriManagedAgents";
 import { removeSelfProfileCachesForRelay } from "@/features/profile/lib/selfProfileStorage";
 import { removeChannelSnapshotForRelay } from "@/features/channels/channelSnapshot";
 import { removeMessageSnapshotsForRelay } from "@/features/messages/lib/messageSnapshot";
@@ -224,6 +225,23 @@ function useCommunitiesInternal(): UseCommunitiesReturn {
       );
 
       if (result.kind === "updated") {
+        // Agent records are pinned to their home relay, so a relay-URL edit
+        // must re-pin them onto the new URL or they orphan on the old one.
+        // Fire-and-forget: a failure leaves the pins on the old URL, which
+        // stays recoverable by re-editing the community.
+        const previous = communitiesRef.current.find((w) => w.id === id);
+        if (
+          previous &&
+          updates.relayUrl !== undefined &&
+          updates.relayUrl !== previous.relayUrl
+        ) {
+          rebindAgentRelay(previous.relayUrl, updates.relayUrl).catch(
+            (error) => {
+              console.error("failed to rebind agents to edited relay:", error);
+            },
+          );
+        }
+
         setCommunitiesState((prev) => {
           const next = prev.map((w) =>
             w.id === id ? { ...w, ...updates } : w,

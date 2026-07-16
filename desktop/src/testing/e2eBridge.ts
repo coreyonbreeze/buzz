@@ -8570,6 +8570,9 @@ export function maybeInstallE2eTauriMocks() {
         }
         return;
       }
+      case "rebind_agent_relay":
+        // Mock store has no pinned agent records; nothing to rebind.
+        return 0;
       case "get_profile":
         return handleGetProfile(activeConfig);
       case "update_profile":
