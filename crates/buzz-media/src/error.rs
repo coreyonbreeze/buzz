@@ -78,6 +78,18 @@ pub enum MediaError {
     /// MP4 metadata could not be parsed.
     #[error("invalid video data")]
     InvalidVideo,
+    /// A recognized media format is outside the sanitizer allowlist.
+    #[error("unsupported media format: {0}")]
+    UnsupportedMedia(String),
+    /// Media could not be sanitized or failed post-processing verification.
+    #[error("media sanitization failed")]
+    SanitizationFailed,
+    /// Sanitizer completed but forbidden descriptive metadata remained.
+    #[error("forbidden metadata remained after sanitization")]
+    ResidualMetadata,
+    /// Required media processing tools are missing or unusable.
+    #[error("media processing tools unavailable")]
+    ToolUnavailable,
     /// I/O error during streaming upload.
     #[error("io error: {0}")]
     Io(String),
@@ -140,14 +152,25 @@ impl IntoResponse for MediaError {
             Self::UploadRateLimitExceeded | Self::UploadConcurrencyLimitReached => {
                 (StatusCode::TOO_MANY_REQUESTS, self.to_string())
             }
-            Self::UnsupportedContainer => (StatusCode::UNSUPPORTED_MEDIA_TYPE, self.to_string()),
+            Self::UnsupportedContainer | Self::UnsupportedMedia(_) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, self.to_string())
+            }
             Self::WrongCodec
             | Self::DurationTooLong
             | Self::ResolutionTooHigh
             | Self::MoovNotAtFront
-            | Self::InvalidVideo => (StatusCode::BAD_REQUEST, self.to_string()),
+            | Self::InvalidVideo
+            | Self::SanitizationFailed
+            | Self::ResidualMetadata => (StatusCode::UNPROCESSABLE_ENTITY, self.to_string()),
             Self::UnknownContentType | Self::InvalidImage => {
                 (StatusCode::BAD_REQUEST, self.to_string())
+            }
+            Self::ToolUnavailable => {
+                tracing::error!(error = %self, "media processing tool unavailable");
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "media processing unavailable".into(),
+                )
             }
             Self::Io(_) | Self::StorageError(_) | Self::Internal => {
                 tracing::error!(error = %self, "media storage error");

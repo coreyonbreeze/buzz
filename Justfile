@@ -230,7 +230,7 @@ desktop-e2e-pre-push: _ensure-migrations
     cd {{desktop_dir}} && pnpm build && pnpm exec playwright test --only-changed=origin/main
 
 # Run all checks suitable for CI / pre-push (no infra needed)
-ci: check test-unit desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
+ci: check test-unit media-compliance-test desktop-test desktop-build desktop-tauri-check desktop-tauri-test web-build mobile-test
 
 # ─── Test ─────────────────────────────────────────────────────────────────────
 
@@ -261,6 +261,11 @@ test-unit:
     else
         ./scripts/run-tests.sh unit
     fi
+
+# Exercise the real FFmpeg/ffprobe/ExifTool privacy pipeline. These tests are
+# intentionally not allowed to skip when a required executable is missing.
+media-compliance-test:
+    cargo test -p buzz-media --test media_compliance -- --ignored --test-threads=1
 
 # Run integration tests only (starts services if needed)
 test-integration:

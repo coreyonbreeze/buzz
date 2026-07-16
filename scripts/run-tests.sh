@@ -40,11 +40,12 @@ if [[ -f ".env" ]]; then
   set +o allexport
 else
   # Use defaults matching docker-compose.yml
-  export DATABASE_URL="postgres://buzz:buzz_dev@localhost:5432/buzz"
+  export POSTGRES_PASSWORD="${POSTGRES_PASSWORD:-buzz_dev}"
+  export DATABASE_URL="postgres://buzz:${POSTGRES_PASSWORD}@localhost:5432/buzz"
   export PGHOST=localhost
   export PGPORT=5432
   export PGUSER=buzz
-  export PGPASSWORD=buzz_dev
+  export PGPASSWORD="${POSTGRES_PASSWORD}"
   export PGDATABASE=buzz
   export REDIS_URL="redis://localhost:6379"
 fi
@@ -112,9 +113,15 @@ run_integration_tests() {
   run_test_step "buzz-db tests" \
     cargo test -p buzz-db -- --nocapture
 
-  run_test_step "buzz-auth integration tests" \
-    cargo test -p buzz-auth --test '*' -- --nocapture 2>/dev/null || \
+  shopt -s nullglob
+  local auth_integration_tests=(crates/buzz-auth/tests/*.rs)
+  shopt -u nullglob
+  if (( ${#auth_integration_tests[@]} > 0 )); then
+    run_test_step "buzz-auth integration tests" \
+      cargo test -p buzz-auth --test '*' -- --nocapture
+  else
     run_test_step "buzz-auth (no integration tests found)" true
+  fi
 
   run_test_step "workspace integration tests" \
     cargo test --test '*' -- --nocapture 2>/dev/null || \

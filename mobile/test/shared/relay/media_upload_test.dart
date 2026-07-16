@@ -360,7 +360,7 @@ void main() {
       expect(capturedRequest, isNotNull);
       expect(
         capturedRequest!.url.toString(),
-        'https://relay.example:8443/media/upload',
+        'https://relay.example:8443/media',
       );
       expect(capturedRequest!.headers['Content-Type'], 'image/png');
       expect(capturedRequest!.headers['X-SHA-256'], isNotEmpty);
@@ -380,7 +380,7 @@ void main() {
 
       expect(authEvent['kind'], 24242);
       expect(authEvent['pubkey'], keychain.public);
-      expect(tags, anyElement(equals(<String>['t', 'upload'])));
+      expect(tags, anyElement(equals(<String>['t', 'media'])));
       expect(
         tags,
         anyElement(

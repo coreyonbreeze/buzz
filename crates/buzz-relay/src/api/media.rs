@@ -1,7 +1,9 @@
 //! Blossom-compatible media upload, retrieval, and existence check handlers.
 //!
 //! Routes:
-//!   PUT  /media/upload          — BUD-02 upload (auth required)
+//!   PUT  /media                 — BUD-05 sanitizing media upload
+//!   PUT  /upload                — BUD-02 exact-byte non-media upload
+//!   PUT  /media/upload          — temporary legacy compatibility route
 //!   GET  /media/{sha256_ext}    — BUD-01 serve blob
 //!   HEAD /media/{sha256_ext}    — BUD-01 existence check
 
@@ -35,6 +37,8 @@ pub(crate) struct AuthenticatedUpload {
     /// this HTTP door), identical to the WS door in `router.rs` and the bridge
     /// door in `bridge.rs`. Server-resolved, never client-supplied.
     tenant: TenantContext,
+    claimed_hash: String,
+    mode: buzz_media::UploadRouteMode,
     _upload_permit: UploadPermit,
 }
 
@@ -145,13 +149,30 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
             .await
             .map_err(|_| MediaError::NotFound)?;
 
+        let mode = match parts.uri.path() {
+            "/media" => buzz_media::UploadRouteMode::Media,
+            "/upload" => buzz_media::UploadRouteMode::Upload,
+            "/media/upload" => buzz_media::UploadRouteMode::Legacy,
+            _ => return Err(MediaError::NotFound),
+        };
+
         // 2. Extract and validate Blossom auth event against the bound host.
         let auth_event = extract_blossom_auth(headers)?;
         // Use the permissive window (3600s) here because we don't know the
         // content type yet.  The upload functions re-verify with the correct
         // per-type window (600s for images, 3600s for video) after the body
         // has been consumed and the SHA-256 computed.
-        buzz_media::auth::verify_blossom_auth_event(&auth_event, Some(tenant.host()), 3600)?;
+        let verb = if mode == buzz_media::UploadRouteMode::Media {
+            buzz_media::auth::BlossomVerb::Media
+        } else {
+            buzz_media::auth::BlossomVerb::Upload
+        };
+        buzz_media::auth::verify_blossom_auth_event_for_verb(
+            &auth_event,
+            verb,
+            Some(tenant.host()),
+            3600,
+        )?;
 
         // 3. Require X-SHA-256 header (BUD-11: mandatory for PUT /upload)
         let claimed_hash = headers
@@ -208,6 +229,8 @@ impl FromRequestParts<Arc<AppState>> for AuthenticatedUpload {
         Ok(AuthenticatedUpload {
             auth_event,
             tenant,
+            claimed_hash: claimed_hash.to_string(),
+            mode,
             _upload_permit: upload_permit,
         })
     }
@@ -259,7 +282,7 @@ async fn upload_attribution(
     })
 }
 
-/// PUT /media/upload — Blossom BUD-02 upload.
+/// PUT /media, /upload, or the temporary /media/upload compatibility route.
 ///
 /// Auth is validated via the [`AuthenticatedUpload`] extractor BEFORE the body
 /// is read, preventing unauthenticated clients from forcing body buffering.
@@ -271,7 +294,7 @@ async fn upload_attribution(
 /// Expects:
 ///   - `Authorization: Nostr <base64(kind:24242 event)>` — Blossom auth
 ///   - `X-SHA-256: <hex>` — Required per BUD-11
-///   - `Content-Type: video/mp4` — routes to video validation path; all other types use image path
+///   - `Content-Type` is advisory only; routing is always based on body probes
 ///   - Raw binary body (the file bytes)
 ///
 /// Returns a [`BlobDescriptor`] JSON on success.
@@ -283,71 +306,27 @@ pub async fn upload_blob(
     headers: HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<BlobDescriptor>, MediaError> {
-    let content_type = headers
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
     let attribution = upload_attribution(&state, &auth, &headers).await;
-
-    let mut descriptor = if content_type.starts_with("video/") {
-        // Video path: stream body directly to disk — never fully buffered in RAM.
-        let content_length = headers
-            .get("content-length")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.parse::<u64>().ok());
-        buzz_media::process_video_upload(
-            &state.media_storage,
-            &state.config.media,
-            &auth.tenant,
-            &auth.auth_event,
-            body.into_data_stream(),
+    let content_length = headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if auth.mode == buzz_media::UploadRouteMode::Legacy {
+        metrics::counter!("buzz_media_legacy_upload_route_total").increment(1);
+    }
+    let mut descriptor = buzz_media::process_streaming_ingest(
+        buzz_media::StreamingIngestInput {
+            storage: &state.media_storage,
+            config: &state.config.media,
+            ctx: &auth.tenant,
+            auth_event: &auth.auth_event,
             content_length,
             attribution,
-        )
-        .await?
-    } else {
-        // Non-video path: buffer the body (bounded by the larger of the image
-        // and generic-file caps), then decide image-vs-generic by sniffed MIME.
-        // Images go through the thumbnailing pipeline; everything else (docs,
-        // archives, audio, text, data) takes the generic file path and is
-        // served as a download.
-        let max = state
-            .config
-            .media
-            .max_image_bytes
-            .max(state.config.media.max_file_bytes);
-        let bytes = axum::body::to_bytes(body, max as usize)
-            .await
-            .map_err(|_| MediaError::FileTooLarge { size: 0, max })?;
-
-        let is_image = matches!(
-            infer::get(&bytes).map(|t| t.mime_type()),
-            Some("image/jpeg" | "image/png" | "image/gif" | "image/webp")
-        );
-
-        if is_image {
-            buzz_media::process_upload(
-                &state.media_storage,
-                &state.config.media,
-                &auth.tenant,
-                &auth.auth_event,
-                bytes,
-                attribution,
-            )
-            .await?
-        } else {
-            buzz_media::process_file_upload(
-                &state.media_storage,
-                &state.config.media,
-                &auth.tenant,
-                &auth.auth_event,
-                bytes,
-                attribution,
-            )
-            .await?
-        }
-    };
+            mode: auth.mode,
+        },
+        body.into_data_stream(),
+    )
+    .await?;
 
     rewrite_descriptor_urls_for_tenant(
         &mut descriptor,
@@ -371,6 +350,7 @@ pub async fn upload_blob(
 
     // Audit via bounded channel — same pattern as event audit.
     let desc = descriptor.clone();
+    let sanitized = desc.sha256 != auth.claimed_hash;
     if let Err(e) = state
         .audit_tx
         .send(NewAuditEntry {
@@ -380,8 +360,13 @@ pub async fn upload_blob(
             object_id: Some(desc.sha256.clone()),
             detail: serde_json::json!({
                 "sha256": desc.sha256,
-                "size": desc.size,
-                "mime": desc.mime_type,
+                "source_sha256": auth.claimed_hash,
+                "sanitized": sanitized,
+                "sanitization_policy": sanitized.then_some(1),
+                "outcome": "accepted",
+                "output_size": desc.size,
+                "output_mime": desc.mime_type,
+                "tool_versions": buzz_media::sanitize::tool_versions(),
             }),
         })
         .await

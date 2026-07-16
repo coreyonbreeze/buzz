@@ -1,0 +1,3 @@
+exclude_rules_for_files:
+  sq.pii.cc.visa:
+    - Cargo.lock

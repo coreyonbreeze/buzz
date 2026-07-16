@@ -12,7 +12,7 @@ import 'package:pointycastle/digests/sha256.dart';
 import 'media_auth.dart';
 import 'relay_provider.dart';
 
-const _mediaUploadPath = '/media/upload';
+const _mediaUploadPath = '/media';
 const _mediaUploadPlatformChannelName = 'buzz/media_upload';
 const _sanitizeImageForUploadMethod = 'sanitizeImageForUpload';
 const _transcodeVideoToMp4Method = 'transcodeVideoToMp4';
@@ -309,7 +309,7 @@ class MediaUploadService {
     final expiration =
         (_now().millisecondsSinceEpoch ~/ 1000) + _uploadAuthLifetimeSeconds;
     final tags = <List<String>>[
-      ['t', 'upload'],
+      ['t', 'media'],
       ['x', sha256],
       ['expiration', '$expiration'],
       if (extractServerAuthority(_baseUrl) case final authority?)
@@ -318,7 +318,7 @@ class MediaUploadService {
 
     return nostr.Event.from(
       kind: _uploadAuthKind,
-      content: 'Upload buzz-media',
+      content: 'Process buzz-media',
       tags: tags,
       secretKey: privkeyHex,
       verify: false,

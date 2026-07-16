@@ -6,6 +6,7 @@ use crate::error::MediaError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlossomVerb {
     Upload,
+    Media,
     Get,
 }
 
@@ -13,6 +14,7 @@ impl BlossomVerb {
     fn as_str(self) -> &'static str {
         match self {
             Self::Upload => "upload",
+            Self::Media => "media",
             Self::Get => "get",
         }
     }
@@ -198,6 +200,29 @@ pub fn verify_blossom_upload_auth(
     Ok(())
 }
 
+/// Verify a BUD-11 authorization for the transforming `PUT /media` route.
+pub fn verify_blossom_media_auth(
+    auth_event: &nostr::Event,
+    sha256: &str,
+    server_domain: Option<&str>,
+    max_age_secs: u64,
+) -> Result<(), MediaError> {
+    verify_blossom_auth_event_for_verb(
+        auth_event,
+        BlossomVerb::Media,
+        server_domain,
+        max_age_secs,
+    )?;
+    let has_matching_x = auth_event
+        .tags
+        .iter()
+        .any(|tag| tag.kind().to_string() == "x" && tag.content() == Some(sha256));
+    if !has_matching_x {
+        return Err(MediaError::HashMismatch);
+    }
+    Ok(())
+}
+
 /// Verify a kind:24242 Blossom get auth event for one requested blob.
 ///
 /// BUD-01 permits either blob-scoped authorization (`x` tag matches `sha256`)
@@ -271,6 +296,31 @@ mod tests {
         let sha256 = "a".repeat(64);
         let event = build_valid_auth(&keys, &sha256);
         assert!(verify_blossom_auth_event(&event, None, 600).is_ok());
+    }
+
+    #[test]
+    fn test_media_verb_is_distinct_and_hash_bound() {
+        let keys = Keys::generate();
+        let sha256 = "a".repeat(64);
+        let now = Timestamp::now().as_secs();
+        let event = EventBuilder::new(Kind::from(24242), "Process media")
+            .tags(vec![
+                Tag::parse(["t", "media"]).unwrap(),
+                Tag::parse(["x", &sha256]).unwrap(),
+                Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
+            ])
+            .sign_with_keys(&keys)
+            .unwrap();
+
+        assert!(verify_blossom_media_auth(&event, &sha256, None, 600).is_ok());
+        assert!(matches!(
+            verify_blossom_upload_auth(&event, &sha256, None, 600),
+            Err(MediaError::InvalidAuthVerb)
+        ));
+        assert!(matches!(
+            verify_blossom_media_auth(&event, &"b".repeat(64), None, 600),
+            Err(MediaError::HashMismatch)
+        ));
     }
 
     fn build_get_auth(keys: &Keys, tags: Vec<Tag>) -> nostr::Event {

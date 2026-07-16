@@ -126,7 +126,9 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
         curl \
+        ffmpeg \
         git \
+        libimage-exiftool-perl \
         openssl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1000 buzz \

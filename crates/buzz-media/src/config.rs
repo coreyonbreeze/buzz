@@ -4,6 +4,30 @@ fn default_max_video_bytes() -> u64 {
     524_288_000 // 500 MB
 }
 
+fn default_max_audio_bytes() -> u64 {
+    104_857_600 // 100 MB
+}
+
+fn default_exiftool_path() -> String {
+    "exiftool".to_string()
+}
+
+fn default_ffmpeg_path() -> String {
+    "ffmpeg".to_string()
+}
+
+fn default_ffprobe_path() -> String {
+    "ffprobe".to_string()
+}
+
+fn default_image_process_timeout_secs() -> u64 {
+    120
+}
+
+fn default_av_process_timeout_secs() -> u64 {
+    600
+}
+
 fn default_max_file_bytes() -> u64 {
     104_857_600 // 100 MB
 }
@@ -38,9 +62,27 @@ pub struct MediaConfig {
     /// Maximum upload size for video files (bytes). Default: 500 MB.
     #[serde(default = "default_max_video_bytes")]
     pub max_video_bytes: u64,
+    /// Maximum upload size for audio files (bytes). Default: 100 MB.
+    #[serde(default = "default_max_audio_bytes")]
+    pub max_audio_bytes: u64,
     /// Maximum upload size for generic (non-image, non-video) files (bytes). Default: 100 MB.
     #[serde(default = "default_max_file_bytes")]
     pub max_file_bytes: u64,
+    /// ExifTool executable used for metadata deletion and verification.
+    #[serde(default = "default_exiftool_path")]
+    pub exiftool_path: String,
+    /// FFmpeg executable used for media remuxing and normalization.
+    #[serde(default = "default_ffmpeg_path")]
+    pub ffmpeg_path: String,
+    /// ffprobe executable used for content-derived media classification.
+    #[serde(default = "default_ffprobe_path")]
+    pub ffprobe_path: String,
+    /// Maximum image sanitizer runtime.
+    #[serde(default = "default_image_process_timeout_secs")]
+    pub image_process_timeout_secs: u64,
+    /// Maximum audio/video sanitizer runtime.
+    #[serde(default = "default_av_process_timeout_secs")]
+    pub av_process_timeout_secs: u64,
     /// Public base URL for media URLs in BlobDescriptor (must include `/media` path).
     pub public_base_url: String,
     /// Whether to write per-upload-event records under `_uploads/`
@@ -85,8 +127,23 @@ impl MediaConfig {
         if self.max_video_bytes == 0 {
             return Err("max_video_bytes must be > 0".to_string());
         }
+        if self.max_audio_bytes == 0 {
+            return Err("max_audio_bytes must be > 0".to_string());
+        }
         if self.max_file_bytes == 0 {
             return Err("max_file_bytes must be > 0".to_string());
+        }
+        for (name, value) in [
+            ("exiftool_path", &self.exiftool_path),
+            ("ffmpeg_path", &self.ffmpeg_path),
+            ("ffprobe_path", &self.ffprobe_path),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("{name} must not be empty"));
+            }
+        }
+        if self.image_process_timeout_secs == 0 || self.av_process_timeout_secs == 0 {
+            return Err("media process timeouts must be > 0".to_string());
         }
         // Fail startup on incoherent collection config instead of silently
         // recording nothing — an operator who set an IP header believes they
@@ -135,7 +192,13 @@ mod tests {
             max_image_bytes: 1,
             max_gif_bytes: 1,
             max_video_bytes: 1,
+            max_audio_bytes: 1,
             max_file_bytes: 1,
+            exiftool_path: "exiftool".to_string(),
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffprobe_path: "ffprobe".to_string(),
+            image_process_timeout_secs: 120,
+            av_process_timeout_secs: 600,
             public_base_url: "http://localhost:3000/media".to_string(),
             upload_records_enabled: false,
             upload_ip_header: None,

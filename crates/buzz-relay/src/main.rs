@@ -122,6 +122,16 @@ async fn main() -> anyhow::Result<()> {
         error!("Invalid configuration: {e}");
         anyhow::anyhow!("Configuration error: {e}")
     })?;
+    config.media.validate().map_err(|message| {
+        error!(%message, "Invalid media configuration");
+        anyhow::anyhow!("Media configuration error: {message}")
+    })?;
+    buzz_media::sanitize::validate_toolchain(&config.media)
+        .await
+        .map_err(|error| {
+            error!(%error, "Required media privacy toolchain is unavailable");
+            anyhow::anyhow!("Media privacy toolchain unavailable: {error}")
+        })?;
     info!(
         bind_addr = %config.bind_addr,
         relay_url = %config.relay_url,

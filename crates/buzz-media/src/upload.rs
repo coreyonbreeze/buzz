@@ -5,7 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 
-use crate::auth::verify_blossom_upload_auth;
+use crate::auth::{verify_blossom_media_auth, verify_blossom_upload_auth};
 use crate::config::MediaConfig;
 use crate::error::MediaError;
 use crate::storage::{BlobMeta, MediaStorage};
@@ -15,6 +15,393 @@ use crate::upload_record::{record_upload_event, UploadAttribution, UploadEventFa
 use crate::validation::{
     mime_to_ext, validate_content, validate_file_content, validate_video_file,
 };
+
+/// Upload route semantics. `Media` transforms recognized media, `Upload`
+/// preserves exact non-media bytes, and `Legacy` keeps the historical route
+/// while applying the same sanitizer whenever the body is recognized media.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadRouteMode {
+    Media,
+    Upload,
+    Legacy,
+}
+
+/// Request-scoped dependencies and policy for a unified streaming upload.
+pub struct StreamingIngestInput<'a> {
+    /// Content-addressed object storage.
+    pub storage: &'a MediaStorage,
+    /// Media limits and sanitizer executable configuration.
+    pub config: &'a MediaConfig,
+    /// Server-resolved tenant boundary for storage and authorization.
+    pub ctx: &'a TenantContext,
+    /// Verified Blossom authorization event for the source bytes.
+    pub auth_event: &'a nostr::Event,
+    /// Optional request content length for an early size rejection.
+    pub content_length: Option<u64>,
+    /// Optional moderation attribution recorded after durable publication.
+    pub attribution: Option<UploadAttribution>,
+    /// Route policy controlling transformation versus exact-byte storage.
+    pub mode: UploadRouteMode,
+}
+
+/// Unified streaming ingestion pipeline used by all public upload routes.
+///
+/// The source hash is authenticated before any transformation. Only the final
+/// sanitized artifact is hashed into the public storage key and descriptor.
+pub async fn process_streaming_ingest(
+    input: StreamingIngestInput<'_>,
+    body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+) -> Result<BlobDescriptor, MediaError> {
+    let StreamingIngestInput {
+        storage,
+        config,
+        ctx,
+        auth_event,
+        content_length,
+        attribution,
+        mode,
+    } = input;
+    let max_bytes = config
+        .max_image_bytes
+        .max(config.max_video_bytes)
+        .max(config.max_audio_bytes)
+        .max(config.max_file_bytes);
+    if content_length.is_some_and(|size| size > max_bytes) {
+        return Err(MediaError::FileTooLarge {
+            size: content_length.unwrap_or(max_bytes),
+            max: max_bytes,
+        });
+    }
+
+    let source = tempfile::Builder::new()
+        .prefix("buzz-source-")
+        .tempfile()
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+    let source_path = source.path().to_path_buf();
+    let (source_hash, source_size, sniff) =
+        stream_source(body_stream, &source_path, max_bytes).await?;
+
+    let auth = auth_event.clone();
+    let auth_hash = source_hash.clone();
+    let bound_host = ctx.host().to_string();
+    tokio::task::spawn_blocking(move || match mode {
+        UploadRouteMode::Media => {
+            verify_blossom_media_auth(&auth, &auth_hash, Some(&bound_host), 3600)
+        }
+        UploadRouteMode::Upload | UploadRouteMode::Legacy => {
+            verify_blossom_upload_auth(&auth, &auth_hash, Some(&bound_host), 3600)
+        }
+    })
+    .await
+    .map_err(|_| MediaError::Internal)??;
+
+    let source_probe = crate::sanitize::probe_media(&source_path, &sniff, config).await?;
+    let is_media = source_probe.is_some();
+    match (mode, is_media) {
+        (UploadRouteMode::Media, false) => {
+            return Err(MediaError::UnsupportedMedia(
+                "non-media attachment".to_string(),
+            ));
+        }
+        (UploadRouteMode::Upload, true) => {
+            return Err(MediaError::UnsupportedMedia(
+                source_probe
+                    .as_ref()
+                    .map(|probe| probe.mime.clone())
+                    .unwrap_or_else(|| "media".to_string()),
+            ));
+        }
+        _ => {}
+    }
+
+    enforce_source_size(source_probe.as_ref(), source_size, config)?;
+
+    let sanitized = match source_probe.as_ref() {
+        Some(probe) => {
+            let started = std::time::Instant::now();
+            let result = crate::sanitize::sanitize(&source_path, probe, config).await;
+            let outcome = match &result {
+                Ok(_) => "accepted",
+                Err(MediaError::ResidualMetadata) => "residual_metadata",
+                Err(MediaError::SanitizationFailed) => "sanitization_failed",
+                Err(MediaError::ImageTooLarge) => "limits",
+                Err(_) => "rejected",
+            };
+            metrics::counter!(
+                "buzz_media_sanitization_total",
+                "class" => probe.class.as_str(),
+                "format" => probe.ext.clone(),
+                "outcome" => outcome
+            )
+            .increment(1);
+            metrics::histogram!(
+                "buzz_media_sanitization_duration_seconds",
+                "class" => probe.class.as_str(),
+                "format" => probe.ext.clone(),
+                "outcome" => outcome
+            )
+            .record(started.elapsed().as_secs_f64());
+            if matches!(&result, Err(MediaError::ResidualMetadata)) {
+                metrics::counter!("buzz_media_residual_metadata_rejections_total").increment(1);
+            }
+            Some(result?)
+        }
+        None => None,
+    };
+    let (artifact_path, mime, ext, class, duration, dim) = if let Some(artifact) = &sanitized {
+        let output_size = tokio::fs::metadata(artifact.file.path())
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?
+            .len();
+        enforce_source_size(Some(&artifact.probe), output_size, config)?;
+        let dim = artifact
+            .probe
+            .width
+            .zip(artifact.probe.height)
+            .map(|(width, height)| format!("{width}x{height}"))
+            .unwrap_or_default();
+        (
+            artifact.file.path(),
+            artifact.probe.mime.clone(),
+            artifact.probe.ext.clone(),
+            Some(artifact.probe.class),
+            artifact.probe.duration_secs,
+            dim,
+        )
+    } else {
+        let bytes = tokio::fs::read(&source_path)
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        let (mime, ext) = validate_file_content(&bytes, config)?;
+        (source_path.as_path(), mime, ext, None, None, String::new())
+    };
+
+    let (output_hash, output_size) = hash_file(artifact_path).await?;
+    let key = format!("{output_hash}.{ext}");
+    let meta_key = MediaStorage::ctx_sidecar_key(ctx, &output_hash);
+    let sidecar_exists = storage.head(&meta_key).await?;
+    let blob_exists = storage.head(&key).await?;
+    if sidecar_exists && blob_exists {
+        let meta = storage.get_sidecar(ctx, &output_hash).await?;
+        if let Some(attribution) = &attribution {
+            record_upload_event(
+                storage,
+                ctx,
+                &auth_event.pubkey,
+                attribution,
+                UploadEventFacts {
+                    sha256: &output_hash,
+                    ext: &ext,
+                    mime: &mime,
+                    size: output_size,
+                    source_sha256: Some(source_hash.as_str()),
+                    source_size: Some(source_size),
+                    source_mime: Some(
+                        source_probe
+                            .as_ref()
+                            .map_or(mime.as_str(), |probe| probe.mime.as_str()),
+                    ),
+                    sanitization_policy: is_media.then_some(1),
+                    tool_versions: is_media.then(crate::sanitize::tool_versions).flatten(),
+                    uploaded_at: chrono::Utc::now().timestamp(),
+                },
+            )
+            .await?;
+        }
+        return Ok(build_descriptor(
+            config,
+            &output_hash,
+            &ext,
+            &mime,
+            output_size,
+            Some(&meta),
+            meta.uploaded_at,
+        ));
+    }
+
+    let uploaded_at = chrono::Utc::now().timestamp();
+    storage.put_file(&key, artifact_path, &mime).await?;
+
+    let meta = if class == Some(crate::sanitize::MediaClass::Image)
+        && matches!(
+            mime.as_str(),
+            "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+        ) {
+        let body = Bytes::from(
+            tokio::fs::read(artifact_path)
+                .await
+                .map_err(|error| MediaError::Io(error.to_string()))?,
+        );
+        prepare_image_metadata(
+            storage,
+            config,
+            MetadataInput {
+                sha256: output_hash.clone(),
+                ext: ext.clone(),
+                mime: mime.clone(),
+                body,
+                uploaded_at,
+            },
+        )
+        .await?
+    } else {
+        BlobMeta {
+            dim,
+            blurhash: String::new(),
+            thumb_url: String::new(),
+            size: output_size,
+            ext: ext.clone(),
+            mime_type: mime.clone(),
+            uploaded_at,
+            duration_secs: duration,
+        }
+    };
+
+    if let Some(attribution) = &attribution {
+        record_upload_event(
+            storage,
+            ctx,
+            &auth_event.pubkey,
+            attribution,
+            UploadEventFacts {
+                sha256: &output_hash,
+                ext: &ext,
+                mime: &mime,
+                size: output_size,
+                source_sha256: Some(source_hash.as_str()),
+                source_size: Some(source_size),
+                source_mime: Some(
+                    source_probe
+                        .as_ref()
+                        .map_or(mime.as_str(), |probe| probe.mime.as_str()),
+                ),
+                sanitization_policy: is_media.then_some(1),
+                tool_versions: is_media.then(crate::sanitize::tool_versions).flatten(),
+                uploaded_at,
+            },
+        )
+        .await?;
+    }
+    storage.put_sidecar(ctx, &output_hash, &meta).await?;
+
+    metrics::counter!(
+        "buzz_media_ingest_total",
+        "class" => class.map(crate::sanitize::MediaClass::as_str).unwrap_or("file"),
+        "format" => ext.clone(),
+        "outcome" => "accepted"
+    )
+    .increment(1);
+    metrics::histogram!("buzz_media_processing_input_bytes", "class" => class.map(crate::sanitize::MediaClass::as_str).unwrap_or("file"))
+        .record(source_size as f64);
+    metrics::histogram!("buzz_media_processing_output_bytes", "class" => class.map(crate::sanitize::MediaClass::as_str).unwrap_or("file"))
+        .record(output_size as f64);
+
+    Ok(build_descriptor(
+        config,
+        &output_hash,
+        &ext,
+        &mime,
+        output_size,
+        Some(&meta),
+        uploaded_at,
+    ))
+}
+
+async fn stream_source(
+    body_stream: impl futures_core::Stream<Item = Result<Bytes, axum::Error>> + Send + 'static,
+    path: &std::path::Path,
+    max_bytes: u64,
+) -> Result<(String, u64, Vec<u8>), MediaError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_util::io::StreamReader;
+
+    let mapped = futures_util::StreamExt::map(body_stream, |result| {
+        result.map_err(|error| std::io::Error::other(error.to_string()))
+    });
+    let mut reader = StreamReader::new(Box::pin(mapped));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(path)
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut total = 0_u64;
+    let mut sniff = Vec::with_capacity(4096);
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        total += read as u64;
+        if total > max_bytes {
+            return Err(MediaError::FileTooLarge {
+                size: total,
+                max: max_bytes,
+            });
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        let remaining = 4096_usize.saturating_sub(sniff.len());
+        sniff.extend_from_slice(&buffer[..read.min(remaining)]);
+    }
+    file.flush()
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+    Ok((hex::encode(hasher.finalize()), total, sniff))
+}
+
+async fn hash_file(path: &std::path::Path) -> Result<(String, u64), MediaError> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| MediaError::Io(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .map_err(|error| MediaError::Io(error.to_string()))?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    Ok((hex::encode(hasher.finalize()), size))
+}
+
+fn enforce_source_size(
+    probe: Option<&crate::sanitize::MediaProbe>,
+    size: u64,
+    config: &MediaConfig,
+) -> Result<(), MediaError> {
+    let max = match probe.map(|probe| probe.class) {
+        Some(crate::sanitize::MediaClass::Image) => {
+            if probe.is_some_and(|probe| probe.ext == "gif") {
+                config.max_gif_bytes
+            } else {
+                config.max_image_bytes
+            }
+        }
+        Some(crate::sanitize::MediaClass::Video) => config.max_video_bytes,
+        Some(crate::sanitize::MediaClass::Audio) => config.max_audio_bytes,
+        None => config.max_file_bytes,
+    };
+    if size > max {
+        Err(MediaError::FileTooLarge { size, max })
+    } else {
+        Ok(())
+    }
+}
 
 /// Shared buffered-upload pipeline for the image and generic-file paths.
 ///
@@ -111,6 +498,11 @@ where
                     ext: &ext,
                     mime: &mime,
                     size: body.len() as u64,
+                    source_sha256: None,
+                    source_size: None,
+                    source_mime: None,
+                    sanitization_policy: None,
+                    tool_versions: None,
                     uploaded_at: chrono::Utc::now().timestamp(),
                 },
             )
@@ -169,6 +561,11 @@ where
                 ext: &ext,
                 mime: &mime,
                 size: body.len() as u64,
+                source_sha256: None,
+                source_size: None,
+                source_mime: None,
+                sanitization_policy: None,
+                tool_versions: None,
                 uploaded_at,
             },
         )
@@ -444,6 +841,11 @@ pub async fn process_video_upload(
                     ext,
                     mime: &mime,
                     size: file_size,
+                    source_sha256: None,
+                    source_size: None,
+                    source_mime: None,
+                    sanitization_policy: None,
+                    tool_versions: None,
                     uploaded_at: chrono::Utc::now().timestamp(),
                 },
             )
@@ -490,6 +892,11 @@ pub async fn process_video_upload(
                 ext,
                 mime: &mime,
                 size: file_size,
+                source_sha256: None,
+                source_size: None,
+                source_mime: None,
+                sanitization_policy: None,
+                tool_versions: None,
                 uploaded_at,
             },
         )
@@ -573,7 +980,13 @@ mod tests {
             max_image_bytes: 50 * 1024 * 1024,
             max_gif_bytes: 10 * 1024 * 1024,
             max_video_bytes: 524_288_000,
+            max_audio_bytes: 104_857_600,
             max_file_bytes: 104_857_600,
+            exiftool_path: "exiftool".to_string(),
+            ffmpeg_path: "ffmpeg".to_string(),
+            ffprobe_path: "ffprobe".to_string(),
+            image_process_timeout_secs: 120,
+            av_process_timeout_secs: 600,
             public_base_url: "https://media.example.com".to_string(),
             upload_records_enabled: false,
             upload_ip_header: None,

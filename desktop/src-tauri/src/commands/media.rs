@@ -235,10 +235,11 @@ fn sign_blossom_upload_auth(
     sha256: &str,
     expiry_secs: u64,
     base_url: &str,
+    verb: &str,
 ) -> Result<nostr::Event, String> {
     let now = Timestamp::now().as_secs();
     let mut tags = vec![
-        Tag::parse(vec!["t", "upload"]).map_err(|e| e.to_string())?,
+        Tag::parse(vec!["t", verb]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["x", sha256]).map_err(|e| e.to_string())?,
         Tag::parse(vec!["expiration", &(now + expiry_secs).to_string()])
             .map_err(|e| e.to_string())?,
@@ -246,7 +247,7 @@ fn sign_blossom_upload_auth(
     if let Some(domain) = extract_server_authority(base_url) {
         tags.push(Tag::parse(vec!["server".to_string(), domain]).map_err(|e| e.to_string())?);
     }
-    EventBuilder::new(Kind::from(24242), "Upload buzz-media")
+    EventBuilder::new(Kind::from(24242), format!("{verb} buzz-media"))
         .tags(tags)
         .sign_with_keys(keys)
         .map_err(|e| e.to_string())
@@ -274,9 +275,13 @@ async fn do_upload(
         300
     };
     let base_url = relay_api_base_url_with_override(state);
+    let is_media =
+        mime.starts_with("image/") || mime.starts_with("video/") || mime.starts_with("audio/");
+    let verb = if is_media { "media" } else { "upload" };
+    let route = if is_media { "/media" } else { "/upload" };
     let auth_event = {
         let keys = state.signing_keys()?;
-        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url)?
+        sign_blossom_upload_auth(&keys, &sha256, expiry_secs, &base_url, verb)?
     };
 
     let auth_header = format!(
@@ -285,7 +290,7 @@ async fn do_upload(
     );
     let req = state
         .http_client
-        .put(format!("{base_url}/media/upload"))
+        .put(format!("{base_url}{route}"))
         .header("Authorization", &auth_header)
         .header("Content-Type", mime)
         .header("X-SHA-256", &sha256);

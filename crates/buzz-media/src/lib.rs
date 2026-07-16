@@ -5,6 +5,7 @@
 pub mod auth;
 pub mod config;
 pub mod error;
+pub mod sanitize;
 pub mod storage;
 pub mod thumbnail;
 pub mod types;
@@ -17,6 +18,7 @@ pub use error::MediaError;
 pub use storage::{BlobHeadMeta, BlobMeta, ByteStream, MediaStorage};
 pub use types::BlobDescriptor;
 pub use upload::{process_file_upload, process_upload, process_video_upload};
+pub use upload::{process_streaming_ingest, StreamingIngestInput, UploadRouteMode};
 pub use upload_record::{
     parse_port, parse_public_ip, upload_record_key, UploadAttribution, UploadNetworkInfo,
     UploadRecord, UPLOAD_RECORD_VERSION,

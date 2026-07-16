@@ -499,10 +499,27 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(500 * 1024 * 1024),
+            max_audio_bytes: std::env::var("BUZZ_MAX_AUDIO_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100 * 1024 * 1024),
             max_file_bytes: std::env::var("BUZZ_MAX_FILE_BYTES")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(100 * 1024 * 1024),
+            exiftool_path: std::env::var("BUZZ_EXIFTOOL_PATH")
+                .unwrap_or_else(|_| "exiftool".to_string()),
+            ffmpeg_path: std::env::var("BUZZ_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_string()),
+            ffprobe_path: std::env::var("BUZZ_FFPROBE_PATH")
+                .unwrap_or_else(|_| "ffprobe".to_string()),
+            image_process_timeout_secs: std::env::var("BUZZ_MEDIA_IMAGE_PROCESS_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(120),
+            av_process_timeout_secs: std::env::var("BUZZ_MEDIA_AV_PROCESS_TIMEOUT_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600),
             public_base_url: std::env::var("BUZZ_MEDIA_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:3000/media".to_string()),
             // Per-upload-event records (`_uploads/` moderation side channel).

@@ -30,7 +30,7 @@ fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
     let now = Timestamp::now().as_secs();
     let exp_str = (now + 300).to_string();
     let tags = vec![
-        Tag::parse(["t", "upload"]).expect("t tag"),
+        Tag::parse(["t", "media"]).expect("t tag"),
         Tag::parse(["x", sha256]).expect("x tag"),
         Tag::parse(["expiration", &exp_str]).expect("expiration tag"),
     ];
@@ -51,6 +51,7 @@ fn blossom_auth_header(event: &nostr::Event) -> String {
 ///
 /// Layout: ftyp | moov(mvhd + trak(tkhd + mdia(mdhd + hdlr + minf(vmhd + dinf + stbl)))) | mdat
 /// This is enough for `infer` to detect video/mp4 and for the `mp4` crate to parse.
+#[allow(dead_code)]
 fn build_test_mp4() -> Vec<u8> {
     fn box_wrap(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
         let size = (8 + payload.len()) as u32;
@@ -235,6 +236,45 @@ fn build_test_mp4() -> Vec<u8> {
     [ftyp, moov, mdat].concat()
 }
 
+/// Generate a real decodable H.264/AAC fixture. Compliance processing uses
+/// FFmpeg rather than accepting header-only MP4 structures, so happy-path E2E
+/// coverage must exercise actual media samples.
+fn build_real_test_mp4() -> Vec<u8> {
+    let output = tempfile::Builder::new()
+        .suffix(".mp4")
+        .tempfile()
+        .expect("MP4 fixture tempfile");
+    let status = std::process::Command::new("ffmpeg")
+        .args([
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=10:duration=1",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=1",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            "-movflags",
+            "+faststart",
+        ])
+        .arg(output.path())
+        .status()
+        .expect("run ffmpeg fixture generator");
+    assert!(status.success(), "ffmpeg fixture generation failed");
+    std::fs::read(output.path()).expect("read MP4 fixture")
+}
+
 /// Upload a valid MP4 video via Blossom, verify the BlobDescriptor includes
 /// video-specific fields (duration, dim) and the blob is retrievable.
 #[tokio::test]
@@ -242,11 +282,11 @@ fn build_test_mp4() -> Vec<u8> {
 async fn test_video_upload_and_get() {
     let client = http_client();
     let keys = Keys::generate();
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let sha256 = hex::encode(Sha256::digest(&mp4));
 
     let auth = sign_blossom_auth(&keys, &sha256);
-    let url = format!("{}/media/upload", relay_http_url());
+    let url = format!("{}/media", relay_http_url());
 
     let resp = client
         .put(&url)
@@ -261,7 +301,7 @@ async fn test_video_upload_and_get() {
     assert_eq!(resp.status(), StatusCode::OK, "upload should succeed");
 
     let desc: serde_json::Value = resp.json().await.expect("json body");
-    assert_eq!(desc["sha256"].as_str().unwrap(), sha256);
+    let output_sha = desc["sha256"].as_str().unwrap();
     assert_eq!(desc["type"].as_str().unwrap(), "video/mp4");
     assert!(desc["size"].as_u64().unwrap() > 0);
     // Video descriptor should have duration
@@ -275,7 +315,7 @@ async fn test_video_upload_and_get() {
     let get_resp = client.get(get_url).send().await.expect("GET blob");
     assert_eq!(get_resp.status(), StatusCode::OK);
     let body = get_resp.bytes().await.expect("body bytes");
-    assert_eq!(body.len(), mp4.len());
+    assert_eq!(hex::encode(Sha256::digest(&body)), output_sha);
 }
 
 /// The relay ignores the Content-Type header and sniffs magic bytes. MP4
@@ -286,11 +326,11 @@ async fn test_video_upload_and_get() {
 async fn test_video_content_type_header_ignored() {
     let client = http_client();
     let keys = Keys::generate();
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let sha256 = hex::encode(Sha256::digest(&mp4));
 
     let auth = sign_blossom_auth(&keys, &sha256);
-    let url = format!("{}/media/upload", relay_http_url());
+    let url = format!("{}/media", relay_http_url());
 
     // Upload MP4 bytes but claim it's image/jpeg
     let resp = client
@@ -322,12 +362,12 @@ async fn test_video_content_type_header_ignored() {
 async fn test_video_range_request_206() {
     let client = http_client();
     let keys = Keys::generate();
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let sha256 = hex::encode(Sha256::digest(&mp4));
 
     // Upload first
     let auth = sign_blossom_auth(&keys, &sha256);
-    let url = format!("{}/media/upload", relay_http_url());
+    let url = format!("{}/media", relay_http_url());
     let resp = client
         .put(&url)
         .header("Authorization", blossom_auth_header(&auth))
@@ -357,7 +397,6 @@ async fn test_video_range_request_206() {
         .is_some_and(|v| v == "bytes"));
     let body = range_resp.bytes().await.unwrap();
     assert_eq!(body.len(), 100);
-    assert_eq!(&body[..], &mp4[..100]);
 }
 
 /// Unsatisfiable range request should return 416.
@@ -366,12 +405,12 @@ async fn test_video_range_request_206() {
 async fn test_video_range_request_416() {
     let client = http_client();
     let keys = Keys::generate();
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let sha256 = hex::encode(Sha256::digest(&mp4));
 
     // Upload first
     let auth = sign_blossom_auth(&keys, &sha256);
-    let url = format!("{}/media/upload", relay_http_url());
+    let url = format!("{}/media", relay_http_url());
     let resp = client
         .put(&url)
         .header("Authorization", blossom_auth_header(&auth))
@@ -390,7 +429,11 @@ async fn test_video_range_request_416() {
         .get(blob_url)
         .header(
             "Range",
-            format!("bytes={}-{}", mp4.len() + 1000, mp4.len() + 2000),
+            format!(
+                "bytes={}-{}",
+                desc["size"].as_u64().unwrap() + 1000,
+                desc["size"].as_u64().unwrap() + 2000
+            ),
         )
         .send()
         .await
@@ -408,8 +451,8 @@ async fn test_video_range_request_416() {
 #[ignore]
 async fn test_video_upload_no_auth_returns_401() {
     let client = http_client();
-    let mp4 = build_test_mp4();
-    let url = format!("{}/media/upload", relay_http_url());
+    let mp4 = build_real_test_mp4();
+    let url = format!("{}/media", relay_http_url());
 
     let resp = client
         .put(&url)
@@ -496,11 +539,11 @@ async fn test_video_poster_imeta_accepted_via_ws() {
     assert!(resp.status().is_success(), "channel creation failed");
 
     // 2. Upload video
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let video_sha = hex::encode(Sha256::digest(&mp4));
     let video_auth = sign_blossom_auth(&keys, &video_sha);
     let video_resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&video_auth))
         .header("X-SHA-256", &video_sha)
         .header("Content-Type", "video/mp4")
@@ -510,6 +553,7 @@ async fn test_video_poster_imeta_accepted_via_ws() {
         .unwrap();
     assert_eq!(video_resp.status(), StatusCode::OK, "video upload failed");
     let video_desc: serde_json::Value = video_resp.json().await.unwrap();
+    let published_video_sha = video_desc["sha256"].as_str().unwrap().to_string();
     let video_size = video_desc["size"].as_u64().unwrap();
 
     // 3. Upload poster (tiny JPEG)
@@ -517,7 +561,7 @@ async fn test_video_poster_imeta_accepted_via_ws() {
     let poster_sha = hex::encode(Sha256::digest(&poster));
     let poster_auth = sign_blossom_auth(&keys, &poster_sha);
     let poster_resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&poster_auth))
         .header("X-SHA-256", &poster_sha)
         .body(poster.to_vec())
@@ -525,6 +569,8 @@ async fn test_video_poster_imeta_accepted_via_ws() {
         .await
         .unwrap();
     assert_eq!(poster_resp.status(), StatusCode::OK, "poster upload failed");
+    let poster_desc: serde_json::Value = poster_resp.json().await.unwrap();
+    let published_poster_sha = poster_desc["sha256"].as_str().unwrap();
 
     // 4. Send message with imeta referencing both video and poster
     let mut ws = BuzzTestClient::connect(&relay_ws_url(), &keys)
@@ -534,17 +580,17 @@ async fn test_video_poster_imeta_accepted_via_ws() {
     let base = relay_http_url();
     let event = EventBuilder::new(
         Kind::from(9),
-        format!("![video]({base}/media/{video_sha}.mp4)"),
+        format!("![video]({base}/media/{published_video_sha}.mp4)"),
     )
     .tags(vec![
         Tag::parse(["h", &channel_id]).unwrap(),
         Tag::parse([
             "imeta",
-            &format!("url {base}/media/{video_sha}.mp4"),
+            &format!("url {base}/media/{published_video_sha}.mp4"),
             "m video/mp4",
-            &format!("x {video_sha}"),
+            &format!("x {published_video_sha}"),
             &format!("size {video_size}"),
-            &format!("image {base}/media/{poster_sha}.jpg"),
+            &format!("image {base}/media/{published_poster_sha}.jpg"),
         ])
         .unwrap(),
     ])
@@ -595,11 +641,11 @@ async fn test_video_poster_imeta_rejects_video_as_poster() {
     assert!(resp.status().is_success());
 
     // 2. Upload video
-    let mp4 = build_test_mp4();
+    let mp4 = build_real_test_mp4();
     let video_sha = hex::encode(Sha256::digest(&mp4));
     let video_auth = sign_blossom_auth(&keys, &video_sha);
     let video_resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&video_auth))
         .header("X-SHA-256", &video_sha)
         .header("Content-Type", "video/mp4")
@@ -609,6 +655,7 @@ async fn test_video_poster_imeta_rejects_video_as_poster() {
         .unwrap();
     assert_eq!(video_resp.status(), StatusCode::OK);
     let video_desc: serde_json::Value = video_resp.json().await.unwrap();
+    let published_video_sha = video_desc["sha256"].as_str().unwrap();
     let video_size = video_desc["size"].as_u64().unwrap();
 
     // 3. Send message with imeta `image` pointing to the VIDEO (not an image)
@@ -622,12 +669,12 @@ async fn test_video_poster_imeta_rejects_video_as_poster() {
             Tag::parse(["h", &channel_id]).unwrap(),
             Tag::parse([
                 "imeta",
-                &format!("url {base}/media/{video_sha}.mp4"),
+                &format!("url {base}/media/{published_video_sha}.mp4"),
                 "m video/mp4",
-                &format!("x {video_sha}"),
+                &format!("x {published_video_sha}"),
                 &format!("size {video_size}"),
                 // BAD: image field points to the video itself (.mp4 extension)
-                &format!("image {base}/media/{video_sha}.mp4"),
+                &format!("image {base}/media/{published_video_sha}.mp4"),
             ])
             .unwrap(),
         ])

@@ -44,6 +44,8 @@ unacceptable behavior to **conduct@buzz-relay.org**.
 | pnpm | 10+ | Required for desktop app commands and `just ci` |
 | Flutter | 3.41+ | Required for mobile app — install via [flutter.dev](https://docs.flutter.dev/get-started/install) |
 | Docker | 24+ | For Postgres, Redis, MinIO |
+| FFmpeg + ffprobe | 6+ | Media sanitization; pinned by Hermit |
+| ExifTool | 12.70+ | Image metadata removal and verification; install with your OS package manager |
 | `just` | latest | Task runner — `cargo install just` |
 | `lefthook` | latest | Optional; run `lefthook install` for local Git hooks |
 | `sqlx` migrations | workspace crate | `just migrate` applies embedded migrations from `migrations/` |
@@ -89,6 +91,13 @@ Adminer on `:8082`, Keycloak on `:8180` for local OAuth/OIDC testing, MinIO on
 `:9000` for media storage, and Prometheus on `:9090` for metrics) and runs all
 pending database migrations.
 
+The relay validates its privacy toolchain during startup and fails closed when
+FFmpeg, ffprobe, ExifTool, or a required codec is unavailable. Hermit supplies
+FFmpeg and ffprobe. Install ExifTool separately (for example,
+`brew install exiftool` on macOS or `apt install libimage-exiftool-perl` on
+Debian/Ubuntu). Override binary locations with `BUZZ_EXIFTOOL_PATH`,
+`BUZZ_FFMPEG_PATH`, and `BUZZ_FFPROBE_PATH` when needed.
+
 ### Running the Relay and Desktop App
 
 ```bash
@@ -131,6 +140,14 @@ just test-unit
 
 Unit tests are self-contained and run without Docker. They cover event
 parsing, filter matching, auth logic, workflow YAML parsing, and more.
+
+The media compliance suite exercises the real packaged binaries and the full
+synthetic format corpus. It intentionally fails instead of skipping when a
+tool, codec, or fixture is missing:
+
+```bash
+just media-compliance-test
+```
 
 ### Integration Tests (requires running infrastructure)
 

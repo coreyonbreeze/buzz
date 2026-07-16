@@ -173,6 +173,16 @@ pub(super) fn transcode_to_mp4(
             .arg("-i")
             .arg(source) // OsStr — handles non-UTF-8 paths on Unix
             .args([
+                "-map",
+                "0:v:0",
+                "-map",
+                "0:a:0?",
+                "-map_metadata",
+                "-1",
+                "-map_chapters",
+                "-1",
+                "-sn",
+                "-dn",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -187,6 +197,8 @@ pub(super) fn transcode_to_mp4(
                 "128k",
                 "-movflags",
                 "+faststart",
+                "-metadata",
+                "encoder=",
             ])
             .arg(&output)
             .stdout(std::process::Stdio::null())
@@ -232,7 +244,16 @@ pub(super) fn transcode_heic_to_jpeg(
             .args(["-y", "-loglevel", "error"]) // suppress progress spam — prevents stderr pipe deadlock
             .arg("-i")
             .arg(source) // OsStr — handles non-UTF-8 paths on Unix
-            .args(["-frames:v", "1", "-q:v", "2"])
+            .args([
+                "-map",
+                "0:v:0",
+                "-map_metadata",
+                "-1",
+                "-frames:v",
+                "1",
+                "-q:v",
+                "2",
+            ])
             .arg(&output)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::piped()),

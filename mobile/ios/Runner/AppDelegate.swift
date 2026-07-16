@@ -177,6 +177,7 @@ import UserNotifications
     exportSession.outputURL = outputURL
     exportSession.outputFileType = .mp4
     exportSession.shouldOptimizeForNetworkUse = true
+    exportSession.metadataItemFilter = AVMetadataItemFilter.forSharing()
 
     exportSession.exportAsynchronously {
       switch exportSession.status {

@@ -38,7 +38,7 @@ fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
     let now = Timestamp::now().as_secs();
     let exp_str = (now + 300).to_string();
     let tags = vec![
-        Tag::parse(["t", "upload"]).expect("t tag"),
+        Tag::parse(["t", "media"]).expect("t tag"),
         Tag::parse(["x", sha256]).expect("x tag"),
         Tag::parse(["expiration", &exp_str]).expect("expiration tag"),
     ];
@@ -99,10 +99,10 @@ async fn test_upload_and_get() {
     println!("sha256: {sha256}");
     println!("relay: {}", relay_http_url());
 
-    // PUT /media/upload
+    // PUT /media
     let auth = sign_blossom_auth(&keys, &sha256);
     let resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&auth))
         .header("Content-Type", "image/jpeg")
         .header("X-SHA-256", &sha256)
@@ -113,7 +113,7 @@ async fn test_upload_and_get() {
 
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
-    println!("PUT /media/upload → {status}: {body_text}");
+    println!("PUT /media → {status}: {body_text}");
     assert_eq!(status, 200, "upload should succeed");
 
     // Parse BlobDescriptor
@@ -121,14 +121,10 @@ async fn test_upload_and_get() {
         serde_json::from_str(&body_text).expect("BlobDescriptor JSON");
     println!("BlobDescriptor: {descriptor:#}");
 
-    assert_eq!(
-        descriptor["sha256"].as_str().unwrap(),
-        sha256,
-        "sha256 must match"
-    );
+    let output_sha = descriptor["sha256"].as_str().unwrap();
     assert!(
-        descriptor["url"].as_str().unwrap().contains(&sha256),
-        "url must contain sha256"
+        descriptor["url"].as_str().unwrap().contains(output_sha),
+        "url must contain sanitized sha256"
     );
     assert!(
         descriptor["size"].as_u64().unwrap() > 0,
@@ -145,7 +141,7 @@ async fn test_upload_and_get() {
     );
 
     // GET /media/{sha256}.jpg — bytes must match
-    let get_url = format!("{}/media/{sha256}.jpg", relay_http_url());
+    let get_url = descriptor["url"].as_str().unwrap().to_string();
     let get_resp = client
         .get(&get_url)
         .send()
@@ -153,11 +149,7 @@ async fn test_upload_and_get() {
         .expect("GET /media/{sha256}.jpg failed");
     assert_eq!(get_resp.status(), 200, "GET should return 200");
     let returned_bytes = get_resp.bytes().await.unwrap();
-    assert_eq!(
-        returned_bytes.as_ref(),
-        jpeg.as_slice(),
-        "GET must return original bytes"
-    );
+    assert_eq!(hex::encode(Sha256::digest(&returned_bytes)), output_sha);
 
     // HEAD /media/{sha256}.jpg — must return 200 with content-type
     let head_resp = client
@@ -172,7 +164,7 @@ async fn test_upload_and_get() {
     );
 
     // GET thumbnail — /media/{sha256}.thumb.jpg
-    let thumb_url = format!("{}/media/{sha256}.thumb.jpg", relay_http_url());
+    let thumb_url = format!("{}/media/{output_sha}.thumb.jpg", relay_http_url());
     let thumb_resp = client
         .get(&thumb_url)
         .send()
@@ -195,7 +187,7 @@ async fn test_upload_idempotent() {
     let upload = |keys: &Keys| {
         let auth = sign_blossom_auth(keys, &sha256);
         client
-            .put(format!("{}/media/upload", relay_http_url()))
+            .put(format!("{}/media", relay_http_url()))
             .header("Authorization", blossom_auth_header(&auth))
             .header("Content-Type", "image/jpeg")
             .header("X-SHA-256", sha256.clone())
@@ -234,7 +226,7 @@ async fn test_upload_no_auth_returns_401() {
     let jpeg = tiny_jpeg();
 
     let resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Content-Type", "image/jpeg")
         .body(jpeg)
         .send()
@@ -256,7 +248,7 @@ async fn test_upload_missing_x_sha256_returns_401() {
 
     let auth = sign_blossom_auth(&keys, &sha256);
     let resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&auth))
         .header("Content-Type", "image/jpeg")
         // Intentionally omit X-SHA-256
@@ -280,7 +272,7 @@ async fn test_upload_hash_mismatch_returns_400() {
 
     let auth = sign_blossom_auth(&keys, &wrong_hash);
     let resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&auth))
         .header("Content-Type", "image/jpeg")
         .header("X-SHA-256", &wrong_hash)
@@ -331,7 +323,7 @@ async fn test_upload_real_image() {
 
     let auth = sign_blossom_auth(&keys, &sha256);
     let resp = client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&auth))
         .header("Content-Type", "image/jpeg")
         .header("X-SHA-256", &sha256)
@@ -342,16 +334,15 @@ async fn test_upload_real_image() {
 
     let status = resp.status();
     let body_text = resp.text().await.unwrap_or_default();
-    println!("PUT /media/upload → {status}: {body_text}");
+    println!("PUT /media → {status}: {body_text}");
     assert_eq!(status, 200, "upload should succeed");
 
     let descriptor: serde_json::Value =
         serde_json::from_str(&body_text).expect("BlobDescriptor JSON");
     println!("BlobDescriptor: {descriptor:#}");
 
-    assert_eq!(descriptor["sha256"].as_str().unwrap(), sha256);
-    assert_eq!(descriptor["size"].as_u64().unwrap(), size as u64);
-    assert!(descriptor["url"].as_str().unwrap().contains(&sha256));
+    let output_sha = descriptor["sha256"].as_str().unwrap();
+    assert!(descriptor["url"].as_str().unwrap().contains(output_sha));
     assert!(
         descriptor["dim"].as_str().is_some(),
         "real image should have dim"
@@ -366,11 +357,7 @@ async fn test_upload_real_image() {
     let get_resp = client.get(get_url).send().await.expect("GET failed");
     assert_eq!(get_resp.status(), 200);
     let returned = get_resp.bytes().await.unwrap();
-    assert_eq!(
-        returned.as_ref(),
-        bytes.as_slice(),
-        "GET must return original bytes"
-    );
+    assert_eq!(hex::encode(Sha256::digest(&returned)), output_sha);
 
     println!("✅ Real image upload round-trip passed");
 }

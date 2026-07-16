@@ -65,7 +65,24 @@ const ALLOWED_MIMES: &[&str] = &[
     "image/png",
     "image/gif",
     "image/webp",
+    "image/tiff",
+    "image/bmp",
+    "image/x-ms-bmp",
+    "image/heic",
+    "image/heif",
+    "image/avif",
     "video/mp4",
+    "video/quicktime",
+    "video/webm",
+    "video/x-matroska",
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/aac",
+    "audio/flac",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/opus",
 ];
 
 /// Maximum file size for image uploads (50 MB).
@@ -73,6 +90,9 @@ const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 
 /// Maximum file size for video uploads (500 MB).
 const MAX_VIDEO_BYTES: u64 = 500 * 1024 * 1024;
+
+/// Maximum file size for audio uploads (100 MB).
+const MAX_AUDIO_BYTES: u64 = 100 * 1024 * 1024;
 
 /// Sign a NIP-98 HTTP auth event (kind:27235) and return the Authorization header value.
 ///
@@ -534,6 +554,8 @@ impl BuzzClient {
         // 3. Size check
         let max = if mime.starts_with("video/") {
             MAX_VIDEO_BYTES
+        } else if mime.starts_with("audio/") {
+            MAX_AUDIO_BYTES
         } else {
             MAX_IMAGE_BYTES
         };
@@ -559,7 +581,7 @@ impl BuzzClient {
         let exp_str = (now + expiry).to_string();
 
         let mut blossom_tags = vec![
-            Tag::parse(["t", "upload"]).map_err(|e| CliError::Other(e.to_string()))?,
+            Tag::parse(["t", "media"]).map_err(|e| CliError::Other(e.to_string()))?,
             Tag::parse(["x", &sha256]).map_err(|e| CliError::Other(e.to_string()))?,
             Tag::parse(["expiration", &exp_str]).map_err(|e| CliError::Other(e.to_string()))?,
         ];
@@ -569,7 +591,7 @@ impl BuzzClient {
                 .push(Tag::parse(["server", &domain]).map_err(|e| CliError::Other(e.to_string()))?);
         }
 
-        let auth_event = EventBuilder::new(Kind::from(24242), "Upload file")
+        let auth_event = EventBuilder::new(Kind::from(24242), "Process media")
             .tags(blossom_tags)
             .sign_with_keys(&self.keys)
             .map_err(|e| CliError::Other(format!("signing failed: {e}")))?;
@@ -581,13 +603,13 @@ impl BuzzClient {
             URL_SAFE_NO_PAD.encode(auth_event.as_json().as_bytes())
         );
 
-        // 7. PUT request to /media/upload — with generous per-request timeout.
+        // 7. PUT request to BUD-05 /media — with generous per-request timeout.
         let upload_timeout = if mime.starts_with("video/") {
             Duration::from_secs(600)
         } else {
             Duration::from_secs(120)
         };
-        let url = format!("{}/media/upload", self.relay_url);
+        let url = format!("{}/media", self.relay_url);
         let req = self
             .http
             .put(&url)

@@ -66,6 +66,25 @@ pub struct UploadRecord {
     pub mime_type: String,
     /// Size of the uploaded bytes.
     pub size: u64,
+    /// Hash of the authenticated source bytes when the public blob was
+    /// transformed. Omitted for exact-byte uploads and historical callers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_sha256: Option<String>,
+    /// Size of the authenticated source bytes before transformation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_size: Option<u64>,
+    /// Content-derived MIME type of the authenticated source artifact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_mime_type: Option<String>,
+    /// Sanitization policy version applied to this upload.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sanitization_policy: Option<u32>,
+    /// Stable processing outcome. Accepted records currently use `accepted`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    /// Startup-verified sanitizer binary versions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_versions: Option<crate::sanitize::ToolVersions>,
     /// Unix seconds when the relay accepted *this* upload event. On an
     /// idempotent re-upload this is the re-upload time, not the original
     /// blob's `uploaded_at`.
@@ -125,6 +144,16 @@ pub struct UploadEventFacts<'a> {
     pub mime: &'a str,
     /// Uploaded byte size.
     pub size: u64,
+    /// Authenticated pre-transform hash for sanitized media.
+    pub source_sha256: Option<&'a str>,
+    /// Authenticated pre-transform size for sanitized media.
+    pub source_size: Option<u64>,
+    /// Content-derived MIME type of the authenticated source.
+    pub source_mime: Option<&'a str>,
+    /// Applied sanitization policy version (`1` for the initial policy).
+    pub sanitization_policy: Option<u32>,
+    /// Startup-verified sanitizer binary versions.
+    pub tool_versions: Option<&'a crate::sanitize::ToolVersions>,
     /// Unix seconds this upload event was accepted.
     pub uploaded_at: i64,
 }
@@ -156,6 +185,12 @@ pub async fn record_upload_event(
         ext: facts.ext.to_string(),
         mime_type: facts.mime.to_string(),
         size: facts.size,
+        source_sha256: facts.source_sha256.map(str::to_string),
+        source_size: facts.source_size,
+        source_mime_type: facts.source_mime.map(str::to_string),
+        sanitization_policy: facts.sanitization_policy,
+        outcome: facts.sanitization_policy.map(|_| "accepted".to_string()),
+        tool_versions: facts.tool_versions.cloned(),
         uploaded_at: facts.uploaded_at,
         community_id: ctx.community().to_string(),
         community_host: ctx.host().to_string(),
@@ -290,6 +325,12 @@ mod tests {
             ext: "png".into(),
             mime_type: "image/png".into(),
             size: 12345,
+            source_sha256: Some("a".repeat(64)),
+            source_size: Some(13000),
+            source_mime_type: Some("image/png".into()),
+            sanitization_policy: Some(1),
+            outcome: Some("accepted".into()),
+            tool_versions: None,
             uploaded_at: 1_783_358_352,
             community_id: uuid::Uuid::from_u128(7).to_string(),
             community_host: "chat.example.com".into(),
@@ -304,6 +345,7 @@ mod tests {
         assert_eq!(json["ext"], "png");
         assert_eq!(json["mime_type"], "image/png");
         assert_eq!(json["size"], 12345);
+        assert_eq!(json["sanitization_policy"], 1);
         assert_eq!(json["ip"], "203.0.113.7");
         assert_eq!(json["port"], 51234);
         assert_eq!(json["uploader_name"], "alice");
@@ -318,6 +360,12 @@ mod tests {
             ext: "mp4".into(),
             mime_type: "video/mp4".into(),
             size: 1,
+            source_sha256: None,
+            source_size: None,
+            source_mime_type: None,
+            sanitization_policy: None,
+            outcome: None,
+            tool_versions: None,
             uploaded_at: 0,
             community_id: "cid".into(),
             community_host: "h".into(),
@@ -332,6 +380,8 @@ mod tests {
         assert!(json.get("uploader_name").is_none());
         assert!(json.get("ip").is_none());
         assert!(json.get("port").is_none());
+        assert!(json.get("source_sha256").is_none());
+        assert!(json.get("sanitization_policy").is_none());
     }
 
     #[test]

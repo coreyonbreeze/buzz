@@ -27,9 +27,13 @@ fn http_client() -> Client {
 }
 
 fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
+    sign_blossom_auth_for_verb(keys, sha256, "media")
+}
+
+fn sign_blossom_auth_for_verb(keys: &Keys, sha256: &str, verb: &str) -> nostr::Event {
     let now = Timestamp::now().as_secs();
     let tags = vec![
-        Tag::parse(["t", "upload"]).unwrap(),
+        Tag::parse(["t", verb]).unwrap(),
         Tag::parse(["x", sha256]).unwrap(),
         Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
     ];
@@ -37,6 +41,19 @@ fn sign_blossom_auth(keys: &Keys, sha256: &str) -> nostr::Event {
         .tags(tags)
         .sign_with_keys(keys)
         .unwrap()
+}
+
+async fn upload_file(client: &Client, keys: &Keys, body: &[u8]) -> reqwest::Response {
+    let sha256 = hex::encode(Sha256::digest(body));
+    let auth = sign_blossom_auth_for_verb(keys, &sha256, "upload");
+    client
+        .put(format!("{}/upload", relay_http_url()))
+        .header("Authorization", blossom_auth_header(&auth))
+        .header("X-SHA-256", &sha256)
+        .body(body.to_vec())
+        .send()
+        .await
+        .expect("file upload request")
 }
 
 fn blossom_auth_header(event: &nostr::Event) -> String {
@@ -50,7 +67,7 @@ async fn upload(client: &Client, keys: &Keys, body: &[u8]) -> reqwest::Response 
     let sha256 = hex::encode(Sha256::digest(body));
     let auth = sign_blossom_auth(keys, &sha256);
     client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(&auth))
         .header("X-SHA-256", &sha256)
         .body(body.to_vec())
@@ -137,7 +154,7 @@ async fn upload_with_auth(
     body: &[u8],
 ) -> reqwest::Response {
     client
-        .put(format!("{}/media/upload", relay_http_url()))
+        .put(format!("{}/media", relay_http_url()))
         .header("Authorization", blossom_auth_header(auth_event))
         .header("X-SHA-256", sha256)
         .body(body.to_vec())
@@ -166,7 +183,11 @@ async fn test_upload_png_roundtrip() {
         .await
         .unwrap();
     assert_eq!(get.status(), 200);
-    assert_eq!(get.bytes().await.unwrap().as_ref(), png.as_slice());
+    let returned = get.bytes().await.unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&returned)),
+        desc["sha256"].as_str().unwrap()
+    );
     println!("✅ PNG GET roundtrip verified");
 }
 
@@ -189,7 +210,11 @@ async fn test_upload_gif_roundtrip() {
         .await
         .unwrap();
     assert_eq!(get.status(), 200);
-    assert_eq!(get.bytes().await.unwrap().as_ref(), gif.as_slice());
+    let returned = get.bytes().await.unwrap();
+    assert_eq!(
+        hex::encode(Sha256::digest(&returned)),
+        desc["sha256"].as_str().unwrap()
+    );
     println!("✅ GIF GET roundtrip verified");
 }
 
@@ -223,7 +248,7 @@ async fn test_auth_wrong_kind() {
         27235,
         "Upload test",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
         ],
@@ -267,7 +292,7 @@ async fn test_auth_missing_expiration() {
         24242,
         "Upload test",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
         ],
     );
@@ -289,7 +314,7 @@ async fn test_auth_expired_token() {
         24242,
         "Upload test",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now - 60).to_string()]).unwrap(),
         ],
@@ -312,7 +337,7 @@ async fn test_auth_empty_content() {
         24242,
         "",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
         ],
@@ -335,7 +360,7 @@ async fn test_auth_server_tag_mismatch() {
         24242,
         "Upload test",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
             Tag::parse(["server", "evil.example.com"]).unwrap(),
@@ -359,7 +384,7 @@ async fn test_auth_server_tag_correct() {
         24242,
         "Upload test",
         vec![
-            Tag::parse(["t", "upload"]).unwrap(),
+            Tag::parse(["t", "media"]).unwrap(),
             Tag::parse(["x", &sha256]).unwrap(),
             Tag::parse(["expiration", &(now + 300).to_string()]).unwrap(),
             Tag::parse(["server", "localhost:3000"]).unwrap(),
@@ -378,7 +403,7 @@ async fn test_upload_svg_accepted_as_text_xml() {
     let client = http_client();
     let keys = Keys::generate();
     let svg = b"<?xml version=\"1.0\"?><svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
-    let resp = upload(&client, &keys, svg).await;
+    let resp = upload_file(&client, &keys, svg).await;
     let status = resp.status().as_u16();
     assert_eq!(
         status, 200,
@@ -397,7 +422,7 @@ async fn test_upload_pdf_accepted() {
     let client = http_client();
     let keys = Keys::generate();
     let pdf = b"%PDF-1.4 fake pdf content here for testing";
-    let resp = upload(&client, &keys, pdf).await;
+    let resp = upload_file(&client, &keys, pdf).await;
     let status = resp.status().as_u16();
     assert_eq!(
         status, 200,
@@ -415,7 +440,7 @@ async fn test_upload_zero_bytes_accepted() {
     // as application/octet-stream.
     let client = http_client();
     let keys = Keys::generate();
-    let resp = upload(&client, &keys, b"").await;
+    let resp = upload_file(&client, &keys, b"").await;
     let status = resp.status().as_u16();
     assert_eq!(
         status, 200,
@@ -435,7 +460,7 @@ async fn test_upload_random_bytes_accepted() {
     let client = http_client();
     let keys = Keys::generate();
     let random: Vec<u8> = (0..1000).map(|i| (i * 37 % 256) as u8).collect();
-    let resp = upload(&client, &keys, &random).await;
+    let resp = upload_file(&client, &keys, &random).await;
     let status = resp.status().as_u16();
     assert_eq!(
         status, 200,
@@ -444,6 +469,34 @@ async fn test_upload_random_bytes_accepted() {
     let desc: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(desc["type"].as_str().unwrap(), "application/octet-stream");
     println!("✅ Random bytes → 200 as octet-stream");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_standard_upload_rejects_media_bypass() {
+    let client = http_client();
+    let keys = Keys::generate();
+    let resp = upload_file(&client, &keys, &tiny_jpeg()).await;
+    assert_eq!(resp.status(), 415, "recognized media must use PUT /media");
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_legacy_media_upload_alias_sanitizes_with_upload_verb() {
+    let client = http_client();
+    let keys = Keys::generate();
+    let jpeg = tiny_jpeg();
+    let sha256 = hex::encode(Sha256::digest(&jpeg));
+    let auth = sign_blossom_auth_for_verb(&keys, &sha256, "upload");
+    let resp = client
+        .put(format!("{}/media/upload", relay_http_url()))
+        .header("Authorization", blossom_auth_header(&auth))
+        .header("X-SHA-256", &sha256)
+        .body(jpeg)
+        .send()
+        .await
+        .expect("legacy upload request");
+    assert_eq!(resp.status(), 200);
 }
 
 #[tokio::test]
