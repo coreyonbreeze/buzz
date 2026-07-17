@@ -26,16 +26,39 @@ const RELAY_MEDIA_RE =
 let cachedPort: number | null = null;
 let portPromise: Promise<number | null> | null = null;
 
-/** Cached relay origin (e.g. "https://buzz-oss.stage.blox.sqprod.co"). */
+/**
+ * Cached relay origin (e.g. "https://buzz-oss.stage.blox.sqprod.co"),
+ * canonicalized via {@link canonicalOrigin} so comparisons are stable.
+ */
 let cachedRelayOrigin: string | null = null;
 
 /**
- * Generation token for the relay-origin fetch. Bumped on every
- * `resetMediaCaches` (i.e. workspace switch) so an origin fetch started for
- * the previous community can never publish its stale origin after the switch:
- * only a resolution whose generation still matches the current one is applied.
+ * Canonicalize a URL to its origin with a lowercased scheme/host.
+ *
+ * The relay always emits media URLs with a lowercased tenant host
+ * (`normalize_host` in buzz-core), but the saved community relay URL keeps
+ * whatever casing the user typed (DNS is case-insensitive, so an uppercase
+ * host connects fine). A raw string comparison between the two misclassifies
+ * the relay's own media URLs as external and skips the authenticated proxy.
+ * `new URL().origin` lowercases scheme + host and drops default ports.
+ *
+ * Returns null for unparseable input.
  */
-let relayOriginGeneration = 0;
+function canonicalOrigin(url: string): string | null {
+  try {
+    return new URL(url).origin;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Monotonic cache generation, bumped on every `resetMediaCaches` (i.e.
+ * workspace switch). Async lookups capture the current generation and may
+ * only publish results while it is still current, so a lookup started for the
+ * previous community can never repopulate caches (port or origin) after reset.
+ */
+let cacheGeneration = 0;
 
 /** `useSyncExternalStore` listeners for relay-origin changes. */
 const relayOriginListeners = new Set<() => void>();
@@ -50,7 +73,7 @@ function notifyRelayOriginListeners(): void {
  * only on an actual snapshot change so `useSyncExternalStore` doesn't churn.
  */
 function setRelayOrigin(origin: string | null, generation: number): void {
-  if (generation !== relayOriginGeneration) return;
+  if (generation !== cacheGeneration) return;
   if (cachedRelayOrigin === origin) return;
   cachedRelayOrigin = origin;
   notifyRelayOriginListeners();
@@ -64,7 +87,7 @@ function setRelayOrigin(origin: string | null, generation: number): void {
  * community B. Callers invoke the returned function once the origin resolves.
  */
 export function beginRelayOriginFetch(): (origin: string | null) => void {
-  const generation = relayOriginGeneration;
+  const generation = cacheGeneration;
   return (origin) => setRelayOrigin(origin, generation);
 }
 
@@ -133,9 +156,13 @@ async function fetchProxyPort(): Promise<number | null> {
   // fire-and-forget attempt that fails before the bridge is up would leave the
   // origin unresolved forever, hiding relay Download eligibility. The publisher
   // captures the generation at each attempt so a resolution that lands after a
-  // workspace switch is discarded rather than publishing a stale origin.
+  // workspace switch is discarded rather than publishing a stale origin. The
+  // loop itself also captures the generation so a still-running poll from the
+  // previous community can neither keep spinning nor cache its stale port
+  // after a reset.
+  const generation = cacheGeneration;
   const deadline = Date.now() + POLL_TIMEOUT_MS;
-  while (Date.now() < deadline) {
+  while (Date.now() < deadline && generation === cacheGeneration) {
     if (!cachedRelayOrigin) {
       const publishRelayOrigin = beginRelayOriginFetch();
       try {
@@ -143,7 +170,7 @@ async function fetchProxyPort(): Promise<number | null> {
           invoke<string>("get_relay_http_url"),
           deadline,
         );
-        if (url !== null) publishRelayOrigin(url.replace(/\/+$/, ""));
+        if (url !== null) publishRelayOrigin(canonicalOrigin(url));
       } catch {
         // invoke failed (e.g. Tauri IPC not ready yet) — keep retrying
       }
@@ -155,7 +182,9 @@ async function fetchProxyPort(): Promise<number | null> {
           invoke<number>("get_media_proxy_port"),
           deadline,
         );
-        if (port !== null && port > 0) cachedPort = port;
+        if (port !== null && port > 0 && generation === cacheGeneration) {
+          cachedPort = port;
+        }
       } catch {
         // invoke failed (e.g. Tauri IPC not ready yet) — keep retrying
       }
@@ -192,9 +221,9 @@ if (typeof window !== "undefined") {
  * listeners).
  */
 export function resetMediaCaches(): void {
+  cacheGeneration += 1;
   cachedPort = null;
   portPromise = null;
-  relayOriginGeneration += 1;
   if (cachedRelayOrigin !== null) {
     cachedRelayOrigin = null;
     notifyRelayOriginListeners();
@@ -236,8 +265,14 @@ export function rewriteRelayUrl(url: string): string {
   // (different origin) pass through unchanged — they work fine via WKWebView.
   // If the relay origin isn't cached yet, fall through to the rewrite path
   // as a safe default (relay URLs need the proxy to avoid Cloudflare 403s).
-  if (cachedRelayOrigin && !url.startsWith(`${cachedRelayOrigin}/`)) {
-    return url;
+  // Compare canonicalized origins: hosts are case-insensitive, and the relay
+  // always returns lowercased media URLs even when the saved community URL
+  // was typed with uppercase (e.g. wss://PENDING-SEED.communities.buzz.xyz).
+  if (cachedRelayOrigin) {
+    const urlOrigin = canonicalOrigin(url);
+    if (urlOrigin !== cachedRelayOrigin) {
+      return url;
+    }
   }
 
   if (cachedPort && cachedPort > 0) {
