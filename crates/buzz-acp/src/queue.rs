@@ -289,6 +289,18 @@ pub struct FlushBatch {
     pub cancel_reason: Option<CancelReason>,
 }
 
+impl FlushBatch {
+    /// Whether any event in this batch — fresh or merged-cancelled — is a
+    /// restart-recovery replay. Gates the batch-level recovery header in
+    /// `format_prompt` (R5-F6): a mixed batch of recovered + live events
+    /// still needs per-event markers so the agent doesn't apply the
+    /// "may already be done" caveat to genuinely new work.
+    pub fn has_recovered_events(&self) -> bool {
+        self.events.iter().any(|be| be.restart_recovery)
+            || self.cancelled_events.iter().any(|be| be.restart_recovery)
+    }
+}
+
 /// Per-channel event queue with per-channel in-flight enforcement.
 ///
 /// # State Machine
@@ -2094,6 +2106,20 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         sections.push(format_conversation_context(ctx, args.profile_lookup));
     }
 
+    // 3b. Restart-recovery header (R5-F6). Scoped explicitly so a mixed
+    // batch (recovered backlog + fresh live event) isn't misread as "the
+    // whole batch may already be done" — only events individually marked
+    // `[restart recovery]` below carry that caveat.
+    if batch.has_recovered_events() {
+        sections.push(
+            "[Restart recovery] The app restarted while some of this work was pending; \
+             events below marked [restart recovery] may already have been answered. \
+             Re-read the thread first — skip any marked event whose reply already landed. \
+             All unmarked events are new work and must be handled regardless."
+                .to_string(),
+        );
+    }
+
     // 4. Cancelled + re-prompt framing. When a turn was cancelled to deliver
     //    new events mid-flight, the merged prompt is framed two ways depending
     //    on why it was cancelled (see [`CancelReason`]):
@@ -2108,9 +2134,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         let mut s = framing.prior_header.to_string();
         for (i, be) in batch.cancelled_events.iter().enumerate() {
             s.push_str(&format!(
-                "\n\n--- Event {} ({}) ---\n{}",
+                "\n\n--- Event {} ({}){} ---\n{}",
                 i + 1,
                 be.prompt_tag,
+                recovery_marker(be),
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             ));
         }
@@ -2122,15 +2149,17 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         let be = &batch.events[0];
         if has_cancelled {
             format!(
-                "{}\n\n--- Event 1 ({}) ---\n{}",
+                "{}\n\n--- Event 1 ({}){} ---\n{}",
                 framing.new_header_single,
                 be.prompt_tag,
+                recovery_marker(be),
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             )
         } else {
             format!(
-                "[Buzz event: {}]\n{}",
+                "[Buzz event: {}]{}\n{}",
                 be.prompt_tag,
+                recovery_marker(be),
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             )
         }
@@ -2147,9 +2176,10 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
         let mut s = header;
         for (i, be) in batch.events.iter().enumerate() {
             s.push_str(&format!(
-                "\n\n--- Event {} ({}) ---\n{}",
+                "\n\n--- Event {} ({}){} ---\n{}",
                 i + 1,
                 be.prompt_tag,
+                recovery_marker(be),
                 format_event_block(batch.channel_id, args.channel_info, be, args.profile_lookup)
             ));
         }
@@ -2163,6 +2193,18 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     }
 
     sections
+}
+
+/// Per-event provenance tag appended to an event's header line — `""` for
+/// live events, `" [restart recovery]"` for boot-recovered replays. Scoped
+/// per event (not per batch) so a mixed batch's fresh events are never
+/// mistaken for already-answered recovered ones (R5-F6).
+fn recovery_marker(be: &BatchEvent) -> &'static str {
+    if be.restart_recovery {
+        " [restart recovery]"
+    } else {
+        ""
+    }
 }
 
 /// Prompt-framing strings for a merged (cancel + re-prompt) turn, selected by
@@ -2491,6 +2533,145 @@ mod tests {
         assert!(prompt.contains("Event ID:"));
         // Should NOT contain "--- Event 1 ---" (that's the multi-event format).
         assert!(!prompt.contains("--- Event 1 ---"));
+    }
+
+    #[test]
+    fn test_format_prompt_recovered_single_event_gets_header_and_marker() {
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event: make_event("original request"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                admission_seq: 0,
+                enqueued_at_unix: 0,
+                restart_recovery: true,
+                cap_exempt: false,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+
+        assert!(
+            prompt.contains("[Restart recovery]"),
+            "recovered batch must carry the scoped header: {prompt}"
+        );
+        assert!(
+            prompt.contains("[Buzz event: @mention] [restart recovery]"),
+            "the single recovered event's header line must carry the marker: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_fresh_batch_has_no_recovery_header_or_marker() {
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event: make_event("Hello @agent"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                admission_seq: 0,
+                enqueued_at_unix: 0,
+                restart_recovery: false,
+                cap_exempt: false,
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+
+        assert!(!prompt.contains("[Restart recovery]"));
+        assert!(!prompt.contains("[restart recovery]"));
+    }
+
+    #[test]
+    fn test_format_prompt_mixed_batch_marks_only_recovered_event() {
+        // A recovered backlog event batched with a fresh live event: the
+        // header must appear (batch has at least one recovered event), but
+        // only the recovered event's header line carries the per-event
+        // marker — the live event must read as new, unambiguous work
+        // (R5-F6's scoped no-op rule).
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![
+                BatchEvent {
+                    event: make_event("recovered work"),
+                    prompt_tag: "@mention".into(),
+                    received_at: Instant::now(),
+                    admission_seq: 1,
+                    enqueued_at_unix: 100,
+                    restart_recovery: true,
+                    cap_exempt: false,
+                },
+                BatchEvent {
+                    event: make_event("fresh work"),
+                    prompt_tag: "@mention".into(),
+                    received_at: Instant::now(),
+                    admission_seq: 2,
+                    enqueued_at_unix: 200,
+                    restart_recovery: false,
+                    cap_exempt: false,
+                },
+            ],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+
+        assert!(prompt.contains("[Restart recovery]"), "{prompt}");
+        assert!(
+            prompt.contains("--- Event 1 (@mention) [restart recovery] ---"),
+            "recovered event must be marked: {prompt}"
+        );
+        assert!(
+            prompt.contains("--- Event 2 (@mention) ---"),
+            "fresh event must NOT be marked: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_format_prompt_recovered_marker_in_cancelled_section_only() {
+        // The cancelled (prior-work) half of a merge can independently carry
+        // recovery provenance even when the new event is fresh — the marker
+        // must appear in the cancelled section, not bleed into the new one.
+        let ch = Uuid::new_v4();
+        let batch = FlushBatch {
+            channel_id: ch,
+            events: vec![BatchEvent {
+                event: make_event("fresh follow-up"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                admission_seq: 2,
+                enqueued_at_unix: 200,
+                restart_recovery: false,
+                cap_exempt: false,
+            }],
+            cancelled_events: vec![BatchEvent {
+                event: make_event("recovered prior task"),
+                prompt_tag: "@mention".into(),
+                received_at: Instant::now(),
+                admission_seq: 1,
+                enqueued_at_unix: 100,
+                restart_recovery: true,
+                cap_exempt: false,
+            }],
+            cancel_reason: Some(CancelReason::Steer),
+        };
+        let prompt = format_prompt(&batch, &FormatPromptArgs::default()).join("\n\n");
+
+        assert!(prompt.contains("[Restart recovery]"), "{prompt}");
+        assert!(
+            prompt.contains("--- Event 1 (@mention) [restart recovery] ---\nEvent ID:"),
+            "cancelled/prior event must be marked: {prompt}"
+        );
+        assert!(
+            prompt.contains("--- Event 1 (@mention) ---\nEvent ID:"),
+            "the new event's own header (also numbered Event 1 in its own section) must NOT be marked: {prompt}"
+        );
     }
 
     /// Helper: build a merged (cancel + re-prompt) batch with one cancelled
@@ -5030,6 +5211,18 @@ mod tests {
         assert_eq!(
             slash_command_for_batch(&make_single_batch("@Eva hello"), &[]),
             None
+        );
+
+        // Recovered single-event slash command → no pass-through (must go
+        // through the wrapped-context path so the model sees the recovery
+        // header before any side effect fires — bare pass-through would
+        // re-execute a command that may have already run pre-restart).
+        let mut recovered = make_single_batch("@Eva /init");
+        recovered.events[0].restart_recovery = true;
+        assert_eq!(
+            slash_command_for_batch(&recovered, &[]),
+            None,
+            "recovered slash command must not pass through unwrapped"
         );
     }
 
