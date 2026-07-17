@@ -368,7 +368,15 @@ const overrides = new Map([
   ["src/features/settings/ui/ProfileSettingsCard.tsx", 1033],
   // keyring-dev-isolation: keyring_service() fn (7 lines) replaces the const
   // to return "buzz-desktop-dev" in debug builds. Load-bearing isolation fix.
-  ["src-tauri/src/app_state.rs", 1042],
+  // +10 (1042 -> 1052): media_fetch_client with redirect::Policy::none() so a
+  // relay 3xx cannot forward the minted auth header cross-origin (SSRF fix).
+  // +16 (1052 -> 1068): extracted that client into `build_media_fetch_client()`
+  // -> Result so the fail-closed invariant is testable (no silent redirect-
+  // following fallback; startup panics loudly instead). The function belongs
+  // here beside `build_app_state` and its sibling client; its doc comment
+  // carries the load-bearing SSRF rationale. Extraction would only relocate,
+  // not reduce, the security-critical code.
+  ["src-tauri/src/app_state.rs", 1068],
   // multi-slot splitting + no-op suppression (#1309): the ReadStateManager
   // class grew from ~700 lines to ~1019 with the addition of
   // splitContextsIntoBudgetedSlots (pure fn + 5 tests), publishSplitSlots,
@@ -396,7 +404,11 @@ const overrides = new Map([
   // large shared renderers cannot grow further while follow-up splits land.
   // +33 for config-nudge detect-and-render + author-auth gate (normalizePubkey guard).
   ["src/shared/ui/markdown.tsx", 2152],
-  ["src/shared/ui/VideoPlayer.tsx", 2199],
+  // +15 (2199 -> 2214): the video right-click Download/Copy menu's props,
+  // hook wiring, and render slot. The stateful menu logic (~52 lines) was
+  // extracted to useVideoContextMenu.tsx; what remains here is the component's
+  // public interface (downloadUrl/filename props) and cannot move out.
+  ["src/shared/ui/VideoPlayer.tsx", 2214],
   ["src/shared/ui/sidebar.tsx", 1042],
   // permission-outcome (fix #1381 regression): pendingPermissions state map,
   // describePermissionOutcome helper, jsonRpcId key helper (handles both
