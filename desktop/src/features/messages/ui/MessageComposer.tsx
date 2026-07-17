@@ -247,6 +247,8 @@ function MessageComposerImpl({
     channelId,
     loadDraft: drafts.loadDraft,
     persistDraft: drafts.persistDraft,
+    getMentionRefs: mentions.getDraftMentionRefs,
+    restoreMentionRefs: mentions.restoreDraftMentionRefs,
     livePendingImeta: media.pendingImeta,
     setPendingImeta: media.setPendingImeta,
     setContent: (content) => {
@@ -261,12 +263,10 @@ function MessageComposerImpl({
     spoileredAttachmentUrlsRef,
     syncComposerContentFromEditor,
   });
-
   // biome-ignore lint/correctness/useExhaustiveDependencies: effectiveDraftKey is the sole trigger
   React.useEffect(() => {
     media.setUploadState({ status: "idle" });
     setIsEmojiPickerOpen(false);
-    mentions.clearMentions();
     channelLinks.clearChannels();
     emojiAutocomplete.clearEmojis();
   }, [effectiveDraftKey]);
