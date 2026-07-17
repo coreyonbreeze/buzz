@@ -176,6 +176,59 @@ fn decrease_taints_only_the_affected_field() {
     assert!(matches!(outcome.output, FieldValue::Known(50)));
 }
 
+// ── Cost ladder (mirrors the token ladder tests above, f64-specific) ───────
+
+#[test]
+fn ladder_cost_direct_value_used_when_no_baseline() {
+    let r = AgentMetricIndexRow {
+        turn_cost_usd: Some(0.05),
+        delta_reliable: Some(true),
+        ..row("e1", "agent1", "s1", 1, 0)
+    };
+    let __probe_rows = [r.clone()];
+    let probes = probe_map(&__probe_rows);
+    let outcome = compute_event_outcome(&r, &probes);
+    assert!(matches!(outcome.cost, FieldValue::Known(v) if v == 0.05));
+}
+
+#[test]
+fn ladder_cost_adjacent_cumulative_preferred_over_direct() {
+    let prev = AgentMetricIndexRow {
+        cumulative_cost_usd: Some(1.0),
+        ..row("e0", "agent1", "s1", 1, 0)
+    };
+    let cur = AgentMetricIndexRow {
+        cumulative_cost_usd: Some(1.3),
+        turn_cost_usd: Some(999.0), // deliberately wrong direct value
+        delta_reliable: Some(true),
+        ..row("e1", "agent1", "s1", 2, 10)
+    };
+    let __probe_rows = [prev, cur.clone()];
+    let probes = probe_map(&__probe_rows);
+    let outcome = compute_event_outcome(&cur, &probes);
+    assert!(matches!(outcome.cost, FieldValue::Known(v) if (v - 0.3).abs() < f64::EPSILON));
+}
+
+#[test]
+fn ladder_cost_adjacent_decrease_is_unknown_not_direct() {
+    // A1 applies identically to the cost field: a decreasing cumulative
+    // pair is terminal-unknown even with a present direct value.
+    let prev = AgentMetricIndexRow {
+        cumulative_cost_usd: Some(5.0),
+        ..row("e0", "agent1", "s1", 1, 0)
+    };
+    let cur = AgentMetricIndexRow {
+        cumulative_cost_usd: Some(3.0), // decreased
+        turn_cost_usd: Some(1.0),       // present, but must NOT be used
+        delta_reliable: Some(true),
+        ..row("e1", "agent1", "s1", 2, 10)
+    };
+    let __probe_rows = [prev, cur.clone()];
+    let probes = probe_map(&__probe_rows);
+    let outcome = compute_event_outcome(&cur, &probes);
+    assert!(matches!(outcome.cost, FieldValue::Unknown));
+}
+
 // ── A4/A11: duplicate sequence quarantine ───────────────────────────────────
 
 #[test]
@@ -395,6 +448,24 @@ fn window_probe_keys_skips_rows_without_session_or_seq() {
     assert!(keys.is_empty());
 }
 
+// ── assign_bucket_index: boundary edges ─────────────────────────────────────
+
+#[test]
+fn assign_bucket_index_start_is_inclusive_end_is_exclusive() {
+    let boundaries = boundaries_7();
+    // Exactly on bucket 1's start boundary → bucket 1, not bucket 0.
+    assert_eq!(assign_bucket_index(&boundaries, DAY), Some(1));
+    // One second before bucket 1's start → still bucket 0 (end-exclusive).
+    assert_eq!(assign_bucket_index(&boundaries, DAY - 1), Some(0));
+}
+
+#[test]
+fn assign_bucket_index_returns_none_outside_every_bucket() {
+    let boundaries = boundaries_7();
+    assert_eq!(assign_bucket_index(&boundaries, -1), None);
+    assert_eq!(assign_bucket_index(&boundaries, boundaries[7]), None); // last boundary is exclusive end
+}
+
 // ── compute_series: bucketing, overflow, ranking, models ────────────────────
 
 #[test]
@@ -475,6 +546,27 @@ fn compute_series_ranks_known_total_before_unknown_total() {
     let series = compute_series(&rows, &rows, 0, &boundaries, None, true);
     assert_eq!(series.agents[0].agent_pubkey, "agent_known");
     assert_eq!(series.agents[1].agent_pubkey, "agent_unknown");
+}
+
+#[test]
+fn compute_series_ties_on_known_total_break_by_pubkey_ascending() {
+    // Equal totalTokens for two agents: the A2 tiebreak must be
+    // deterministic pubkey order, not insertion/hash order.
+    let agent_z = AgentMetricIndexRow {
+        turn_total_tokens: Some(100),
+        delta_reliable: Some(true),
+        ..row("e1", "agent_zzz", "s1", 1, 0)
+    };
+    let agent_a = AgentMetricIndexRow {
+        turn_total_tokens: Some(100),
+        delta_reliable: Some(true),
+        ..row("e2", "agent_aaa", "s1", 1, 0)
+    };
+    let boundaries = boundaries_7();
+    let rows = vec![agent_z, agent_a];
+    let series = compute_series(&rows, &rows, 0, &boundaries, None, true);
+    assert_eq!(series.agents[0].agent_pubkey, "agent_aaa");
+    assert_eq!(series.agents[1].agent_pubkey, "agent_zzz");
 }
 
 #[test]
@@ -564,6 +656,22 @@ fn validate_request_rejects_non_increasing_boundaries() {
 fn validate_request_rejects_interval_over_48h() {
     let mut b = boundaries_7();
     b[1] = b[0] + 49 * 3600;
+    assert!(validate_request(&req(b, None)).is_err());
+}
+
+#[test]
+fn validate_request_rejects_boundary_out_of_chrono_representable_range() {
+    // All 7 intervals stay well within the 48h band (exactly one day each)
+    // so only the finite-range check can be responsible for the rejection;
+    // the window is shifted to straddle chrono's actual max representable
+    // instant rather than a hardcoded guess.
+    let max_ts = chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp();
+    let base = max_ts - 6 * DAY;
+    let b: Vec<i64> = (0..=7).map(|i| base + i * DAY).collect();
+    assert!(
+        b[7] > max_ts,
+        "test setup must push the last boundary out of range"
+    );
     assert!(validate_request(&req(b, None)).is_err());
 }
 
