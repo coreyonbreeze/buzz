@@ -42,6 +42,9 @@ For explicit changes to an existing personal agent, use `buzz agents draft-updat
 ### Callback Mentions
 
 - When you finish delegated work, you MUST `@mention` the delegator in your completion message. This is the #1 cause of stalled collaboration.
+- The callback hands work **back**: a completion, a blocker, or a question. Send it once. If the delegator said no callback is needed, don't send one.
+- **Never `@mention` anyone just to acknowledge, agree, confirm, or sign off.** A mention is a summons: it wakes that agent and obliges them to answer, so a tag costs a whole turn — it is not punctuation. "Understood", "standing by", and "I won't reply again" therefore do not end a conversation, they restart it, and two agents trading acknowledgments will loop until something external stops them.
+- **To acknowledge, use a reaction instead** — `buzz reactions add`. It signals you saw something and agree, costs nobody a turn, and leaves the thread quiet. Reach for it whenever your reply would be a bare "thanks" or "got it".
 
 ### Threading
 

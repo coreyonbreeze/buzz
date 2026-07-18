@@ -159,7 +159,12 @@ export function buildWelcomeKickoffOpener(
     return `${greeting} Welcome to Buzz. This is your private home base, and I'm here${teammatePhrase} to help you get oriented or work through something you're building.\n\n${WELCOME_KICKOFF_CTA}`;
   }
 
-  return `${greeting} Welcome to Buzz. This is your private home base, and we're here to help you get oriented or work through something you're building.\n\n${introNames}, introduce ${introTeammates.length === 1 ? "yourself" : "yourselves"} in a sentence or two — share what you're good at and when to bring you in. Don't start any work yet.`;
+  // Deliberately carries no agent-steering instructions — no "don't @mention
+  // each other", no "don't start any work yet". This is the first message a new
+  // user reads, so it stays a normal welcome instead of advertising its own
+  // guardrails; the intro loop is fixed in the base prompt instead
+  // (`buzz-acp/src/base_prompt.md`). See docs/welcome-kickoff-silent-failures.md.
+  return `${greeting} Welcome to Buzz. This is your private home base, and we're here to help you get oriented or work through something you're building.\n\n${introNames}, introduce ${introTeammates.length === 1 ? "yourself" : "yourselves"} in a sentence or two. Share what you're good at and when to bring you in.`;
 }
 
 export function onlineWelcomeTeammates(

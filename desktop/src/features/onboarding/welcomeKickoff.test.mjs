@@ -51,7 +51,27 @@ test("opener uses current agent names and requests bounded simultaneous intros",
   assert.match(opener, /@Honeybee and @Bumble/);
   assert.doesNotMatch(opener, /@@/);
   assert.match(opener, /sentence or two/);
-  assert.match(opener, /Don't start any work yet/);
+});
+
+test("opener carries no agent-steering instructions", () => {
+  // The opener is the first message a new user reads: it should read as a normal
+  // welcome, not as prompt engineering. The intro loop is fixed in the base
+  // prompt (`buzz-acp/src/base_prompt.md`), not here. Re-adding an anti-loop
+  // instruction is a product decision, not a quick fix — see
+  // docs/welcome-kickoff-silent-failures.md.
+  const opener = buildWelcomeKickoffOpener(fizz, [honey, bumble]);
+
+  assert.doesNotMatch(opener, /@mention/i);
+  assert.doesNotMatch(opener, /don't start any work/i);
+});
+
+test("solo opener has no mentions to loop on", () => {
+  // No teammates online: nothing delegated, so there is no callback to waive
+  // and the opener must not mention an agent at all.
+  const opener = buildWelcomeKickoffOpener(fizz, [], [honey, bumble], "morgan");
+
+  assert.match(opener, /Hi @morgan/);
+  assert.doesNotMatch(opener, /@Honey|@Bumble/);
 });
 
 test("teammates are not ready until every harness publishes online presence", () => {
