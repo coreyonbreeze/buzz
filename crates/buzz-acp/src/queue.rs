@@ -293,40 +293,13 @@ impl EventQueue {
                     .keys()
                     .find(|id| !self.in_flight_channels.contains(id))
                     .copied();
-                match cancelled_id {
-                    Some(id) => {
-                        // No new events to merge — re-dispatch the oldest cancelled
-                        // batch unchanged under its original conversation root.
-                        let cancelled = self
-                            .cancelled_batches
-                            .get_mut(&id)
-                            .and_then(VecDeque::pop_front)
-                            .expect("cancelled channel must have a batch");
-                        if self
-                            .cancelled_batches
-                            .get(&id)
-                            .is_some_and(VecDeque::is_empty)
-                        {
-                            self.cancelled_batches.remove(&id);
-                        }
-                        self.in_flight_channels.insert(id);
-                        self.in_flight_deadlines
-                            .insert(id, now + self.in_flight_deadline);
-                        self.in_flight_batch_sizes
-                            .insert(id, cancelled.events.len());
-                        return Some(FlushBatch {
-                            channel_id: id,
-                            conversation_root: cancelled.conversation_root,
-                            events: cancelled.events,
-                            cancelled_events: vec![],
-                            cancel_reason: Some(cancelled.reason),
-                        });
-                    }
-                    None => return None,
-                }
+                return cancelled_id.map(|id| self.dispatch_cancelled(id, now));
             }
         };
 
+        // Re-dispatch a cancelled batch whose conversation root differs from
+        // the queued head before starting the queued work — its root was
+        // interrupted first and must not merge into another root's turn.
         let queued_root = self
             .queues
             .get(&channel_id)
@@ -336,32 +309,9 @@ impl EventQueue {
             .cancelled_batches
             .get(&channel_id)
             .and_then(|batches| batches.front())
-            .and_then(|batch| batch.conversation_root.clone());
-        if self.cancelled_batches.contains_key(&channel_id) && cancelled_root != queued_root {
-            let cancelled = self
-                .cancelled_batches
-                .get_mut(&channel_id)
-                .and_then(VecDeque::pop_front)
-                .expect("cancelled channel must have a batch");
-            if self
-                .cancelled_batches
-                .get(&channel_id)
-                .is_some_and(VecDeque::is_empty)
-            {
-                self.cancelled_batches.remove(&channel_id);
-            }
-            self.in_flight_channels.insert(channel_id);
-            self.in_flight_deadlines
-                .insert(channel_id, now + self.in_flight_deadline);
-            self.in_flight_batch_sizes
-                .insert(channel_id, cancelled.events.len());
-            return Some(FlushBatch {
-                channel_id,
-                conversation_root: cancelled.conversation_root,
-                events: cancelled.events,
-                cancelled_events: vec![],
-                cancel_reason: Some(cancelled.reason),
-            });
+            .map(|batch| batch.conversation_root.clone());
+        if cancelled_root.is_some_and(|root| root != queued_root) {
+            return Some(self.dispatch_cancelled(channel_id, now));
         }
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
@@ -401,18 +351,7 @@ impl EventQueue {
         self.in_flight_batch_sizes.insert(channel_id, events.len());
 
         // Merge only a cancelled batch for the same conversation root.
-        let cancelled = self
-            .cancelled_batches
-            .get_mut(&channel_id)
-            .and_then(VecDeque::pop_front);
-        if self
-            .cancelled_batches
-            .get(&channel_id)
-            .is_some_and(VecDeque::is_empty)
-        {
-            self.cancelled_batches.remove(&channel_id);
-        }
-        let (cancelled_events, cancel_reason) = cancelled.map_or_else(
+        let (cancelled_events, cancel_reason) = self.pop_cancelled(channel_id).map_or_else(
             || (vec![], None),
             |batch| (batch.events, Some(batch.reason)),
         );
@@ -424,6 +363,37 @@ impl EventQueue {
             cancelled_events,
             cancel_reason,
         })
+    }
+
+    /// Pop the oldest cancelled batch for `channel_id`, dropping the map entry
+    /// once its queue is empty. `None` if the channel has no cancelled batches.
+    fn pop_cancelled(&mut self, channel_id: Uuid) -> Option<CancelledBatch> {
+        let batches = self.cancelled_batches.get_mut(&channel_id)?;
+        let cancelled = batches.pop_front();
+        if batches.is_empty() {
+            self.cancelled_batches.remove(&channel_id);
+        }
+        cancelled
+    }
+
+    /// Re-dispatch the oldest cancelled batch for `channel_id` unchanged under
+    /// its original conversation root, marking the channel in-flight.
+    fn dispatch_cancelled(&mut self, channel_id: Uuid, now: Instant) -> FlushBatch {
+        let cancelled = self
+            .pop_cancelled(channel_id)
+            .expect("cancelled channel must have a batch");
+        self.in_flight_channels.insert(channel_id);
+        self.in_flight_deadlines
+            .insert(channel_id, now + self.in_flight_deadline);
+        self.in_flight_batch_sizes
+            .insert(channel_id, cancelled.events.len());
+        FlushBatch {
+            channel_id,
+            conversation_root: cancelled.conversation_root,
+            events: cancelled.events,
+            cancelled_events: vec![],
+            cancel_reason: Some(cancelled.reason),
+        }
     }
 
     /// Mark the prompt for `channel_id` as complete.

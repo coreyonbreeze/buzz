@@ -555,8 +555,6 @@ pub struct PromptContext {
     /// `[Agent Memory — core]` section. On by default; disabled via
     /// `--no-memory` / `BUZZ_ACP_NO_MEMORY`.
     pub memory_enabled: bool,
-    /// Whether ACP sessions are isolated by human conversation root.
-    pub top_level_sessions: bool,
     /// Harness identity string for NIP-AM `harness` field. Derived from the
     /// configured `agent_command` at startup (e.g. `"goose"`, `"buzz-agent"`).
     pub harness_name: String,
@@ -595,20 +593,11 @@ impl AgentPool {
         // wait rather than creating a duplicate provider session in another slot.
         if let Some(key) = session_key {
             if key.root_event_id.is_some() {
+                self.prune_session_owners();
                 if let Some(&owner) = self.session_owners.get(key) {
-                    let owner_busy = self.task_map.values().any(|meta| meta.agent_index == owner);
-                    let owner_retains_session = self
-                        .agents
-                        .get(owner)
-                        .and_then(Option::as_ref)
-                        .is_some_and(|agent| agent.state.contains_session(key));
-                    if owner_busy || owner_retains_session {
-                        return self.agents.get_mut(owner).and_then(Option::take);
-                    }
-                    // The slot died, was replaced, or evicted/invalidated this
-                    // root while idle. Drop the stale reservation so a live
-                    // slot can recreate the provider session.
-                    self.session_owners.remove(key);
+                    // Surviving the prune means the owner is busy (wait by
+                    // returning None) or idle and retaining the session.
+                    return self.agents.get_mut(owner).and_then(Option::take);
                 }
             }
             let idx = self.agents.iter().position(|slot| {
@@ -631,6 +620,23 @@ impl AgentPool {
         self.agents[idx].take()
     }
 
+    /// Drop root reservations that no longer bind: the owning slot is neither
+    /// busy (checked out on a task) nor idle-retaining the session. Runs before
+    /// every reservation read, so slot death, replacement, LRU eviction, and
+    /// channel invalidation all converge here instead of requiring explicit
+    /// cleanup calls at each lifecycle site.
+    fn prune_session_owners(&mut self) {
+        let agents = &self.agents;
+        let task_map = &self.task_map;
+        self.session_owners.retain(|key, owner| {
+            task_map.values().any(|meta| meta.agent_index == *owner)
+                || agents
+                    .get(*owner)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|agent| agent.state.contains_session(key))
+        });
+    }
+
     /// Return an agent to its slot after a task completes.
     pub fn return_agent(&mut self, agent: OwnedAgent) {
         let idx = agent.index;
@@ -644,11 +650,6 @@ impl AgentPool {
                 "BUG: return_agent called for slot {idx} which is already occupied — overwriting"
             );
         }
-        // Reconcile reservations whenever a slot returns. This clears roots
-        // evicted by the per-slot LRU, explicitly invalidated while checked
-        // out, or lost when a dead slot is replaced.
-        self.session_owners
-            .retain(|key, owner| *owner != idx || agent.state.contains_session(key));
         self.agents[idx] = Some(agent);
     }
 
@@ -759,14 +760,6 @@ impl AgentPool {
         &mut self.agents
     }
 
-    /// Remove every root reservation owned by a slot that died or is about to
-    /// be replaced. Returns the number removed for diagnostics and tests.
-    pub fn clear_slot_session_owners(&mut self, index: usize) -> usize {
-        let before = self.session_owners.len();
-        self.session_owners.retain(|_, owner| *owner != index);
-        before - self.session_owners.len()
-    }
-
     /// Remove the session for `channel_id` from all idle agents.
     ///
     /// Called when the agent is removed from a channel — stale sessions
@@ -784,8 +777,8 @@ impl AgentPool {
                 }
             }
         }
-        self.session_owners
-            .retain(|key, _| key.channel_id != channel_id);
+        // Freed root reservations are dropped lazily by prune_session_owners
+        // on the next root claim.
         count
     }
 
@@ -841,33 +834,24 @@ impl AgentPool {
             agent.model_overridden = true;
             agent.state.invalidate_channel(&channel_id);
         }
-        self.session_owners
-            .retain(|key, _| key.channel_id != channel_id);
+        // Freed reservations are dropped lazily by prune_session_owners on the
+        // next root claim.
         IdleSwitchResult::Switched
     }
 
     /// Apply a busy channel model switch to every currently idle slot retaining
     /// another root for that channel. The checked-out owner receives the
-    /// control signal separately and invalidates its own channel state.
+    /// control signal separately and invalidates its own channel state; its
+    /// reservation survives pruning (busy), so a reply arriving during
+    /// cancellation still waits for it instead of falling through.
     pub fn switch_other_idle_channel_roots(&mut self, channel_id: Uuid, model_id: &str) {
-        let mut invalidated_slots = Vec::new();
-        for (index, agent) in self.agents.iter_mut().enumerate() {
-            let Some(agent) = agent.as_mut() else {
-                continue;
-            };
+        for agent in self.agents.iter_mut().flatten() {
             if agent.state.has_channel_state(&channel_id) {
                 agent.desired_model = Some(model_id.to_string());
                 agent.model_overridden = true;
                 agent.state.invalidate_channel(&channel_id);
-                invalidated_slots.push(index);
             }
         }
-        // Preserve the checked-out root owner's reservation until that task
-        // returns with its own channel state invalidated. Otherwise a reply
-        // arriving during cancellation could fall through to an idle slot.
-        self.session_owners.retain(|key, owner| {
-            key.channel_id != channel_id || !invalidated_slots.contains(owner)
-        });
     }
 }
 
@@ -1356,24 +1340,13 @@ fn send_prompt_result(
     });
 }
 
-pub(crate) fn conversation_session_key(
-    batch: &FlushBatch,
-    top_level_sessions: bool,
-) -> ConversationSessionKey {
-    let root_event_id = top_level_sessions
-        .then(|| {
-            batch.conversation_root.clone().or_else(|| {
-                batch.events.last().map(|event| {
-                    crate::queue::parse_thread_tags(&event.event)
-                        .root_event_id
-                        .unwrap_or_else(|| event.event.id.to_hex())
-                })
-            })
-        })
-        .flatten();
+/// Session identity for a batch. `FlushBatch::conversation_root` is populated
+/// at queue-push time only when the top-level-sessions experiment is enabled,
+/// so this is purely data-driven: no root means the legacy channel-scoped key.
+pub(crate) fn conversation_session_key(batch: &FlushBatch) -> ConversationSessionKey {
     ConversationSessionKey {
         channel_id: batch.channel_id,
-        root_event_id,
+        root_event_id: batch.conversation_root.clone(),
     }
 }
 
@@ -1400,7 +1373,7 @@ pub async fn run_prompt_task(
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
-        Some(b) => PromptSource::Channel(conversation_session_key(b, ctx.top_level_sessions)),
+        Some(b) => PromptSource::Channel(conversation_session_key(b)),
         None => PromptSource::Heartbeat,
     };
     let observer_channel_id = match &source {
@@ -2679,7 +2652,8 @@ async fn fetch_conversation_context(
 
     // Experiment: seed only a fresh top-level conversation. Replies use their
     // thread context, and existing sessions already carry their own history.
-    if ctx.top_level_sessions && is_new_session {
+    // `conversation_root` is only ever set when the experiment is enabled.
+    if batch.conversation_root.is_some() && is_new_session {
         let triggering_ids: HashSet<String> = batch
             .events
             .iter()
@@ -4581,18 +4555,18 @@ mod tests {
     }
 
     #[test]
-    fn test_conversation_session_key_is_channel_scoped_when_disabled() {
+    fn test_conversation_session_key_is_channel_scoped_without_root() {
         let batch = one_event_batch(Uuid::new_v4());
-        let key = conversation_session_key(&batch, false);
+        let key = conversation_session_key(&batch);
         assert_eq!(key.channel_id, batch.channel_id);
         assert_eq!(key.root_event_id, None);
     }
 
     #[test]
-    fn test_conversation_session_key_uses_explicit_root_when_enabled() {
+    fn test_conversation_session_key_uses_batch_root_when_present() {
         let mut batch = one_event_batch(Uuid::new_v4());
         batch.conversation_root = Some("root-a".into());
-        let key = conversation_session_key(&batch, true);
+        let key = conversation_session_key(&batch);
         assert_eq!(key.channel_id, batch.channel_id);
         assert_eq!(key.root_event_id.as_deref(), Some("root-a"));
     }
@@ -5827,7 +5801,6 @@ mod tests {
             agent_owner_pubkey: owner_pubkey,
             memory_enabled: false,
             harness_name: "goose".to_string(),
-            top_level_sessions: false,
         }
     }
 

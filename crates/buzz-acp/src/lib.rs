@@ -1475,7 +1475,6 @@ async fn tokio_main() -> Result<()> {
             .as_deref()
             .and_then(|hex| nostr::PublicKey::from_hex(hex).ok()),
         memory_enabled: config.memory_enabled,
-        top_level_sessions: config.top_level_sessions,
         harness_name: crate::config::normalize_agent_command_identity(&config.agent_command),
     });
 
@@ -1633,7 +1632,6 @@ async fn tokio_main() -> Result<()> {
                 if !slot.can_refill() {
                     continue;
                 }
-                pool.clear_slot_session_owners(idx);
                 slot.respawn_in_flight = true;
                 tracing::info!(agent = idx, "slot refill: spawning background respawn");
                 let cmd = config.agent_command.clone();
@@ -2670,7 +2668,7 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let session_key = pool::conversation_session_key(&batch, ctx.top_level_sessions);
+        let session_key = pool::conversation_session_key(&batch);
         let affinity_hit = pool.has_session_for(&session_key);
         let mut agent = match pool.try_claim(Some(&session_key)) {
             Some(a) => a,
@@ -2953,7 +2951,6 @@ fn handle_prompt_result(
             emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
-            pool.clear_slot_session_owners(index);
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
                 result.agent,
@@ -2994,7 +2991,6 @@ fn handle_prompt_result(
             emit_turn_error(&death_message, None);
 
             let index = result.agent.index;
-            pool.clear_slot_session_owners(index);
             let slot_history = &mut crash_history[index];
             if !spawn_respawn_task(
                 result.agent,
@@ -3060,7 +3056,6 @@ fn handle_prompt_result(
                 emit_turn_error(&e.to_string(), error_code);
 
                 let index = result.agent.index;
-                pool.clear_slot_session_owners(index);
                 let slot_history = &mut crash_history[index];
                 if !spawn_respawn_task(
                     result.agent,
@@ -3112,7 +3107,6 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
-    pool.clear_slot_session_owners(i);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -4502,8 +4496,12 @@ mod error_outcome_emission_tests {
             pool.return_agent(owner);
         }
         pool.agents_mut()[0] = None;
-        assert_eq!(pool.clear_slot_session_owners(0), 2);
-        assert_eq!(pool.try_claim(Some(&keys[0])).unwrap().index, 1);
+        // Every reservation owned by the dead slot is pruned lazily on the
+        // next claim; both roots recreate on the surviving slot.
+        let first_claim = pool.try_claim(Some(&keys[0])).unwrap();
+        assert_eq!(first_claim.index, 1);
+        pool.return_agent(first_claim);
+        assert_eq!(pool.try_claim(Some(&keys[1])).unwrap().index, 1);
     }
 
     #[tokio::test]
