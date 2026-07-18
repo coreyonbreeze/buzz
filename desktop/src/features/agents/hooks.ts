@@ -3,6 +3,13 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import { hasRunningAgentInCommunity } from "@/features/agents/agentRelayScope";
 import {
+  invalidateAgentQueriesInBackground,
+  invalidateManagedAgentQueriesInBackground,
+  isCachedDmChannel,
+  managedAgentsQueryKey,
+  relayAgentsQueryKey,
+} from "@/features/agents/agentQueryInvalidation";
+import {
   connectAcpRuntime,
   discoverAcpAuthMethods,
 } from "@/shared/api/tauriAgentAuth";
@@ -102,8 +109,10 @@ export type {
   ProvisionChannelManagedAgentResult,
 } from "@/features/agents/channelAgents";
 
-export const relayAgentsQueryKey = ["relay-agents"] as const;
-export const managedAgentsQueryKey = ["managed-agents"] as const;
+export {
+  managedAgentsQueryKey,
+  relayAgentsQueryKey,
+} from "@/features/agents/agentQueryInvalidation";
 export const personasQueryKey = ["personas"] as const;
 export const teamsQueryKey = ["teams"] as const;
 export const acpRuntimesQueryKey = ["acp-runtimes"] as const;
@@ -111,76 +120,6 @@ export const acpAuthMethodsQueryKey = ["acp-auth-methods"] as const;
 export const managedAgentPrereqsQueryKey = ["managed-agent-prereqs"] as const;
 export const backendProvidersQueryKey = ["backend-providers"] as const;
 export const gitBashPrerequisiteQueryKey = ["git-bash-prerequisite"] as const;
-
-type InvalidateAgentQueriesOptions = {
-  refetchChannels?: boolean;
-};
-
-async function invalidateAgentQueries(
-  queryClient: ReturnType<typeof useQueryClient>,
-  channelId: string | null,
-  options: InvalidateAgentQueriesOptions = {},
-) {
-  await Promise.all([
-    queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-    queryClient.invalidateQueries({ queryKey: relayAgentsQueryKey }),
-    queryClient.invalidateQueries({
-      queryKey: channelsQueryKey,
-      refetchType: options.refetchChannels === false ? "none" : "active",
-    }),
-    ...(channelId
-      ? [
-          queryClient.invalidateQueries({
-            queryKey: ["channels", channelId, "members"],
-          }),
-        ]
-      : []),
-  ]);
-}
-
-function refreshAgentQueriesInBackground(task: () => Promise<unknown>) {
-  void task().catch((error) => {
-    console.error("Failed to refresh agent queries", error);
-  });
-}
-
-function invalidateAgentQueriesInBackground(
-  queryClient: ReturnType<typeof useQueryClient>,
-  channelId: string | null,
-  options?: InvalidateAgentQueriesOptions,
-) {
-  refreshAgentQueriesInBackground(() =>
-    invalidateAgentQueries(queryClient, channelId, options),
-  );
-}
-
-function isCachedDmChannel(
-  queryClient: ReturnType<typeof useQueryClient>,
-  channelId: string | null,
-) {
-  if (!channelId) {
-    return false;
-  }
-
-  return Boolean(
-    queryClient
-      .getQueryData<Channel[]>(channelsQueryKey)
-      ?.some(
-        (channel) => channel.id === channelId && channel.channelType === "dm",
-      ),
-  );
-}
-
-function invalidateManagedAgentQueriesInBackground(
-  queryClient: ReturnType<typeof useQueryClient>,
-) {
-  refreshAgentQueriesInBackground(() =>
-    Promise.all([
-      queryClient.invalidateQueries({ queryKey: managedAgentsQueryKey }),
-      queryClient.invalidateQueries({ queryKey: relayAgentsQueryKey }),
-    ]),
-  );
-}
 
 export function useAcpRuntimesQuery(options?: { enabled?: boolean }) {
   return useQuery({
