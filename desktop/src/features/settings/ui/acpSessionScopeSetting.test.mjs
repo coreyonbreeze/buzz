@@ -24,10 +24,15 @@ function harness(overrides = {}) {
     calls,
     deps: {
       setBackend: async (scope) => calls.push(["backend", scope]),
+      getBackend: async () => {
+        calls.push(["read-backend"]);
+        return "thread";
+      },
       listAgents: async () => [localRunning, remoteRunning, localStopped],
       stopAgent: async (pubkey) => calls.push(["stop", pubkey]),
       startAgent: async (pubkey) => calls.push(["start", pubkey]),
       setUi: (enabled) => calls.push(["ui", enabled]),
+      onUnrecoverable: () => calls.push(["unrecoverable"]),
       ...overrides,
     },
   };
@@ -129,5 +134,82 @@ describe("ACP session scope setting", () => {
       ["ui", false],
     ]);
     assert.equal(secondStarts, 2);
+  });
+
+  it("reconciles UI and processes to the re-read authoritative scope when rollback persistence fails", async () => {
+    let backendCalls = 0;
+    const { calls, deps } = harness({
+      setBackend: async (scope) => {
+        calls.push(["backend", scope]);
+        backendCalls += 1;
+        if (backendCalls === 1) return; // apply write succeeds (thread persisted)
+        throw new Error("rollback persist failed");
+      },
+      startAgent: async (pubkey) => {
+        calls.push(["start", pubkey]);
+        if (calls.filter((c) => c[0] === "start").length === 1)
+          throw new Error("restart failed");
+      },
+      // Authoritative backend remains the NEW value (thread): the apply
+      // write landed and the rollback write failed.
+      getBackend: async () => {
+        calls.push(["read-backend"]);
+        return "thread";
+      },
+    });
+    await assert.rejects(
+      applyAcpSessionScopeSetting(false, true, deps),
+      /restart failed/,
+    );
+    // UI must land on the actual persisted scope (thread), never the
+    // assumed previous (channel), and processes reconcile after the read.
+    const readIndex = calls.findIndex((c) => c[0] === "read-backend");
+    const uiIndex = calls.findIndex((c) => c[0] === "ui");
+    assert.notEqual(readIndex, -1);
+    assert.deepEqual(calls[uiIndex], ["ui", true]);
+    assert.ok(readIndex < uiIndex, "authority read must precede UI commit");
+    const restartsAfterRead = calls
+      .slice(readIndex)
+      .filter((c) => c[0] === "stop" || c[0] === "start");
+    assert.deepEqual(restartsAfterRead, [
+      ["stop", "local"],
+      ["start", "local"],
+    ]);
+    assert.ok(!calls.some((c) => c[0] === "unrecoverable"));
+  });
+
+  it("surfaces hard recovery and touches nothing when rollback and authority read both fail", async () => {
+    let backendCalls = 0;
+    const { calls, deps } = harness({
+      setBackend: async (scope) => {
+        calls.push(["backend", scope]);
+        backendCalls += 1;
+        if (backendCalls === 1) return;
+        throw new Error("rollback persist failed");
+      },
+      startAgent: async (pubkey) => {
+        calls.push(["start", pubkey]);
+        if (calls.filter((c) => c[0] === "start").length === 1)
+          throw new Error("restart failed");
+      },
+      getBackend: async () => {
+        calls.push(["read-backend"]);
+        throw new Error("authority unreadable");
+      },
+    });
+    await assert.rejects(
+      applyAcpSessionScopeSetting(false, true, deps),
+      /restart failed/,
+    );
+    assert.ok(calls.some((c) => c[0] === "unrecoverable"));
+    // No UI claim and no process restarts under an unknown scope.
+    const readIndex = calls.findIndex((c) => c[0] === "read-backend");
+    assert.ok(!calls.some((c) => c[0] === "ui"));
+    assert.deepEqual(
+      calls
+        .slice(readIndex + 1)
+        .filter((c) => c[0] === "stop" || c[0] === "start"),
+      [],
+    );
   });
 });

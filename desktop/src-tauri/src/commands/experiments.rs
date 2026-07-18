@@ -43,6 +43,9 @@ struct DesktopSettings {
     // have had a release cycle to persist `acp_session_scope`.
     #[serde(skip_serializing)]
     acp_top_level_sessions: Option<bool>,
+    // Fields owned by other features must survive our writes untouched.
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl DesktopSettings {
@@ -97,10 +100,8 @@ fn save_settings(path: &Path, settings: &DesktopSettings) -> Result<(), String> 
 
 pub(crate) fn acp_session_scope(app: &AppHandle) -> AcpSessionScope {
     HYDRATE.call_once(
-        || match settings_path(app).and_then(|path| load_settings(&path)) {
-            Ok(settings) => {
-                ACP_SESSION_SCOPE.store(settings.session_scope().atomic_value(), Ordering::Release)
-            }
+        || match settings_path(app).and_then(|path| hydrate_scope(&path)) {
+            Ok(scope) => ACP_SESSION_SCOPE.store(scope.atomic_value(), Ordering::Release),
             Err(error) => {
                 eprintln!("buzz-desktop: failed to hydrate desktop settings: {error}");
             }
@@ -110,6 +111,29 @@ pub(crate) fn acp_session_scope(app: &AppHandle) -> AcpSessionScope {
         CHANNEL_SCOPE => AcpSessionScope::Channel,
         _ => AcpSessionScope::Thread,
     }
+}
+
+/// Load the persisted scope, materializing an explicit legacy override into
+/// the durable `acp_session_scope` field so the compatibility reader can be
+/// removed without flipping untouched legacy installs to the default.
+///
+/// The ordinary no-field default is deliberately NOT written: unset must stay
+/// distinguishable from a user/legacy override. A failed materialization
+/// write keeps the translated scope in memory and leaves the legacy field on
+/// disk, so the next launch retries — no divergence, no corruption.
+fn hydrate_scope(path: &Path) -> Result<AcpSessionScope, String> {
+    let mut settings = load_settings(path)?;
+    let scope = settings.session_scope();
+    if settings.acp_session_scope.is_none() && settings.acp_top_level_sessions.is_some() {
+        settings.acp_session_scope = Some(scope);
+        if let Err(error) = save_settings(path, &settings) {
+            eprintln!(
+                "buzz-desktop: failed to materialize legacy ACP session scope \
+                 (kept in memory; legacy field retained on disk for retry): {error}"
+            );
+        }
+    }
+    Ok(scope)
 }
 
 #[tauri::command]
@@ -130,7 +154,7 @@ pub fn set_acp_session_scope(scope: AcpSessionScope, app: AppHandle) -> Result<(
 
 #[cfg(test)]
 mod tests {
-    use super::{load_settings, save_settings, AcpSessionScope, DesktopSettings};
+    use super::{hydrate_scope, load_settings, save_settings, AcpSessionScope, DesktopSettings};
 
     #[test]
     fn missing_store_defaults_to_thread_scope() {
@@ -148,6 +172,7 @@ mod tests {
             &DesktopSettings {
                 acp_session_scope: Some(AcpSessionScope::Channel),
                 acp_top_level_sessions: None,
+                extra: Default::default(),
             },
         )
         .unwrap();
@@ -174,5 +199,114 @@ mod tests {
         let path = dir.path().join("desktop-experiments.json");
         std::fs::write(&path, b"not json").unwrap();
         assert!(load_settings(&path).is_err());
+    }
+
+    #[test]
+    fn hydration_materializes_legacy_opt_out_as_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(&path, br#"{"acp_top_level_sessions":false}"#).unwrap();
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["acp_session_scope"], "channel");
+        assert!(persisted.get("acp_top_level_sessions").is_none());
+        // Restart: the durable field alone must reproduce the override.
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
+    }
+
+    #[test]
+    fn hydration_materializes_legacy_opt_in_as_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(&path, br#"{"acp_top_level_sessions":true}"#).unwrap();
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Thread);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["acp_session_scope"], "thread");
+        assert!(persisted.get("acp_top_level_sessions").is_none());
+    }
+
+    #[test]
+    fn hydration_never_materializes_the_bare_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(&path, br#"{"other_feature":1}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Thread);
+        // Unset must remain distinguishable from an override: no write.
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        // Nor is a missing store created.
+        let missing = dir.path().join("missing.json");
+        assert_eq!(hydrate_scope(&missing).unwrap(), AcpSessionScope::Thread);
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn explicit_new_field_wins_over_legacy_and_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(
+            &path,
+            br#"{"acp_session_scope":"channel","acp_top_level_sessions":true}"#,
+        )
+        .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn materialization_preserves_unrelated_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(
+            &path,
+            br#"{"acp_top_level_sessions":false,"other_feature":{"nested":true},"count":3}"#,
+        )
+        .unwrap();
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["acp_session_scope"], "channel");
+        assert_eq!(persisted["other_feature"]["nested"], true);
+        assert_eq!(persisted["count"], 3);
+    }
+
+    #[test]
+    fn save_preserves_unrelated_fields_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        std::fs::write(
+            &path,
+            br#"{"acp_session_scope":"thread","other_feature":"keep-me"}"#,
+        )
+        .unwrap();
+        let mut settings = load_settings(&path).unwrap();
+        settings.acp_session_scope = Some(AcpSessionScope::Channel);
+        save_settings(&path, &settings).unwrap();
+        let persisted: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["acp_session_scope"], "channel");
+        assert_eq!(persisted["other_feature"], "keep-me");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_materialization_keeps_translated_scope_and_legacy_field() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("desktop-experiments.json");
+        let legacy = br#"{"acp_top_level_sessions":false}"#;
+        std::fs::write(&path, legacy).unwrap();
+        // Read-only directory: the atomic temp-file write must fail.
+        let readonly = std::fs::Permissions::from_mode(0o555);
+        std::fs::set_permissions(dir.path(), readonly).unwrap();
+        // In memory: translated override. On disk: legacy field untouched,
+        // so the next launch retries the materialization. No divergence.
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), legacy);
+        assert_eq!(hydrate_scope(&path).unwrap(), AcpSessionScope::Channel);
     }
 }

@@ -13,6 +13,7 @@ type SessionScope = "thread" | "channel";
 export function AcpSessionScopeSettingsCard() {
   const [scope, setScope] = useState<SessionScope>("thread");
   const [pending, setPending] = useState(true);
+  const [unrecoverable, setUnrecoverable] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -37,10 +38,12 @@ export function AcpSessionScopeSettingsCard() {
       await applyAcpSessionScopeSetting(scope === "thread", threadScoped, {
         setBackend: (next) =>
           invokeTauri("set_acp_session_scope", { scope: next }),
+        getBackend: () => invokeTauri<SessionScope>("get_acp_session_scope"),
         listAgents: listManagedAgents,
         stopAgent: stopManagedAgent,
         startAgent: startManagedAgent,
         setUi: (enabled) => setScope(enabled ? "thread" : "channel"),
+        onUnrecoverable: () => setUnrecoverable(true),
       });
     } catch (error) {
       console.error("Failed to apply ACP session scope", error);
@@ -64,12 +67,21 @@ export function AcpSessionScopeSettingsCard() {
             Run separate threads concurrently. Turn this off for one legacy
             session per channel.
           </p>
+          {unrecoverable && (
+            <p
+              className="text-xs text-destructive"
+              data-testid="acp-session-scope-recovery"
+            >
+              The session scope could not be applied or restored. Restart the
+              app to recover a consistent state.
+            </p>
+          )}
         </div>
         <Switch
           aria-labelledby="acp-session-scope-label"
           checked={scope === "thread"}
           data-testid="acp-session-scope-toggle"
-          disabled={pending}
+          disabled={pending || unrecoverable}
           onCheckedChange={(value) => void setThreadScoped(value)}
         />
       </div>
