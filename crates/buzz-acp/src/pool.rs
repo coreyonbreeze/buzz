@@ -40,13 +40,18 @@ use crate::queue::{
 };
 use crate::relay::{ChannelInfo, RestClient};
 
+// Scheduling/session identity lives in queue.rs next to the scope-keyed
+// queue state machine; re-exported here so pool consumers keep one name.
+pub use crate::queue::ConversationSessionKey;
+
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
 
 /// Metadata stored per in-flight task for panic recovery.
 pub struct TaskMeta {
     pub agent_index: usize,
-    pub channel_id: Option<Uuid>,
+    /// Conversation scope of the in-flight prompt; `None` for heartbeats.
+    pub scope: Option<ConversationSessionKey>,
     /// Identifies terminal events when the task panics before returning a result.
     pub turn_id: String,
     /// Clone of batch for Queue mode panic recovery.
@@ -72,22 +77,6 @@ pub struct AgentModelCapabilities {
     pub config_options_raw: Vec<serde_json::Value>,
     /// Unstable: SessionModelState from session/new.
     pub available_models_raw: Option<serde_json::Value>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ConversationSessionKey {
-    pub channel_id: Uuid,
-    pub root_event_id: Option<String>,
-}
-
-impl ConversationSessionKey {
-    #[cfg(test)]
-    pub fn channel(channel_id: Uuid) -> Self {
-        Self {
-            channel_id,
-            root_event_id: None,
-        }
-    }
 }
 
 /// Per-channel session IDs and turn counters.
@@ -579,25 +568,32 @@ impl AgentPool {
         }
     }
 
-    /// Try to claim an idle agent for the given channel (or heartbeat if `None`).
+    /// Try to claim an idle agent for the given scope (or heartbeat if `None`).
     ///
-    /// Pass 1: prefer an agent that already has a session for `channel_id`.
+    /// Pass 1: prefer an agent that already has a session for the scope.
     /// Pass 2: any idle agent.
     ///
-    /// Returns `None` if all agents are checked out.
-    pub fn try_claim(
-        &mut self,
-        session_key: Option<&ConversationSessionKey>,
-    ) -> Option<OwnedAgent> {
+    /// Retained roots have strict slot affinity: if the root's owning slot is
+    /// busy, the claim returns [`ClaimOutcome::BusyOwner`] so the dispatcher
+    /// can skip this scope and keep dispatching other scopes — a busy owner
+    /// must not stall unrelated roots, and the root must never migrate to
+    /// another slot (that would fork the provider session).
+    /// [`ClaimOutcome::Exhausted`] means no idle agent exists at all, so the
+    /// dispatch loop should stop.
+    pub fn try_claim(&mut self, session_key: Option<&ConversationSessionKey>) -> ClaimOutcome {
         // Pass 1: retained roots have strict ownership. If their slot is busy,
         // wait rather than creating a duplicate provider session in another slot.
         if let Some(key) = session_key {
             if key.root_event_id.is_some() {
                 self.prune_session_owners();
                 if let Some(&owner) = self.session_owners.get(key) {
-                    // Surviving the prune means the owner is busy (wait by
-                    // returning None) or idle and retaining the session.
-                    return self.agents.get_mut(owner).and_then(Option::take);
+                    // Surviving the prune means the owner is busy (skip this
+                    // scope, keep dispatching others) or idle and retaining
+                    // the session.
+                    return match self.agents.get_mut(owner).and_then(Option::take) {
+                        Some(agent) => ClaimOutcome::Claimed(agent),
+                        None => ClaimOutcome::BusyOwner,
+                    };
                 }
             }
             let idx = self.agents.iter().position(|slot| {
@@ -607,17 +603,21 @@ impl AgentPool {
             });
             if let Some(i) = idx {
                 self.session_owners.insert(key.clone(), i);
-                return self.agents[i].take();
+                return ClaimOutcome::Claimed(
+                    self.agents[i].take().expect("position matched idle slot"),
+                );
             }
         }
 
         // Pass 2: first idle agent. Reserve root affinity immediately so another
         // turn for the same root cannot fall through while this slot is checked out.
-        let idx = self.agents.iter().position(|slot| slot.is_some())?;
+        let Some(idx) = self.agents.iter().position(|slot| slot.is_some()) else {
+            return ClaimOutcome::Exhausted;
+        };
         if let Some(key) = session_key.filter(|key| key.root_event_id.is_some()) {
             self.session_owners.insert(key.clone(), idx);
         }
-        self.agents[idx].take()
+        ClaimOutcome::Claimed(self.agents[idx].take().expect("position matched idle slot"))
     }
 
     /// Drop root reservations that no longer bind: the owning slot is neither
@@ -703,19 +703,19 @@ impl AgentPool {
     /// watcher, to close the result-vs-ack race.
     ///
     /// Returns `Err(SteerError::PromptCompleted)` if no task is in flight
-    /// for `channel_id` (the prompt completed between the mode-gate check
-    /// and this call, or the channel was never in flight). This is
+    /// for `scope` (the prompt completed between the mode-gate check
+    /// and this call, or the scope was never in flight). This is
     /// semantically a soft no-op — the caller should release any withheld
     /// event and let normal dispatch handle delivery.
     pub fn send_steer(
         &mut self,
-        channel_id: Uuid,
+        scope: &ConversationSessionKey,
         request: SteerRequest,
     ) -> Result<(), SteerError> {
         let meta = self
             .task_map
             .values_mut()
-            .find(|m| m.channel_id == Some(channel_id))
+            .find(|m| m.scope.as_ref() == Some(scope))
             .ok_or(SteerError::PromptCompleted)?;
         let tx = meta
             .steer_tx
@@ -851,6 +851,33 @@ impl AgentPool {
                 agent.model_overridden = true;
                 agent.state.invalidate_channel(&channel_id);
             }
+        }
+    }
+}
+
+/// Outcome of [`AgentPool::try_claim`].
+// The variant size skew is fine: a ClaimOutcome is matched and consumed
+// immediately at the claim site, never stored — boxing would add churn
+// on the hot dispatch path for no benefit.
+#[allow(clippy::large_enum_variant)]
+pub enum ClaimOutcome {
+    /// An idle agent was checked out for the scope.
+    Claimed(OwnedAgent),
+    /// The scope is a retained root whose owning slot is busy on another
+    /// turn. Skip this scope — do NOT stop the dispatch loop, and do NOT
+    /// run the root on a different slot (that would fork its session).
+    BusyOwner,
+    /// No idle agent in the pool. Stop the dispatch loop.
+    Exhausted,
+}
+
+impl ClaimOutcome {
+    /// The claimed agent, if any. Test-only convenience.
+    #[cfg(test)]
+    pub fn claimed(self) -> Option<OwnedAgent> {
+        match self {
+            ClaimOutcome::Claimed(agent) => Some(agent),
+            ClaimOutcome::BusyOwner | ClaimOutcome::Exhausted => None,
         }
     }
 }
@@ -1340,16 +1367,6 @@ fn send_prompt_result(
     });
 }
 
-/// Session identity for a batch. `FlushBatch::conversation_root` is populated
-/// at queue-push time only when the top-level-sessions experiment is enabled,
-/// so this is purely data-driven: no root means the legacy channel-scoped key.
-pub(crate) fn conversation_session_key(batch: &FlushBatch) -> ConversationSessionKey {
-    ConversationSessionKey {
-        channel_id: batch.channel_id,
-        root_event_id: batch.conversation_root.clone(),
-    }
-}
-
 /// Core async function spawned for each prompt.
 ///
 /// Lifecycle:
@@ -1373,7 +1390,7 @@ pub async fn run_prompt_task(
 ) {
     // Is this a channel prompt or a heartbeat?
     let source = match &batch {
-        Some(b) => PromptSource::Channel(conversation_session_key(b)),
+        Some(b) => PromptSource::Channel(b.scope_key()),
         None => PromptSource::Heartbeat,
     };
     let observer_channel_id = match &source {
@@ -4557,7 +4574,7 @@ mod tests {
     #[test]
     fn test_conversation_session_key_is_channel_scoped_without_root() {
         let batch = one_event_batch(Uuid::new_v4());
-        let key = conversation_session_key(&batch);
+        let key = batch.scope_key();
         assert_eq!(key.channel_id, batch.channel_id);
         assert_eq!(key.root_event_id, None);
     }
@@ -4566,7 +4583,7 @@ mod tests {
     fn test_conversation_session_key_uses_batch_root_when_present() {
         let mut batch = one_event_batch(Uuid::new_v4());
         batch.conversation_root = Some("root-a".into());
-        let key = conversation_session_key(&batch);
+        let key = batch.scope_key();
         assert_eq!(key.channel_id, batch.channel_id);
         assert_eq!(key.root_event_id.as_deref(), Some("root-a"));
     }
