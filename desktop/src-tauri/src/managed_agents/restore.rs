@@ -124,6 +124,37 @@ pub(crate) fn record_activates_on_relay(
     pinned.is_empty() || crate::relay::relay_urls_equivalent(pinned, workspace_relay_url)
 }
 
+/// Pure activation decision produced after process housekeeping has reconciled
+/// the record store with the live runtime view.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct WorkspaceActivationPlan {
+    pub run_boot_sweeps: bool,
+    pub spawn_pubkeys: Vec<String>,
+}
+
+/// Claim `workspace_relay_url` for this session and select the records that its
+/// activation should spawn. The caller owns persistence, process creation, and
+/// shutdown synchronization; tests can drive the complete A→B→A decision
+/// sequence without constructing a Tauri app or an OS child process.
+pub(crate) fn plan_workspace_activation(
+    records: &[ManagedAgentRecord],
+    already_running: &HashSet<String>,
+    activated_relays: &mut HashSet<String>,
+    workspace_relay_url: &str,
+) -> Option<WorkspaceActivationPlan> {
+    let activation = begin_relay_activation(activated_relays, workspace_relay_url)?;
+    let spawn_pubkeys = records
+        .iter()
+        .filter(|record| record_activates_on_relay(record, workspace_relay_url))
+        .filter(|record| !already_running.contains(&record.pubkey))
+        .map(|record| record.pubkey.clone())
+        .collect();
+    Some(WorkspaceActivationPlan {
+        run_boot_sweeps: activation.run_boot_sweeps,
+        spawn_pubkeys,
+    })
+}
+
 /// Lazily activate a workspace's managed agents.
 ///
 /// Called from every `apply_workspace`: starts local `start_on_app_launch`
@@ -158,16 +189,6 @@ pub async fn activate_workspace_agents(
         return Ok(());
     }
 
-    let Some(activation) = ({
-        let mut activated_relays = state
-            .activated_agent_relays
-            .lock()
-            .map_err(|error| error.to_string())?;
-        begin_relay_activation(&mut activated_relays, workspace_relay_url)
-    }) else {
-        return Ok(());
-    };
-
     // ── Phase A (under lock): housekeeping + collect agents to activate ──
     let mut agents_to_start: Vec<super::ManagedAgentRecord>;
     {
@@ -191,12 +212,39 @@ pub async fn activate_workspace_agents(
             &super::current_instance_id(app),
         );
 
+        let mut already_running = HashSet::new();
+        for (pubkey, runtime) in runtimes.iter_mut() {
+            if runtime.child.try_wait().ok().flatten().is_none() {
+                already_running.insert(pubkey.clone());
+            }
+        }
+        already_running.extend(records.iter().filter_map(|record| {
+            record
+                .runtime_pid
+                .filter(|pid| super::process_is_running(*pid))
+                .map(|_| record.pubkey.clone())
+        }));
+        let Some(plan) = ({
+            let mut activated_relays = state
+                .activated_agent_relays
+                .lock()
+                .map_err(|error| error.to_string())?;
+            plan_workspace_activation(
+                &records,
+                &already_running,
+                &mut activated_relays,
+                workspace_relay_url,
+            )
+        }) else {
+            return Ok(());
+        };
+
         // One-shot boot cleanup: previous-session leftovers and orphans are
         // swept only on the session's first activation. Later activations
         // must not sweep — a concurrent activation's or UI start's freshly
         // spawned children are not yet in the tracked set and would be killed
         // as orphans.
-        if activation.run_boot_sweeps {
+        if plan.run_boot_sweeps {
             changed |= kill_stale_tracked_processes(
                 &mut records,
                 &runtimes,
@@ -232,29 +280,13 @@ pub async fn activate_workspace_agents(
             super::sweep_untracked_bundle_harnesses(&tracked_pids);
         }
 
-        let candidates: Vec<String> = records
+        let planned_pubkeys: HashSet<&str> =
+            plan.spawn_pubkeys.iter().map(String::as_str).collect();
+        agents_to_start = records
             .iter()
-            .filter(|record| record_activates_on_relay(record, workspace_relay_url))
-            .map(|record| record.pubkey.clone())
+            .filter(|record| planned_pubkeys.contains(record.pubkey.as_str()))
+            .cloned()
             .collect();
-
-        let mut to_start = Vec::new();
-        for pubkey in &candidates {
-            if let Some(runtime) = runtimes.get_mut(pubkey) {
-                if runtime.child.try_wait().ok().flatten().is_none() {
-                    continue;
-                }
-            }
-            if let Some(record) = records.iter().find(|r| r.pubkey == *pubkey) {
-                if let Some(pid) = record.runtime_pid {
-                    if super::process_is_running(pid) {
-                        continue;
-                    }
-                }
-                to_start.push(record.clone());
-            }
-        }
-        agents_to_start = to_start;
 
         // Re-snapshot persona config for agents about to be restored, matching
         // the interactive spawn path so auto-start agents also pick up the
