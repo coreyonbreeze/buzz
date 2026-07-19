@@ -36,21 +36,22 @@ test.describe("community home", () => {
     await installMockBridge(page, undefined, { skipCommunitySeed: true });
   });
 
-  test("renders saved communities when no community is selected", async ({
+  test("renders the personal lattice with communities and create tiles", async ({
     page,
   }) => {
     await page.goto("/");
 
     await expect(page.getByTestId("community-home")).toBeVisible();
-    await expect(
-      page.getByRole("heading", { name: "Where do you want to go?" }),
-    ).toBeVisible();
+    // The central "you" cell anchors the honeycomb, relay or not.
+    await expect(page.getByTestId("community-home-profile")).toBeVisible();
     await expect(
       page.getByTestId("community-home-community-garden"),
     ).toBeVisible();
     await expect(
       page.getByTestId("community-home-community-makers"),
     ).toBeVisible();
+    // Create-frontier tiles: agent, community, and connect all live on the grid.
+    await expect(page.getByTestId("community-home-create-agent")).toBeVisible();
     await expect(page.getByTestId("community-home-join")).toBeVisible();
     await expect(page.getByTestId("community-home-create")).toBeVisible();
   });
@@ -71,6 +72,9 @@ test.describe("community home", () => {
     page,
   }) => {
     await page.goto("/");
+    // The create-frontier tiles reveal (and become interactive) once the
+    // pointer is over the grid — hover the profile cell before clicking.
+    await page.getByTestId("community-home-profile").hover();
     await page.getByTestId("community-home-join").click();
 
     await expect(
