@@ -70,6 +70,7 @@ class DiagnosticsController extends ChangeNotifier {
       }
 
       final previousConsent = _consentGranted;
+      var consentPersisted = false;
       _consentGranted = granted;
       notifyListeners();
       try {
@@ -80,8 +81,15 @@ class DiagnosticsController extends ChangeNotifier {
         if (!persisted) {
           throw StateError('Failed to persist diagnostics consent');
         }
+        consentPersisted = true;
         await _applyCurrentConsent();
       } on Object {
+        // A persisted revocation must survive teardown failure. Otherwise the
+        // next launch could initialize crash reporting against the user's
+        // explicit choice.
+        if (!granted && consentPersisted) {
+          rethrow;
+        }
         _consentGranted = previousConsent;
         final rolledBack = await _preferences.setBool(
           diagnosticsConsentPreferenceKey,

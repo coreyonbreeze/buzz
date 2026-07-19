@@ -117,8 +117,8 @@ class SettingsPage extends HookConsumerWidget {
                       title: 'Share Crash Reports',
                       subtitle: diagnostics.isConfigured
                           ? 'Send crash details to help improve Buzz. Reports '
-                                'exclude message text, screenshots, and personal '
-                                'information.'
+                                'do not include screenshots, view hierarchy, '
+                                'breadcrumbs, or performance traces.'
                           : 'Crash reporting is unavailable in this build.',
                       subtitleMaxLines: 4,
                       trailing: Switch.adaptive(

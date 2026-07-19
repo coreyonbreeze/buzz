@@ -56,6 +56,15 @@ void main() {
 
     expect(find.text('DIAGNOSTICS'), findsOneWidget);
     expect(find.text('Share Crash Reports'), findsOneWidget);
+    expect(
+      find.text(
+        'Send crash details to help improve Buzz. Reports do not include '
+        'screenshots, view hierarchy, breadcrumbs, or performance traces.',
+      ),
+      findsOneWidget,
+    );
+    expect(find.textContaining('personal information'), findsNothing);
+    expect(find.textContaining('message text'), findsNothing);
     final toggle = tester.widget<Switch>(find.byType(Switch));
     expect(toggle.value, isFalse);
 

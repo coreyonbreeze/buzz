@@ -174,7 +174,7 @@ void main() {
     expect(reporter.initializeCalls, 1);
   });
 
-  test('close failure rolls back revocation', () async {
+  test('close failure preserves persisted revocation', () async {
     final controller = await createController(
       storedValues: {diagnosticsConsentPreferenceKey: true},
     );
@@ -183,8 +183,8 @@ void main() {
 
     await expectLater(controller.setConsent(false), throwsA(isA<StateError>()));
 
-    expect(controller.consentGranted, isTrue);
-    expect(preferences.getBool(diagnosticsConsentPreferenceKey), isTrue);
+    expect(controller.consentGranted, isFalse);
+    expect(preferences.getBool(diagnosticsConsentPreferenceKey), isFalse);
     expect(reporter.closeCalls, 1);
   });
 
