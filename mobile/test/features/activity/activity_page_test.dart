@@ -255,7 +255,7 @@ void main() {
       find.byType(ChannelDetailPage),
     );
     expect(page.channel.id, 'ch1');
-    expect(page.initialThreadRootId, 'thread-root');
+    expect(page.initialThreadRootId, 'parent-reply');
     expect(page.initialMessageId, 'reply-event');
   });
 

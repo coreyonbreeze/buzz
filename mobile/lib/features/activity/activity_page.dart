@@ -143,7 +143,7 @@ class ActivityPage extends HookConsumerWidget {
         builder: (_) => ChannelDetailPage(
           channel: channel,
           initialMessageId: item.id,
-          initialThreadRootId: item.threadRootId,
+          initialThreadRootId: item.threadHeadId,
         ),
       ),
     );

@@ -50,7 +50,7 @@ void main() {
     });
   });
 
-  group('FeedItem.threadRootId', () {
+  group('FeedItem.threadHeadId', () {
     FeedItem makeItem(List<List<String>> tags) => FeedItem(
       id: 'reply',
       kind: 9,
@@ -67,18 +67,18 @@ void main() {
       expect(
         makeItem(const [
           ['e', 'root', '', 'reply'],
-        ]).threadRootId,
+        ]).threadHeadId,
         'root',
       );
     });
 
-    test('uses the root marker for a nested thread reply', () {
+    test('uses the direct parent marker for a nested thread reply', () {
       expect(
         makeItem(const [
           ['e', 'root', '', 'root'],
           ['e', 'parent', '', 'reply'],
-        ]).threadRootId,
-        'root',
+        ]).threadHeadId,
+        'parent',
       );
     });
 
@@ -86,7 +86,7 @@ void main() {
       expect(
         makeItem(const [
           ['e', 'linked-event'],
-        ]).threadRootId,
+        ]).threadHeadId,
         isNull,
       );
     });
