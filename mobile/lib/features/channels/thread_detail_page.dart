@@ -173,6 +173,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                         channelId: channelId,
                         currentPubkey: currentPubkey,
                         showAuthor: true,
+                        isHighlighted: liveHead.id == initialMessageId,
                         allMessages: allMsgs,
                         isMember: isMember,
                         isArchived: isArchived,
@@ -227,6 +228,7 @@ class ThreadDetailPage extends HookConsumerWidget {
                       channelId: channelId,
                       currentPubkey: currentPubkey,
                       showAuthor: showAuthor,
+                      isHighlighted: reply.id == initialMessageId,
                       allMessages: allMsgs,
                       isMember: isMember,
                       isArchived: isArchived,
@@ -391,6 +393,7 @@ class _ThreadMessage extends ConsumerWidget {
   final String channelId;
   final String? currentPubkey;
   final bool showAuthor;
+  final bool isHighlighted;
   final List<TimelineMessage>? allMessages;
   final bool isMember;
   final bool isArchived;
@@ -401,6 +404,7 @@ class _ThreadMessage extends ConsumerWidget {
     required this.channelId,
     required this.currentPubkey,
     required this.showAuthor,
+    this.isHighlighted = false,
     this.allMessages,
     this.isMember = false,
     this.isArchived = false,
@@ -439,84 +443,94 @@ class _ThreadMessage extends ConsumerWidget {
         isMember: isMember,
         isArchived: isArchived,
       ),
-      child: Padding(
-        padding: EdgeInsets.only(top: showAuthor ? Grid.xs : Grid.quarter),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (showAuthor)
-              GestureDetector(
-                onTap: () => showUserProfileSheet(context, message.pubkey),
-                child: _Avatar(profile: profile, pubkey: message.pubkey),
-              )
-            else
-              const SizedBox(width: 28),
-            const SizedBox(width: Grid.xxs),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  if (showAuthor)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: Grid.quarter),
-                      child: Row(
-                        children: [
-                          GestureDetector(
-                            onTap: () =>
-                                showUserProfileSheet(context, message.pubkey),
-                            child: Text(
-                              displayName,
-                              style: context.textTheme.labelMedium?.copyWith(
-                                fontWeight: FontWeight.w600,
-                                color: context.colors.onSurface,
+      child: DecoratedBox(
+        key: ValueKey('thread-message-${message.id}'),
+        decoration: BoxDecoration(
+          color: isHighlighted
+              ? context.colors.primary.withValues(alpha: 0.12)
+              : Colors.transparent,
+          borderRadius: BorderRadius.circular(Grid.half),
+        ),
+        child: Padding(
+          padding: EdgeInsets.only(top: showAuthor ? Grid.xs : Grid.quarter),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              if (showAuthor)
+                GestureDetector(
+                  onTap: () => showUserProfileSheet(context, message.pubkey),
+                  child: _Avatar(profile: profile, pubkey: message.pubkey),
+                )
+              else
+                const SizedBox(width: 28),
+              const SizedBox(width: Grid.xxs),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    if (showAuthor)
+                      Padding(
+                        padding: const EdgeInsets.only(bottom: Grid.quarter),
+                        child: Row(
+                          children: [
+                            GestureDetector(
+                              onTap: () =>
+                                  showUserProfileSheet(context, message.pubkey),
+                              child: Text(
+                                displayName,
+                                style: context.textTheme.labelMedium?.copyWith(
+                                  fontWeight: FontWeight.w600,
+                                  color: context.colors.onSurface,
+                                ),
                               ),
                             ),
-                          ),
-                          const SizedBox(width: Grid.xxs),
-                          Text(
-                            formatMessageTime(message.createdAt),
-                            style: context.textTheme.labelSmall?.copyWith(
-                              color: context.colors.onSurfaceVariant,
-                            ),
-                          ),
-                          if (message.edited) ...[
-                            const SizedBox(width: Grid.half),
+                            const SizedBox(width: Grid.xxs),
                             Text(
-                              '(edited)',
+                              formatMessageTime(message.createdAt),
                               style: context.textTheme.labelSmall?.copyWith(
                                 color: context.colors.onSurfaceVariant,
-                                fontStyle: FontStyle.italic,
                               ),
                             ),
+                            if (message.edited) ...[
+                              const SizedBox(width: Grid.half),
+                              Text(
+                                '(edited)',
+                                style: context.textTheme.labelSmall?.copyWith(
+                                  color: context.colors.onSurfaceVariant,
+                                  fontStyle: FontStyle.italic,
+                                ),
+                              ),
+                            ],
                           ],
-                        ],
+                        ),
                       ),
+                    MessageContent(
+                      content: message.content,
+                      mentionNames: mentionNames,
+                      channelNames: channelNames,
+                      tags: message.tags,
+                      onChannelTap: (targetChannelId) {
+                        openChannelLink(
+                          context: context,
+                          ref: ref,
+                          channelId: targetChannelId,
+                          currentChannelId: channelId,
+                        );
+                      },
+                      onMentionTap: (pubkey) =>
+                          showUserProfileSheet(context, pubkey),
                     ),
-                  MessageContent(
-                    content: message.content,
-                    mentionNames: mentionNames,
-                    channelNames: channelNames,
-                    tags: message.tags,
-                    onChannelTap: (targetChannelId) {
-                      openChannelLink(
-                        context: context,
-                        ref: ref,
-                        channelId: targetChannelId,
-                        currentChannelId: channelId,
-                      );
-                    },
-                    onMentionTap: (pubkey) =>
-                        showUserProfileSheet(context, pubkey),
-                  ),
-                  if (message.reactions.isNotEmpty)
-                    ReactionRow(
-                      reactions: message.reactions,
-                      onToggle: (emoji) => toggleReaction(ref, message, emoji),
-                    ),
-                ],
+                    if (message.reactions.isNotEmpty)
+                      ReactionRow(
+                        reactions: message.reactions,
+                        onToggle: (emoji) =>
+                            toggleReaction(ref, message, emoji),
+                      ),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

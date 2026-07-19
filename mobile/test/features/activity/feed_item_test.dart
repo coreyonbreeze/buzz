@@ -50,6 +50,48 @@ void main() {
     });
   });
 
+  group('FeedItem.threadRootId', () {
+    FeedItem makeItem(List<List<String>> tags) => FeedItem(
+      id: 'reply',
+      kind: 9,
+      pubkey: 'pk',
+      content: '',
+      createdAt: 0,
+      channelId: 'channel',
+      channelName: '',
+      tags: tags,
+      category: 'mention',
+    );
+
+    test('uses the reply marker for a direct thread reply', () {
+      expect(
+        makeItem(const [
+          ['e', 'root', '', 'reply'],
+        ]).threadRootId,
+        'root',
+      );
+    });
+
+    test('uses the root marker for a nested thread reply', () {
+      expect(
+        makeItem(const [
+          ['e', 'root', '', 'root'],
+          ['e', 'parent', '', 'reply'],
+        ]).threadRootId,
+        'root',
+      );
+    });
+
+    test('does not treat unrelated event references as threads', () {
+      expect(
+        makeItem(const [
+          ['e', 'linked-event'],
+        ]).threadRootId,
+        isNull,
+      );
+    });
+  });
+
   group('FeedItem.headline', () {
     FeedItem makeItem({required int kind, String category = 'activity'}) =>
         FeedItem(

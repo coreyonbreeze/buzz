@@ -41,6 +41,19 @@ class FeedItem {
     category: json['category'] as String,
   );
 
+  /// The root of the thread containing this item, when the event is a reply.
+  String? get threadRootId {
+    List<String>? rootTag;
+    List<String>? replyTag;
+    for (final tag in tags) {
+      if (tag.length < 4 || tag[0] != 'e') continue;
+      if (tag[3] == 'root') rootTag = tag;
+      if (tag[3] == 'reply') replyTag = tag;
+    }
+    if (replyTag == null) return null;
+    return rootTag?[1] ?? replyTag[1];
+  }
+
   /// Human-readable headline based on event kind and category.
   String get headline {
     switch (kind) {
