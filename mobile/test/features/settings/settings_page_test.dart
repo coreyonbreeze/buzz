@@ -57,7 +57,7 @@ void main() {
     await controller.applyStartupConsent();
     await pumpSettings(tester, controller);
 
-    expect(find.text('DIAGNOSTICS'), findsNothing);
+    expect(find.text('DIAGNOSTICS'), findsOneWidget);
     expect(find.text('Share crash reports'), findsOneWidget);
     expect(find.text('Sent anonymously to help fix problems.'), findsOneWidget);
     expect(find.text('Share Crash Reports'), findsNothing);

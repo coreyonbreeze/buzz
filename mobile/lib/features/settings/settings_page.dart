@@ -108,8 +108,9 @@ class SettingsPage extends HookConsumerWidget {
                   ],
                 ),
 
-                // Crash reporting
+                // Diagnostics
                 AppListSection(
+                  label: 'Diagnostics',
                   children: [
                     AppListRow(
                       icon: LucideIcons.activity,
