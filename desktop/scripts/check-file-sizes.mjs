@@ -173,7 +173,12 @@ const overrides = new Map([
   // Windows Doctor install fix: cli_install_commands_windows field added to test stubs.
   // team-instructions-first-class: ManagedAgentRecord fixture gains the new
   // team_id field (+1 line).
-  ["src-tauri/src/managed_agents/readiness.rs", 1765],
+  // gemini-goose-provider: the accumulated `mod tests` module was extracted to
+  // readiness_tests.rs (following the agent_models_tests.rs precedent) so the
+  // production file (readiness.rs) is back under the default ceiling. The
+  // historical test debt — plus the goose `google` (native Gemini) provider
+  // readiness coverage — now lives in that test-only file.
+  ["src-tauri/src/managed_agents/readiness_tests.rs", 1125],
   // applyWorkspace reposDir parameter plus the validateReposDir binding,
   // threaded through Tauri invokes for configurable repos_dir, plus the
   // harness-persona-sync `harnessOverride` create-input bit — load-bearing

@@ -33,6 +33,18 @@ export const BUZZ_AGENT_ONLY_PROVIDER_IDS: ReadonlySet<string> = new Set([
   "gemini",
 ]);
 
+/**
+ * Provider ids that only the `goose` runtime can drive. Goose registers a
+ * native Google Gemini provider under the id `google`, authenticated with
+ * `GOOGLE_API_KEY` (distinct from buzz-agent's OpenAI-compatible `gemini` /
+ * `GEMINI_API_KEY` contract — see `BUZZ_AGENT_ONLY_PROVIDER_IDS`). buzz-agent
+ * has no `google` adapter, so offering it there would advertise a provider the
+ * buzz-agent backend never checks. These ids are suppressed from the picker and
+ * from credential requirements for every runtime except `goose`; a value
+ * already persisted with one of them still renders via the `(current)` tail.
+ */
+export const GOOSE_ONLY_PROVIDER_IDS: ReadonlySet<string> = new Set(["google"]);
+
 export const PERSONA_FIELD_SHELL_CLASS =
   "rounded-xl border border-input bg-muted/40 transition-colors duration-150 ease-out hover:border-muted-foreground/40 focus-within:border-muted-foreground/50";
 export const PERSONA_FIELD_CONTROL_CLASS =
@@ -51,6 +63,7 @@ const KNOWN_LLM_PROVIDER_IDS = [
   "databricks",
   "databricks_v2",
   "gemini",
+  "google",
   "openai",
   "openai-compat",
 ] as const;
@@ -110,6 +123,12 @@ const PROVIDER_CREDENTIAL_CONFIG: Partial<
     requiredEnvKeys: ["GEMINI_API_KEY"],
     secretEnvVar: "GEMINI_API_KEY",
   },
+  google: {
+    // Goose's native Gemini provider. GOOGLE_HOST is optional (defaults to the
+    // Google AI host), so only GOOGLE_API_KEY is required.
+    requiredEnvKeys: ["GOOGLE_API_KEY"],
+    secretEnvVar: "GOOGLE_API_KEY",
+  },
   databricks: {
     // DATABRICKS_TOKEN is NOT required — OAuth PKCE is the normal path.
     requiredEnvKeys: ["DATABRICKS_HOST"],
@@ -136,6 +155,7 @@ export const PERSONA_LLM_PROVIDER_OPTIONS: readonly PersonaModelOption[] = [
   { id: "openai", label: "OpenAI" },
   { id: "openai-compat", label: "OpenAI-compatible" },
   { id: "gemini", label: "Gemini" },
+  { id: "google", label: "Google Gemini" },
   { id: "relay-mesh", label: "Buzz shared compute" },
   { id: "databricks", label: "Databricks" },
   { id: "databricks_v2", label: "Databricks v2" },
@@ -179,12 +199,20 @@ export function requiredCredentialEnvKeys(
     return [];
   }
   const normalizedProvider = provider.trim().toLowerCase();
-  // buzz-agent-only providers (e.g. gemini) are unsupported by Goose, so they
-  // require no credentials there — keep this in lockstep with the picker gate
-  // in getPersonaProviderOptions so options and requirements never drift.
+  // Runtime-scoped providers require no credentials on other runtimes — keep
+  // this in lockstep with the picker gate in getPersonaProviderOptions so
+  // options and requirements never drift.
+  // buzz-agent-only providers (e.g. gemini) are unsupported by Goose.
   if (
     normalizedRuntime !== "buzz-agent" &&
     BUZZ_AGENT_ONLY_PROVIDER_IDS.has(normalizedProvider)
+  ) {
+    return [];
+  }
+  // goose-only providers (e.g. google) are unsupported by buzz-agent.
+  if (
+    normalizedRuntime !== "goose" &&
+    GOOSE_ONLY_PROVIDER_IDS.has(normalizedProvider)
   ) {
     return [];
   }
@@ -285,7 +313,8 @@ export function providerRequiresExplicitModel(
     trimmedProvider === "anthropic" ||
     trimmedProvider === "openai" ||
     trimmedProvider === "openai-compat" ||
-    trimmedProvider === "gemini"
+    trimmedProvider === "gemini" ||
+    trimmedProvider === "google"
   );
 }
 
@@ -373,15 +402,19 @@ export function getPersonaProviderOptions(
   const defaultProviderOptions = [
     { id: "", label: getDefaultLlmProviderLabel(runtimeId, globalProvider) },
   ];
-  // Suppress buzz-agent-only providers (e.g. gemini) for every other runtime.
-  // A value already persisted with one still renders via the `(current)` tail
-  // below, so an existing agent never loses its saved selection.
-  const isBuzzAgentRuntime = runtimeId.trim() === "buzz-agent";
-  const runtimeVisibleOptions = isBuzzAgentRuntime
-    ? PERSONA_LLM_PROVIDER_OPTIONS
-    : PERSONA_LLM_PROVIDER_OPTIONS.filter(
-        (o) => !BUZZ_AGENT_ONLY_PROVIDER_IDS.has(o.id),
-      );
+  // Suppress runtime-scoped providers for runtimes that can't drive them:
+  // buzz-agent-only (e.g. gemini) is hidden everywhere but buzz-agent, and
+  // goose-only (e.g. google) is hidden everywhere but goose. A value already
+  // persisted with one still renders via the `(current)` tail below, so an
+  // existing agent never loses its saved selection.
+  const trimmedRuntimeId = runtimeId.trim();
+  const isBuzzAgentRuntime = trimmedRuntimeId === "buzz-agent";
+  const isGooseRuntime = trimmedRuntimeId === "goose";
+  const runtimeVisibleOptions = PERSONA_LLM_PROVIDER_OPTIONS.filter((o) => {
+    if (BUZZ_AGENT_ONLY_PROVIDER_IDS.has(o.id)) return isBuzzAgentRuntime;
+    if (GOOSE_ONLY_PROVIDER_IDS.has(o.id)) return isGooseRuntime;
+    return true;
+  });
   const filteredOptions = hideProviderIds?.size
     ? runtimeVisibleOptions.filter((o) => !hideProviderIds.has(o.id))
     : runtimeVisibleOptions;

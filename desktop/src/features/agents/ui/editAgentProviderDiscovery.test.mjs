@@ -170,6 +170,46 @@ test("editAgent_gooseSupportedProviderCredentialsUnchanged", () => {
   ]);
 });
 
+// ── Google Gemini is goose-only — must not be advertised for buzz-agent ──────
+//
+// Goose registers a native Gemini provider under the id `google`, authenticated
+// with GOOGLE_API_KEY (distinct from buzz-agent's OpenAI-compatible `gemini` /
+// GEMINI_API_KEY). buzz-agent has no `google` adapter, so the picker and
+// credential-requirement helpers gate `google` to the goose runtime.
+
+test("editAgent_providerOptions_includesGoogleForGoose", () => {
+  const options = getPersonaProviderOptions("", "goose");
+  const ids = options.map((o) => o.id);
+  assert.ok(
+    ids.includes("google"),
+    "google (Goose's native Gemini provider) must be offered for goose",
+  );
+});
+
+test("editAgent_providerOptions_excludesGoogleForBuzzAgent", () => {
+  const options = getPersonaProviderOptions("", "buzz-agent");
+  const ids = options.map((o) => o.id);
+  assert.ok(
+    !ids.includes("google"),
+    "google must not be offered for the buzz-agent runtime",
+  );
+});
+
+test("editAgent_google_requiresGoogleApiKeyAndExplicitModelForGoose", () => {
+  assert.deepEqual(requiredCredentialEnvKeys("goose", "google"), [
+    "GOOGLE_API_KEY",
+  ]);
+  assert.ok(
+    providerRequiresExplicitModel("google"),
+    "google must require an explicit model",
+  );
+});
+
+test("editAgent_google_requiresNoCredentialsForBuzzAgent", () => {
+  // buzz-agent can't drive google, so it requires no google credentials there.
+  assert.deepEqual(requiredCredentialEnvKeys("buzz-agent", "google"), []);
+});
+
 test("editAgent_providerOptions_includesDefaultEntry", () => {
   const options = getPersonaProviderOptions("", "buzz-agent");
   // The first entry is the default (empty id) — clearing back to runtime default.
