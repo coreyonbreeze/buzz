@@ -965,7 +965,7 @@ export function ProfileSettingsCard({
             <h2 className="text-lg font-semibold tracking-tight">Sign out</h2>
             <p className="text-sm text-muted-foreground">
               Removes your identity key and all local app data from this device.
-              Back up your private key (nsec) first — this cannot be undone.
+              Back up your private key (nsec) first — this can't be undone.
             </p>
           </div>
           <Button
@@ -979,7 +979,7 @@ export function ProfileSettingsCard({
             {isSignOutPending ? (
               <Spinner aria-label="Signing out" className="h-4 w-4 border-2" />
             ) : null}
-            {isSignOutPending ? "Signing out…" : "Sign Out"}
+            {isSignOutPending ? "Signing out…" : "Sign out"}
           </Button>
         </div>
         <AlertDialog
@@ -995,7 +995,7 @@ export function ProfileSettingsCard({
                 This will delete your identity key, all agent settings, and
                 cached data from this device, then relaunch Buzz into first-run
                 setup. Make sure you have your private key (nsec) backed up
-                before continuing — this cannot be undone.
+                before continuing — this can't be undone.
               </AlertDialogDescription>
             </AlertDialogHeader>
             <AlertDialogFooter>
@@ -1018,7 +1018,7 @@ export function ProfileSettingsCard({
                   });
                 }}
               >
-                {isSignOutPending ? "Signing out…" : "Sign Out"}
+                {isSignOutPending ? "Signing out…" : "Sign out"}
               </AlertDialogAction>
             </AlertDialogFooter>
           </AlertDialogContent>
