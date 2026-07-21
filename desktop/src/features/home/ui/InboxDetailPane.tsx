@@ -19,6 +19,8 @@ import {
   isWithinGroupingWindow,
 } from "@/features/messages/lib/messageGrouping";
 import { orderMentionPubkeysByText } from "@/features/messages/lib/orderMentionPubkeys";
+import { canManageMessageForCurrentUser } from "@/features/messages/lib/canManageMessage";
+import { imetaMediaFromTags } from "@/features/messages/lib/imetaMediaMarkdown";
 import { getThreadReference } from "@/features/messages/lib/threading";
 import { normalizePubkey } from "@/shared/lib/pubkey";
 import { MessageComposer } from "@/features/messages/ui/MessageComposer";
@@ -55,6 +57,7 @@ type InboxDetailPaneProps = {
   canReply: boolean;
   disabledReplyReason?: string | null;
   isDeletingMessage?: boolean;
+  isEditingMessage?: boolean;
   isSendingReply?: boolean;
   isSinglePanelView?: boolean;
   isThreadContextLoading?: boolean;
@@ -82,6 +85,12 @@ type InboxDetailPaneProps = {
   latchedDefaultParentId?: string | null;
   onBack?: () => void;
   onDelete: () => void;
+  onEditSave: (input: {
+    content: string;
+    eventId: string;
+    mediaTags?: string[][];
+    mentionPubkeys?: string[];
+  }) => Promise<void>;
   onManageChannel: (channelId: string) => void;
   onOpenContext: (
     channelId: string,
@@ -108,6 +117,7 @@ export function InboxDetailPane({
   canReply,
   disabledReplyReason,
   isDeletingMessage = false,
+  isEditingMessage = false,
   isSendingReply = false,
   isSinglePanelView = false,
   isThreadContextLoading = false,
@@ -122,6 +132,7 @@ export function InboxDetailPane({
   latchedDefaultParentId = null,
   onBack,
   onDelete,
+  onEditSave,
   onManageChannel,
   onOpenContext,
   onSendReply,
@@ -133,6 +144,7 @@ export function InboxDetailPane({
   const contentRef = React.useRef<HTMLDivElement | null>(null);
   const composerWrapperRef = React.useRef<HTMLDivElement | null>(null);
   const [replyTargetId, setReplyTargetId] = React.useState<string | null>(null);
+  const [editTargetId, setEditTargetId] = React.useState<string | null>(null);
   const [isFocusHighlightVisible, setIsFocusHighlightVisible] =
     React.useState(true);
   const [isMembersSidebarOpen, setIsMembersSidebarOpen] = React.useState(false);
@@ -230,6 +242,7 @@ export function InboxDetailPane({
   React.useEffect(() => {
     void conversationId;
     setReplyTargetId(null);
+    setEditTargetId(null);
   }, [conversationId]);
 
   React.useEffect(() => {
@@ -348,6 +361,16 @@ export function InboxDetailPane({
 
   const replyTarget =
     displayMessages.find((message) => message.id === replyTargetId) ?? null;
+  const editTarget =
+    displayMessages.find((message) => message.id === editTargetId) ?? null;
+  const composerEditTarget = editTarget
+    ? {
+        author: editTarget.authorLabel,
+        body: editTarget.content,
+        id: editTarget.id,
+        imetaMedia: imetaMediaFromTags(editTarget.tags),
+      }
+    : null;
   // Explicit sub-message reply wins. Otherwise use the captured default parent
   // (derived from the selected-event anchor at conversation entry), which does
   // not change when a live incoming message advances the representative item.
@@ -377,6 +400,14 @@ export function InboxDetailPane({
     setReplyTargetId((currentReplyTargetId) =>
       currentReplyTargetId === message.id ? null : message.id,
     );
+    setEditTargetId(null);
+    focusComposer();
+  };
+  const handleSelectEditTarget = (message: InboxDisplayMessage) => {
+    setEditTargetId((currentEditTargetId) =>
+      currentEditTargetId === message.id ? null : message.id,
+    );
+    setReplyTargetId(null);
     focusComposer();
   };
 
@@ -496,6 +527,21 @@ export function InboxDetailPane({
                   message.createdAt,
                 );
 
+              const canManageMessage = canManageMessageForCurrentUser(
+                {
+                  id: message.id,
+                  author: message.authorLabel,
+                  body: message.content,
+                  createdAt: message.createdAt,
+                  depth: message.depth,
+                  kind: message.kind,
+                  pubkey: message.authorPubkey,
+                  time: message.timeLabel ?? message.fullTimestampLabel,
+                },
+                currentPubkey,
+                profiles,
+              );
+
               return (
                 <InboxMessageRow
                   agentPubkeys={agentPubkeys}
@@ -506,6 +552,7 @@ export function InboxDetailPane({
                   isFocusHighlightVisible={isFocusHighlightVisible}
                   key={message.id}
                   message={message}
+                  onEdit={canManageMessage ? handleSelectEditTarget : undefined}
                   onSelectReplyTarget={handleSelectReplyTarget}
                   onToggleReaction={onToggleReaction}
                 />
@@ -550,12 +597,28 @@ export function InboxDetailPane({
               channelName={item.channelLabel ?? "channel"}
               channelType={composerChannelType}
               containerClassName="px-4 pb-4 sm:px-4"
-              disabled={!canReply}
+              disabled={!canReply && !composerEditTarget}
               draftKey={`thread:${item.conversationId}`}
-              isSending={isSendingReply}
+              editTarget={composerEditTarget}
+              isSending={isSendingReply || isEditingMessage}
+              onCancelEdit={
+                composerEditTarget ? () => setEditTargetId(null) : undefined
+              }
               onCancelReply={
                 composerReplyTarget ? () => setReplyTargetId(null) : undefined
               }
+              onEditSave={async (content, mediaTags, mentionPubkeys) => {
+                if (!composerEditTarget) {
+                  return;
+                }
+                await onEditSave({
+                  content,
+                  eventId: composerEditTarget.id,
+                  mediaTags,
+                  mentionPubkeys,
+                });
+                setEditTargetId(null);
+              }}
               onSend={(content, mentionPubkeys, mediaTags) =>
                 onSendReply({
                   content,
