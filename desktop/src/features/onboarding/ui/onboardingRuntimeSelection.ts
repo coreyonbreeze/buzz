@@ -1,3 +1,4 @@
+import { setLocalStorageItemWithRecovery } from "@/shared/lib/localStorageQuota";
 import type { AcpRuntimeCatalogEntry } from "@/shared/api/types";
 
 export const ONBOARDING_RUNTIME_ORDER = [
@@ -6,6 +7,43 @@ export const ONBOARDING_RUNTIME_ORDER = [
   "goose",
   "buzz-agent",
 ];
+
+const RUNTIME_SELECTION_STORAGE_KEY =
+  "buzz-machine-onboarding-runtime-selection.v1";
+
+/**
+ * Restores the harness selection saved by the setup step. Machine onboarding
+ * can be reopened directly on the config page (Back from the first-community
+ * screen), which skips the setup step that normally populates the selection.
+ */
+export function loadStoredOnboardingRuntimeSelection(
+  storage: Storage = localStorage,
+): string[] {
+  try {
+    const raw = storage.getItem(RUNTIME_SELECTION_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (runtimeId): runtimeId is string => typeof runtimeId === "string",
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Persists the setup step's harness selection for config-page reopens. */
+export function storeOnboardingRuntimeSelection(
+  runtimeIds: readonly string[],
+  storage: Storage = localStorage,
+): void {
+  const serialized = JSON.stringify(runtimeIds);
+  if (typeof localStorage !== "undefined" && storage === localStorage) {
+    setLocalStorageItemWithRecovery(RUNTIME_SELECTION_STORAGE_KEY, serialized);
+  } else {
+    storage.setItem(RUNTIME_SELECTION_STORAGE_KEY, serialized);
+  }
+}
 
 const KNOWN_ONBOARDING_RUNTIME_IDS = new Set<string>(ONBOARDING_RUNTIME_ORDER);
 
@@ -65,4 +103,8 @@ export function runtimeCanAdvanceOnboarding(runtime: AcpRuntimeCatalogEntry) {
     (runtime.authStatus.status === "logged_in" ||
       runtime.authStatus.status === "not_applicable")
   );
+}
+
+export function runtimeIsInstalled(runtime: AcpRuntimeCatalogEntry) {
+  return runtimeCanBeSelected(runtime) && runtimeCanAdvanceOnboarding(runtime);
 }

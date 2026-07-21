@@ -22,6 +22,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/shared/ui/tooltip";
 import {
   runtimeCanAdvanceOnboarding,
   runtimeCanBeSelected,
+  runtimeIsInstalled,
 } from "./onboardingRuntimeSelection";
 import { ONBOARDING_PRIMARY_CTA_CLASS } from "./OnboardingChrome";
 import { RuntimeErrorTooltip } from "./RuntimeErrorTooltip";
@@ -102,10 +103,6 @@ function RuntimeSelectionIndicator({
       />
     </span>
   );
-}
-
-function runtimeIsInstalled(runtime: AcpRuntimeCatalogEntry) {
-  return runtimeCanBeSelected(runtime) && runtimeCanAdvanceOnboarding(runtime);
 }
 
 function useSetupFlashState(setupFlashToken: number) {

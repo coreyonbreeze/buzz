@@ -25,7 +25,10 @@ import {
   type OnboardingTransitionDirection,
   OnboardingSlideTransition,
 } from "./OnboardingSlideTransition";
-import { ONBOARDING_RUNTIME_ORDER } from "./onboardingRuntimeSelection";
+import {
+  ONBOARDING_RUNTIME_ORDER,
+  runtimeIsInstalled,
+} from "./onboardingRuntimeSelection";
 import type { DefaultConfigStepActions } from "./types";
 
 type DefaultConfigStepProps = {
@@ -115,10 +118,19 @@ function AgentDefaultsSection({
     };
   }, []);
 
-  const selectedRuntimes = React.useMemo(
-    () => sortSelectedRuntimes(runtimesQuery.data ?? [], selectedRuntimeIds),
-    [runtimesQuery.data, selectedRuntimeIds],
-  );
+  const selectedRuntimes = React.useMemo(() => {
+    const catalog = runtimesQuery.data ?? [];
+    if (selectedRuntimeIds.length > 0) {
+      return sortSelectedRuntimes(catalog, selectedRuntimeIds);
+    }
+    // Reopening onboarding on this page can land here with no recorded
+    // harness selection (installs that predate selection persistence). Fall
+    // back to every installed harness rather than an empty dropdown.
+    return sortSelectedRuntimes(
+      catalog,
+      catalog.filter(runtimeIsInstalled).map((runtime) => runtime.id),
+    );
+  }, [runtimesQuery.data, selectedRuntimeIds]);
   const selectedRuntime = React.useMemo(() => {
     const preferredRuntime = selectedRuntimes.find(
       (runtime) => runtime.id === config.preferred_runtime,
@@ -129,10 +141,7 @@ function AgentDefaultsSection({
     selectedRuntime?.id ?? config.preferred_runtime ?? "";
   const configSurfaceLoading = isLoading || runtimesQuery.isLoading;
   const configSurfaceError =
-    runtimesQuery.isError ||
-    (!configSurfaceLoading &&
-      selectedRuntimeIds.length > 0 &&
-      !selectedRuntime);
+    runtimesQuery.isError || (!configSurfaceLoading && !selectedRuntime);
   const harnessOptions = React.useMemo(
     () =>
       selectedRuntimes.map((runtime) => ({

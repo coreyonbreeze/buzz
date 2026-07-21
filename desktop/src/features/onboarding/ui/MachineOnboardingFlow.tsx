@@ -25,7 +25,9 @@ import {
 import { OnboardingFooterProvider } from "./OnboardingFooter";
 import {
   getPreferredRuntimeIdForSelection,
+  loadStoredOnboardingRuntimeSelection,
   runtimeSelectionNeedsDefaultsStep,
+  storeOnboardingRuntimeSelection,
 } from "./onboardingRuntimeSelection";
 import { OnboardingSlideTransition } from "./OnboardingSlideTransition";
 import { SetupStep } from "./SetupStep";
@@ -60,7 +62,11 @@ export function MachineOnboardingFlow({
     null,
   );
   const [selectedRuntimeIds, setSelectedRuntimeIds] = React.useState<string[]>(
-    [],
+    // Reopening onboarding directly on the config page (Back from the
+    // first-community screen) skips the setup step that normally populates
+    // the selection — restore the one the setup step last saved.
+    () =>
+      initialPage === "config" ? loadStoredOnboardingRuntimeSelection() : [],
   );
   const [isRuntimeSelectionSaving, setIsRuntimeSelectionSaving] =
     React.useState(false);
@@ -78,6 +84,7 @@ export function MachineOnboardingFlow({
       const sequence = runtimeSaveSequence.current + 1;
       runtimeSaveSequence.current = sequence;
       setSelectedRuntimeIds(nextRuntimeIds);
+      storeOnboardingRuntimeSelection(nextRuntimeIds);
       setRuntimeSelectionError(null);
       setIsRuntimeSelectionSaving(true);
 

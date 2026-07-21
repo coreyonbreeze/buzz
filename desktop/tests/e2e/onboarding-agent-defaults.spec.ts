@@ -1289,6 +1289,64 @@ test("community setup back button returns to agent defaults", async ({
 
   await page.getByTestId("welcome-setup-back").click();
   await expect(page.getByTestId("onboarding-page-config")).toBeVisible();
+
+  // Regression: reopening remounts the onboarding flow, which used to lose
+  // the setup step's harness selection — both dropdowns came back empty.
+  const harnessSelect = page.getByTestId("global-agent-default-harness");
+  await expect(harnessSelect).toHaveText("Buzz");
+  await harnessSelect.click();
+  await expect(
+    page.getByTestId("global-agent-default-harness-option-buzz-agent"),
+  ).toBeVisible();
+  // The restored selection is exact — installed-but-unselected harnesses
+  // (the fallback list) must not appear.
+  await expect(
+    page.getByTestId("global-agent-default-harness-option-goose"),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+  await expect(page.locator("#global-agent-provider")).toBeVisible();
+  await expect(page.locator("#global-agent-model")).toBeVisible();
+});
+
+test("returning to agent defaults without a stored selection lists installed harnesses", async ({
+  page,
+}) => {
+  await installMockBridge(page, undefined, {
+    skipCommunitySeed: true,
+    skipOnboardingSeed: true,
+  });
+  await page.goto("/");
+
+  await navigateToConfigPage(page);
+  await page.getByTestId("onboarding-finish").click();
+  await expect(page.getByText("Join or create a community")).toBeVisible();
+
+  // Installs that completed onboarding before selection persistence shipped
+  // have no stored selection to restore.
+  await page.evaluate(() =>
+    window.localStorage.removeItem(
+      "buzz-machine-onboarding-runtime-selection.v1",
+    ),
+  );
+
+  await page.getByTestId("welcome-setup-back").click();
+  await expect(page.getByTestId("onboarding-page-config")).toBeVisible();
+
+  // Falls back to every installed harness instead of an empty dropdown; the
+  // persisted preferred runtime stays selected.
+  const harnessSelect = page.getByTestId("global-agent-default-harness");
+  await expect(harnessSelect).toHaveText("Buzz");
+  await harnessSelect.click();
+  await expect(
+    page.getByTestId("global-agent-default-harness-option-buzz-agent"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("global-agent-default-harness-option-goose"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("global-agent-default-harness-option-claude"),
+  ).toHaveCount(0);
+  await page.keyboard.press("Escape");
 });
 
 // ---------------------------------------------------------------------------
