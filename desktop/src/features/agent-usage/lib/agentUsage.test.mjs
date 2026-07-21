@@ -521,6 +521,23 @@ test("deriveUsageIngressTrailing returns 'Input/output reported' when only input
   assert.equal(deriveUsageIngressTrailing(series), "Input/output reported");
 });
 
+test("deriveUsageIngressTrailing appends '· Partial' when only incomplete I/O fields are known", () => {
+  const series = baseSeries({
+    agents: [
+      agentUsage("a", null, {
+        usage: reportedUsage({
+          inputTokens: usageField({ value: "800", incomplete: true }),
+          outputTokens: usageField({ value: "200" }),
+        }),
+      }),
+    ],
+  });
+  assert.equal(
+    deriveUsageIngressTrailing(series),
+    "Input/output reported · Partial",
+  );
+});
+
 test("deriveUsageIngressTrailing returns 'No recent data' when all usage fields are unknown", () => {
   const series = baseSeries({
     agents: [agentUsage("a", null)],

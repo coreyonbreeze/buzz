@@ -2,7 +2,10 @@ import * as React from "react";
 import { RefreshCw } from "lucide-react";
 
 import { useAppShell } from "@/app/AppShellContext";
-import type { AgentUsageSeries } from "@/shared/api/tauriArchive";
+import type {
+  AgentUsageModel,
+  AgentUsageSeries,
+} from "@/shared/api/tauriArchive";
 import { Alert, AlertDescription } from "@/shared/ui/alert";
 import { Badge } from "@/shared/ui/badge";
 import { Button } from "@/shared/ui/button";
@@ -12,6 +15,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/shared/ui/tabs";
 import { useAgentUsageSeries } from "../hooks";
 import {
   formatEstimatedCostUsd,
+  formatTokenCountCompact,
   formatTokenCountExact,
   isPartialField,
   isUnknownField,
@@ -115,10 +119,24 @@ function AgentUsageFocusedContent({
   const agent = series.agents[0];
   const collectionOff = !series.collectionEnabled;
   const hasRetainedData = series.coverage.reportCount > 0;
+  // Invalid-only: in-window invalid rows exist but none were bucketed (A5/A11).
+  // Distinct from outside-window history — we have evidence in this window,
+  // it just couldn't be counted. Must not be mislabeled as outside-window.
+  const hasInvalidOnlyInWindow =
+    agent === undefined &&
+    series.collectionEnabled &&
+    series.coverage.invalidReportCount > 0;
   const hasEvidenceOutsideWindow =
-    agent === undefined && series.hasArchivedEvidence === true;
+    agent === undefined &&
+    !hasInvalidOnlyInWindow &&
+    series.hasArchivedEvidence === true;
 
-  if (!collectionOff && agent === undefined && !hasEvidenceOutsideWindow) {
+  if (
+    !collectionOff &&
+    agent === undefined &&
+    !hasEvidenceOutsideWindow &&
+    !hasInvalidOnlyInWindow
+  ) {
     return (
       <p
         className="text-sm text-muted-foreground"
@@ -162,6 +180,15 @@ function AgentUsageFocusedContent({
         >
           No locally archived usage in the last {days} days, but this agent has
           reported usage previously. Try the 30-day window.
+        </p>
+      ) : hasInvalidOnlyInWindow ? (
+        <p
+          className="text-sm text-muted-foreground"
+          data-testid="agent-usage-focused-invalid-only"
+        >
+          Usage was collected in the last {days} days but could not be counted —
+          reports with unreadable timestamps or missing session totals are
+          excluded and are not assigned to any day.
         </p>
       ) : null}
     </div>
@@ -224,11 +251,12 @@ function AgentUsageFocusedTotals({
               </span>
               <span className="shrink-0 font-medium text-foreground">
                 {isUnknownField(model.usage.totalTokens)
-                  ? "No usage reported"
+                  ? formatModelIndependentFields(model)
                   : formatTokenCountExact(
                       parseTokenCount(model.usage.totalTokens.value) ?? 0n,
                     )}
-                {isPartialField(model.usage.totalTokens) ? (
+                {isPartialField(model.usage.totalTokens) ||
+                isModelIoPartial(model) ? (
                   <Badge className="ml-2" variant="outline">
                     Partial
                   </Badge>
@@ -319,4 +347,34 @@ function formatCoverageRange(coverage: AgentUsageSeries["coverage"]): string {
     return `reported ${formatCoverageDate(firstReportedAt)}`;
   }
   return `${formatCoverageDate(firstReportedAt)} – ${formatCoverageDate(lastReportedAt)}`;
+}
+
+/**
+ * Render known model I/O fields when the model total is unknown — never
+ * collapses to "No usage reported" when input or output is actually known
+ * (A2 per-field completeness). Mirrors `formatIndependentFields` in the
+ * overview row.
+ */
+function formatModelIndependentFields(model: AgentUsageModel): string {
+  const input = parseTokenCount(model.usage.inputTokens.value);
+  const output = parseTokenCount(model.usage.outputTokens.value);
+  if (input !== null || output !== null) {
+    const parts: string[] = [];
+    if (input !== null) parts.push(`in ${formatTokenCountCompact(input)}`);
+    if (output !== null) parts.push(`out ${formatTokenCountCompact(output)}`);
+    return parts.join(" · ");
+  }
+  return "No usage reported";
+}
+
+/**
+ * True when a model has no known total but its displayed I/O fields carry
+ * incomplete truth — so the Partial badge must still appear (A2).
+ */
+function isModelIoPartial(model: AgentUsageModel): boolean {
+  return (
+    isUnknownField(model.usage.totalTokens) &&
+    (isPartialField(model.usage.inputTokens) ||
+      isPartialField(model.usage.outputTokens))
+  );
 }

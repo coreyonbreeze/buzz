@@ -144,6 +144,13 @@ function AgentUsageCard({
   const hasRows = agents.length > 0;
   const collectionOff = !series.collectionEnabled;
   const hasRetainedData = series.coverage.reportCount > 0;
+  // True when the window has in-window invalid rows but no valid/bucketed rows.
+  // These rows are correctly excluded from buckets (A5/A11) but the window is
+  // not empty — coverage.hasUnknownUsage reflects this via the F1 roll-up.
+  const hasInvalidOnlyInWindow =
+    !hasRows &&
+    series.collectionEnabled &&
+    series.coverage.invalidReportCount > 0;
 
   // Relative bars are decorative (aria-hidden, per plan) — scale each agent's
   // known total against the largest known total in the current window so the
@@ -171,8 +178,10 @@ function AgentUsageCard({
             <span className="text-sm text-muted-foreground">
               {overallTotal.knownTotal !== null
                 ? `${formatTokenCountCompact(overallTotal.knownTotal)} tokens`
-                : "No usage reported"}
-              {overallTotal.partial ? (
+                : hasInvalidOnlyInWindow
+                  ? "Usage uncountable"
+                  : "No usage reported"}
+              {overallTotal.partial || hasInvalidOnlyInWindow ? (
                 <Badge className="ml-2" variant="outline">
                   Partial
                 </Badge>
@@ -227,7 +236,9 @@ function AgentUsageCard({
         >
           {collectionOff
             ? "Turn on collection to start tracking agent usage."
-            : `No locally archived usage in the last ${days} days. Usage appears after an agent completes a usage-reporting turn.`}
+            : hasInvalidOnlyInWindow
+              ? `Usage was collected in the last ${days} days but could not be counted — reports with unreadable timestamps or missing session totals are excluded.`
+              : `No locally archived usage in the last ${days} days. Usage appears after an agent completes a usage-reporting turn.`}
         </p>
       )}
     </Card>
@@ -265,6 +276,13 @@ function AgentUsageRow({
   const partial = isPartialField(total);
   const unknown = isUnknownField(total);
 
+  // When total is null (unknown), check whether any displayed I/O field is
+  // incomplete — per-field partial truth must be preserved at every seam (A2).
+  const ioPartial =
+    knownTotal === null &&
+    (isPartialField(agent.usage.inputTokens) ||
+      isPartialField(agent.usage.outputTokens));
+
   const trailing =
     knownTotal !== null
       ? formatTokenCountCompact(knownTotal)
@@ -300,7 +318,7 @@ function AgentUsageRow({
         ) : null}
       </span>
       <span className="flex shrink-0 items-center gap-2 text-sm text-muted-foreground">
-        {partial ? <Badge variant="outline">Partial</Badge> : null}
+        {partial || ioPartial ? <Badge variant="outline">Partial</Badge> : null}
         {trailing}
       </span>
     </button>

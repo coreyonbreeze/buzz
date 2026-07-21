@@ -335,6 +335,29 @@ mod media_download_tests {
     }
 }
 
+const QUERY_PAGE_SIZE: u32 = 500;
+
+fn advance_query_cursor(
+    filter: &mut serde_json::Value,
+    page: &[serde_json::Value],
+) -> Result<(), CliError> {
+    let last = page
+        .last()
+        .expect("a full query page always has a last event");
+    let created_at = last
+        .get("created_at")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| CliError::Other("query event missing created_at".into()))?;
+    let id = last
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()))
+        .ok_or_else(|| CliError::Other("query event missing valid id".into()))?;
+    filter["until"] = serde_json::json!(created_at);
+    filter["before_id"] = serde_json::json!(id);
+    Ok(())
+}
+
 pub struct BuzzClient {
     http: reqwest::Client,
     relay_url: String, // base URL, no trailing slash, e.g. "https://relay.buzz.place"
@@ -426,6 +449,87 @@ impl BuzzClient {
             Some(ref json) => req.header("x-auth-tag", json),
             None => req,
         }
+    }
+
+    async fn query_pages(
+        &self,
+        mut filter: serde_json::Value,
+        limit: Option<u32>,
+    ) -> Result<Vec<serde_json::Value>, CliError> {
+        let mut events = Vec::new();
+
+        while limit.is_none_or(|limit| events.len() < limit as usize) {
+            let page_limit = limit
+                .map(|limit| (limit as usize - events.len()).min(QUERY_PAGE_SIZE as usize))
+                .unwrap_or(QUERY_PAGE_SIZE as usize);
+            filter["limit"] = serde_json::json!(page_limit);
+
+            let raw = self.query(&filter).await?;
+            let page: Vec<serde_json::Value> = serde_json::from_str(&raw)
+                .map_err(|e| CliError::Other(format!("failed to parse query response: {e}")))?;
+            let done = page.len() < page_limit;
+
+            if !done {
+                advance_query_cursor(&mut filter, &page)?;
+            }
+            events.extend(page);
+            if done {
+                break;
+            }
+        }
+
+        Ok(events)
+    }
+
+    /// Query up to `limit` historical events, following the relay bridge's
+    /// composite `(until, before_id)` cursor across bounded result pages.
+    pub async fn query_paginated(
+        &self,
+        filter: serde_json::Value,
+        limit: u32,
+    ) -> Result<Vec<serde_json::Value>, CliError> {
+        self.query_pages(filter, Some(limit)).await
+    }
+
+    /// Query every historical event matching a filter across bounded pages.
+    pub async fn query_all(
+        &self,
+        filter: serde_json::Value,
+    ) -> Result<Vec<serde_json::Value>, CliError> {
+        self.query_pages(filter, None).await
+    }
+
+    /// Sign an event builder verbatim: no NIP-OA auth-tag injection, and none
+    /// of [`sign_event`]'s "callers must not add auth tags" enforcement.
+    ///
+    /// Used only for NIP-IA identity archive/unarchive requests (kind
+    /// 9035/9036), whose optional `auth` tag is a *content-level*
+    /// owner-of-agent attestation about the *target* identity — unrelated to
+    /// this client's own NIP-OA membership delegation (`self.auth_tag`,
+    /// which [`sign_event`] injects into every other event and which
+    /// `submit_event` separately attaches via the `x-auth-tag` HTTP header).
+    /// Routing an identity archive request through `sign_event` would either
+    /// silently drop the caller's owner attestation or double up an
+    /// unrelated tag.
+    pub fn sign_event_unchecked(&self, builder: EventBuilder) -> Result<nostr::Event, CliError> {
+        builder
+            .sign_with_keys(&self.keys)
+            .map_err(|e| CliError::Other(format!("signing failed: {e}")))
+    }
+
+    /// GET a public, unauthenticated relay endpoint (e.g. the NIP-11 `/info`
+    /// document), returning the raw JSON body. No NIP-98 Authorization and no
+    /// `x-auth-tag` header — the endpoint is public relay metadata, not a
+    /// membership-scoped resource.
+    pub async fn get_public(&self, path: &str) -> Result<String, CliError> {
+        let url = format!("{}{path}", self.relay_url);
+        let resp = self
+            .http
+            .get(&url)
+            .header("Accept", "application/nostr+json")
+            .send()
+            .await?;
+        self.handle_response(resp).await
     }
 
     /// Execute a one-shot query via the HTTP bridge.
@@ -849,7 +953,38 @@ pub fn normalize_write_response(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{create_response_with_id, extract_relay_response_field};
+    use super::{
+        advance_query_cursor, create_response_with_id, extract_relay_response_field, BuzzClient,
+    };
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    #[test]
+    fn query_cursor_uses_last_events_composite_sort_key() {
+        let mut filter = serde_json::json!({"kinds": [39000], "limit": 500});
+        let page = vec![
+            serde_json::json!({"id": "a".repeat(64), "created_at": 20}),
+            serde_json::json!({"id": "b".repeat(64), "created_at": 10}),
+        ];
+
+        advance_query_cursor(&mut filter, &page).unwrap();
+
+        assert_eq!(filter["until"], serde_json::json!(10));
+        assert_eq!(filter["before_id"], serde_json::json!("b".repeat(64)));
+    }
+
+    #[test]
+    fn query_cursor_rejects_missing_or_malformed_sort_key() {
+        let mut filter = serde_json::json!({});
+        assert!(
+            advance_query_cursor(&mut filter, &[serde_json::json!({"id": "a".repeat(64)})])
+                .is_err()
+        );
+        assert!(advance_query_cursor(
+            &mut filter,
+            &[serde_json::json!({"id": "not-an-event-id", "created_at": 10})]
+        )
+        .is_err());
+    }
 
     #[test]
     fn extract_relay_response_field_reads_response_message_json() {
@@ -874,5 +1009,126 @@ mod tests {
         assert_eq!(v["workflow_id"].as_str(), Some("relay-id"));
         assert_eq!(v["event_id"].as_str(), Some("abc"));
         assert_eq!(v["accepted"].as_bool(), Some(true));
+    }
+
+    // --- (a) auth-suppression regression pair ---
+
+    fn make_auth_tag() -> (Tag, String) {
+        let owner_hex = "a".repeat(64);
+        let sig_hex = "b".repeat(128);
+        let tag_vec = vec![
+            "auth".to_string(),
+            owner_hex,
+            "conditions".to_string(),
+            sig_hex,
+        ];
+        let json = serde_json::to_string(&tag_vec).unwrap();
+        let tag = Tag::parse(tag_vec).unwrap();
+        (tag, json)
+    }
+
+    #[test]
+    fn sign_event_unchecked_does_not_inject_ambient_auth_tag() {
+        let keys = Keys::generate();
+        let (auth_tag, auth_json) = make_auth_tag();
+        let client = BuzzClient::new(
+            "https://test.relay".into(),
+            keys,
+            Some(auth_tag),
+            Some(auth_json),
+        )
+        .unwrap();
+
+        let builder =
+            EventBuilder::new(Kind::Custom(9035), "archive").tags([Tag::parse(["-"]).unwrap()]);
+        let event = client.sign_event_unchecked(builder).unwrap();
+
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
+            .collect();
+        assert!(
+            auth_tags.is_empty(),
+            "sign_event_unchecked must not inject the ambient NIP-OA auth tag \
+             into identity archive events; found {auth_tags:?}"
+        );
+    }
+
+    #[test]
+    fn sign_event_unchecked_preserves_callers_content_auth_tag() {
+        let keys = Keys::generate();
+        let (auth_tag, auth_json) = make_auth_tag();
+        let client = BuzzClient::new(
+            "https://test.relay".into(),
+            keys,
+            Some(auth_tag),
+            Some(auth_json),
+        )
+        .unwrap();
+
+        let content_auth = Tag::parse([
+            "auth",
+            &"c".repeat(64),
+            "owner-attestation",
+            &"d".repeat(128),
+        ])
+        .unwrap();
+
+        let builder = EventBuilder::new(Kind::Custom(9035), "archive")
+            .tags([Tag::parse(["-"]).unwrap(), content_auth]);
+        let event = client.sign_event_unchecked(builder).unwrap();
+
+        let auth_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice().first().map(|s| s.as_str()) == Some("auth"))
+            .collect();
+        assert_eq!(
+            auth_tags.len(),
+            1,
+            "content-level auth tag must survive sign_event_unchecked; found {auth_tags:?}"
+        );
+        assert_eq!(auth_tags[0].as_slice()[1], "c".repeat(64));
+    }
+
+    #[test]
+    fn with_auth_tag_sets_header_when_configured() {
+        let keys = Keys::generate();
+        let (auth_tag, auth_json) = make_auth_tag();
+        let client = BuzzClient::new(
+            "https://test.relay".into(),
+            keys,
+            Some(auth_tag),
+            Some(auth_json.clone()),
+        )
+        .unwrap();
+
+        let req = client.http.post("https://test.relay/events");
+        let req = client.with_auth_tag(req);
+        let built = req.build().unwrap();
+        let header = built
+            .headers()
+            .get("x-auth-tag")
+            .expect("x-auth-tag header must be present");
+        assert_eq!(
+            header.to_str().unwrap(),
+            &auth_json,
+            "x-auth-tag header must carry the raw auth tag JSON"
+        );
+    }
+
+    #[test]
+    fn with_auth_tag_omits_header_when_not_configured() {
+        let keys = Keys::generate();
+        let client = BuzzClient::new("https://test.relay".into(), keys, None, None).unwrap();
+
+        let req = client.http.post("https://test.relay/events");
+        let req = client.with_auth_tag(req);
+        let built = req.build().unwrap();
+        assert!(
+            built.headers().get("x-auth-tag").is_none(),
+            "x-auth-tag header must not be present when no auth tag is configured"
+        );
     }
 }

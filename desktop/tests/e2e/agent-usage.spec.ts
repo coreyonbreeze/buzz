@@ -813,3 +813,135 @@ test("focused view shows daily bars, coverage dates, and a partial explanation w
     page.getByTestId("agent-usage-focused-partial-explanation"),
   ).toBeVisible();
 });
+
+// ── T1: invalid-only window behavioral coverage ───────────────────────────────
+
+test("overview and focused view distinguish invalid-only windows from ordinary empty windows", async ({
+  page,
+}) => {
+  // An invalid-only window: invalidReportCount > 0, zero valid agents/buckets.
+  // The overview must NOT say "No locally archived usage in the last N days"
+  // and the focused view must NOT show "Try the 30-day window" — both would
+  // mislabel in-window-but-uncountable evidence as absent.
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "Invalid Bot");
+
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [], // no valid rows
+        buckets: [], // invalid rows never bucketed
+        coverage: {
+          firstArchivedAt: 1_700_000_000,
+          firstReportedAt: null,
+          hasUnknownUsage: true,
+          invalidReportCount: 2, // the signal
+          lastArchivedAt: 1_700_086_400,
+          lastReportedAt: null,
+          reportCount: 0,
+        },
+        hasArchivedEvidence: true, // A13 returns true for invalid rows too
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  await expect(page.getByTestId("agent-usage-card")).toBeVisible();
+
+  // Overview empty-state must reflect uncountable usage, not ordinary empty.
+  const empty = page.getByTestId("agent-usage-empty");
+  await expect(empty).toBeVisible();
+  await expect(empty).not.toContainText("No locally archived usage");
+  await expect(empty).toContainText("could not be counted");
+
+  // Navigate directly to the focused usage view for this agent.
+  await page.evaluate((pubkey) => {
+    (
+      window as Window & {
+        __TSR_ROUTER__?: { navigate: (opts: Record<string, unknown>) => void };
+      }
+    ).__TSR_ROUTER__?.navigate({
+      to: "/agents",
+      search: { profile: pubkey, profileView: "usage" },
+    });
+  }, agentPubkey);
+  await expect(page.getByTestId("agent-usage-focused-view")).toBeVisible({
+    timeout: 10_000,
+  });
+
+  // Focused view must show the invalid-only state, NOT "Try the 30-day window".
+  await expect(
+    page.getByTestId("agent-usage-focused-invalid-only"),
+  ).toBeVisible();
+  await expect(
+    page.getByTestId("agent-usage-focused-outside-window"),
+  ).toHaveCount(0);
+});
+
+// ── T2: I/O-incomplete partial behavioral coverage ────────────────────────────
+
+test("overview row shows Partial badge and ingress shows partial marker when I/O fields are incomplete with null total", async ({
+  page,
+}) => {
+  await installMockBridge(page);
+  await openAgentsView(page);
+
+  const agentPubkey = await addGenericAgent(page, "general", "IO Partial Bot");
+
+  await page.evaluate(
+    ({ series }) => {
+      const testWindow = window as Window & {
+        __BUZZ_E2E__?: { mock?: { agentUsageSeries?: unknown } };
+      };
+      testWindow.__BUZZ_E2E__ ??= {};
+      testWindow.__BUZZ_E2E__.mock ??= {};
+      testWindow.__BUZZ_E2E__.mock.agentUsageSeries = series;
+    },
+    {
+      series: mockUsageSeries({
+        agents: [
+          mockAgentUsage(agentPubkey, {
+            usage: {
+              // null total, incomplete I/O — per-field Partial must surface
+              estimatedCostUsd: costField(null),
+              inputTokens: usageField("800", true), // incomplete
+              outputTokens: usageField("200", false),
+              totalTokens: usageField(null),
+            },
+          }),
+        ],
+      }),
+    },
+  );
+
+  await page.getByTestId("open-agents-view").click();
+  const row = page.getByTestId(`agent-usage-row-${agentPubkey}`);
+  await expect(row).toBeVisible();
+
+  // Row must show Partial badge — not just the I/O text.
+  await expect(row.getByText("Partial", { exact: true })).toBeVisible();
+  // Row must show the I/O breakdown text.
+  await expect(row).toContainText("in 800");
+
+  // Open the profile panel to reach the Info tab for ingress verification.
+  await row.click();
+  await expect(page.getByTestId("user-profile-panel")).toBeVisible();
+  await page.getByTestId("user-profile-panel-back").click();
+  await expect(page.getByTestId("user-profile-tab-info")).toBeVisible();
+
+  // The ingress trailing for an I/O-only-with-partial series must contain
+  // "Partial" (i.e., "Input/output reported · Partial").
+  const ingressRow = page.getByTestId(`user-profile-view-usage-${agentPubkey}`);
+  await expect(ingressRow).toBeVisible();
+  await expect(ingressRow).toContainText("Partial");
+});

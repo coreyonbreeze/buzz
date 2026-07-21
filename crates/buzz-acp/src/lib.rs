@@ -1157,11 +1157,10 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    //
-    // Finding #10: one agent failing to start must not kill the whole pool.
-    // We attempt each spawn under a 60-second timeout; failures are logged and
-    // skipped. If ALL agents fail we return an error. A partial pool is valid —
-    // the harness continues with reduced capacity and logs a warning.
+    // One agent failing to start must not kill the whole pool. We attempt each
+    // spawn under a 60-second timeout; failures are logged and skipped. If ALL
+    // agents fail we return an error. A partial pool is valid — the harness
+    // continues with reduced capacity and logs a warning.
     let mut agent_slots: Vec<Option<OwnedAgent>> = Vec::with_capacity(config.agents as usize);
     for i in 0..config.agents as usize {
         // Spawn OUTSIDE the timeout so we always own the child for cleanup.
@@ -1248,13 +1247,11 @@ async fn tokio_main() -> Result<()> {
     tracing::info!("agent_pool_ready agents={}", live_count);
     let mut pool = AgentPool::from_slots(agent_slots);
 
-    //
-    // Finding #22: capture a startup watermark BEFORE connecting to the relay.
-    // This timestamp is used for membership notification replay (via
-    // startup_watermark) and as the initial subscribe_since for channels
-    // discovered at startup. The Subscribe handler falls back to
-    // subscribe_since when last_seen is None, closing the blind spot
-    // between "agents ready" and "first REQ sent".
+    // Capture a startup watermark BEFORE connecting to the relay. This timestamp
+    // is used for membership notification replay (via startup_watermark) and as
+    // the initial subscribe_since for channels discovered at startup. The Subscribe
+    // handler falls back to subscribe_since when last_seen is None, closing the
+    // blind spot between "agents ready" and "first REQ sent".
     let startup_watermark: u64 = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1273,7 +1270,7 @@ async fn tokio_main() -> Result<()> {
             .await
             .map_err(|e| anyhow::anyhow!("relay connect error: {e}"))?;
 
-    // Finding #22: tell the relay background task the watermark so it can use
+    // Tell the relay background task the watermark so it can use
     // `since = watermark - 5s` on the first REQ instead of `since=now`.
     // Best-effort: a failure here is non-fatal (we just lose the startup window
     // protection, which is the same as the pre-fix behaviour).
@@ -1697,8 +1694,8 @@ async fn tokio_main() -> Result<()> {
             let (result_rx, join_set) = pool.rx_and_join_set();
             tokio::select! {
                 biased;
-                // Finding #24: recv() returning None means all senders dropped
-                // (pool was torn down). Break cleanly instead of panicking.
+                // recv() returning None means all senders dropped (pool was torn down).
+                // Break cleanly instead of panicking.
                 r = result_rx.recv() => match r {
                     Some(result) => Some(PoolEvent::Result(Box::new(result))),
                     None => {
@@ -2331,6 +2328,9 @@ async fn tokio_main() -> Result<()> {
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
+                if matches!(ack, Ok(pool::SteerAck::Success)) {
+                    queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
+                }
                 if drop_withheld {
                     queue.remove_event(channel_id, &event_id);
                 }
@@ -2779,6 +2779,15 @@ fn handle_prompt_result(
         .retain(|_, meta| meta.agent_index != agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
 
+    // The hard-timeout death_message (below) must describe the batch's
+    // *actual* fate, not just the `recently_active` eligibility flag — a
+    // recently-active batch that exhausts the retry budget in queue.requeue()
+    // is dead-lettered same as an immediate one, and both differ from a
+    // channel-removed drop or a heartbeat call with no batch at all. Each
+    // branch below records what actually happened; only the hard-timeout
+    // match arm in the death_message construction reads it.
+    let mut hard_timeout_fate_suffix: Option<&'static str> = None;
+
     // Requeue BEFORE mark_complete: requeue() sets retry_after with a future
     // deadline, and mark_complete() checks for it to decide whether to preserve
     // retry_counts. If mark_complete runs first, retry_counts is cleared and
@@ -2808,15 +2817,16 @@ fn handle_prompt_result(
                 // accounting, same as a clean cancel.
                 let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
                 queue.requeue_as_cancelled(batch, reason);
-            } else if matches!(result.outcome, PromptOutcome::Timeout(TimeoutKind::Hard)) {
-                // Hard-cap timeout is deterministic: re-running the same task
-                // from a fresh session will reproduce the same death. Dead-letter
-                // immediately without requeueing so the channel isn't subjected to
-                // up to 10 × 1-hour retry cycles.
+            } else if matches!(
+                result.outcome,
+                PromptOutcome::Timeout(TimeoutKind::Hard {
+                    recently_active: false
+                })
+            ) {
                 tracing::error!(
                     channel_id = %batch.channel_id,
                     events = batch.events.len(),
-                    "dead-lettering batch after hard-cap timeout — discarding {} events",
+                    "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
                     batch.events.len(),
                 );
                 let content = format!(
@@ -2824,16 +2834,32 @@ fn handle_prompt_result(
                     config.max_turn_duration_secs
                 );
                 spawn_failure_notice(rest_client, &batch, content);
+                hard_timeout_fate_suffix = Some(" — dead-lettered (no recent activity)");
+            } else if matches!(
+                result.outcome,
+                PromptOutcome::Timeout(TimeoutKind::Hard {
+                    recently_active: true
+                })
+            ) {
+                tracing::warn!(
+                    channel_id = %batch.channel_id,
+                    events = batch.events.len(),
+                    "hard-cap timeout with recent activity — requeueing for retry"
+                );
+                if let Some(dead) = queue.requeue(batch) {
+                    let content = format!(
+                        "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                        config.max_turn_duration_secs
+                    );
+                    spawn_failure_notice(rest_client, &dead, content);
+                    hard_timeout_fate_suffix = Some(" — dead-lettered (retry budget exhausted)");
+                } else {
+                    hard_timeout_fate_suffix = Some(" — requeued for retry (recently active)");
+                }
             } else if let Some(dead) = queue.requeue(batch) {
-                // Dead-lettered: retries exhausted and the events are gone.
-                // Post a visible notice so the channel isn't left waiting on
-                // a turn that will never happen.
                 let reason = match &result.outcome {
                     PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
-                    // Unreachable today: Timeout(Hard) is consumed by the immediate
-                    // dead-letter arm above before requeue() runs. Fail soft rather
-                    // than panicking the main loop if that chain is ever reordered.
-                    PromptOutcome::Timeout(TimeoutKind::Hard) => {
+                    PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
                         "the turn exceeded the maximum duration".to_string()
                     }
                     PromptOutcome::AgentExited => "the agent process exited".to_string(),
@@ -2851,6 +2877,7 @@ fn handle_prompt_result(
                 events = batch.events.len(),
                 "dropping failed batch for removed channel"
             );
+            hard_timeout_fate_suffix = Some(" — batch dropped (channel removed)");
         }
     }
 
@@ -2870,7 +2897,7 @@ fn handle_prompt_result(
         PromptOutcome::Ok(_) => "ok",
         PromptOutcome::Error(_) => "error",
         PromptOutcome::Timeout(TimeoutKind::Idle) => "idle_timeout",
-        PromptOutcome::Timeout(TimeoutKind::Hard) => "hard_timeout",
+        PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => "hard_timeout",
         PromptOutcome::AgentExited => "exited",
         PromptOutcome::Cancelled => "cancelled",
         PromptOutcome::CancelDrainTimeout(_) => "cancel_drain_timeout",
@@ -2934,10 +2961,16 @@ fn handle_prompt_result(
             );
             let death_message: String = match outcome_label {
                 "exited" => "Agent process exited unexpectedly".to_string(),
-                "hard_timeout" => format!(
-                    "Agent turn exceeded the maximum duration ({}s)",
-                    config.max_turn_duration_secs
-                ),
+                "hard_timeout" => {
+                    // Neutral wording when no fate was recorded above: a
+                    // heartbeat hard timeout carries no batch at all, so
+                    // nothing was requeued or dead-lettered.
+                    let suffix = hard_timeout_fate_suffix.unwrap_or(" (no batch to retry)");
+                    format!(
+                        "Agent turn exceeded the maximum duration ({}s){}",
+                        config.max_turn_duration_secs, suffix
+                    )
+                }
                 _ => "Agent session timed out due to inactivity".to_string(),
             };
             emit_turn_error(&death_message, None);
@@ -4541,7 +4574,10 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn hard_timeout_emits_exactly_one_feed_event() {
         assert_eq!(
-            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Hard)).await,
+            turn_errors_emitted_for(PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false
+            }))
+            .await,
             1
         );
     }
@@ -4615,7 +4651,13 @@ mod error_outcome_emission_tests {
             );
         };
         check_label(PromptOutcome::Timeout(TimeoutKind::Idle), "idle_timeout").await;
-        check_label(PromptOutcome::Timeout(TimeoutKind::Hard), "hard_timeout").await;
+        check_label(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            "hard_timeout",
+        )
+        .await;
         check_label(
             PromptOutcome::CancelDrainTimeout(std::time::Duration::from_secs(5)),
             "cancel_drain_timeout",
@@ -4697,15 +4739,23 @@ mod error_outcome_emission_tests {
             )
         };
 
-        // Hard timeout: batch must NOT be requeued (dead-lettered immediately).
+        // Hard timeout (not recently active): dead-lettered immediately.
         let hard_batch = make_batch();
-        let (hard_channels, hard_events) =
-            run(PromptOutcome::Timeout(TimeoutKind::Hard), hard_batch).await;
+        let (hard_channels, hard_events) = run(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false,
+            }),
+            hard_batch,
+        )
+        .await;
         assert_eq!(
             hard_channels, 0,
-            "hard-cap timeout must not requeue the batch"
+            "hard-cap timeout (not recently active) must not requeue the batch"
         );
-        assert_eq!(hard_events, 0, "hard-cap timeout must drop all events");
+        assert_eq!(
+            hard_events, 0,
+            "hard-cap timeout (not recently active) must drop all events"
+        );
 
         // Idle timeout: batch IS requeued (first attempt, not yet dead-lettered).
         let idle_batch = make_batch();
@@ -4718,6 +4768,277 @@ mod error_outcome_emission_tests {
         assert_eq!(
             idle_events, 1,
             "idle timeout must preserve the event for retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_timeout_recently_active_requeues_batch() {
+        let channel_id = Uuid::new_v4();
+        let make_batch = || {
+            let keys = Keys::generate();
+            let event = EventBuilder::new(Kind::Custom(9), "test")
+                .sign_with_keys(&keys)
+                .unwrap();
+            FlushBatch {
+                channel_id,
+                events: vec![BatchEvent {
+                    event,
+                    prompt_tag: "test".into(),
+                    received_at: std::time::Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            }
+        };
+
+        let run = |outcome: PromptOutcome, batch: FlushBatch| async move {
+            let channel_id = batch.channel_id;
+            let agent = dummy_agent(0).await;
+            let mut pool = AgentPool::from_slots(vec![None]);
+            let task_id = pool.join_set.spawn(async {}).id();
+            pool.task_map_mut().insert(
+                task_id,
+                crate::pool::TaskMeta {
+                    agent_index: 0,
+                    channel_id: None,
+                    turn_id: "test-turn-id".to_string(),
+                    recoverable_batch: None,
+                    control_tx: None,
+                    steer_tx: None,
+                },
+            );
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            let config = test_config();
+            let mut heartbeat_in_flight = false;
+            let removed_channels = HashSet::new();
+            let mut crash_history = vec![SlotCircuit {
+                crash_times: Vec::new(),
+                open_until: None,
+                respawn_in_flight: false,
+            }];
+            let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+            let mut respawn_tasks = tokio::task::JoinSet::new();
+            let result = PromptResult {
+                agent,
+                source: PromptSource::Channel(channel_id),
+                turn_id: "test-turn-id".to_string(),
+                outcome,
+                batch: Some(batch),
+            };
+            handle_prompt_result(
+                &mut pool,
+                &mut queue,
+                &config,
+                result,
+                &mut heartbeat_in_flight,
+                &removed_channels,
+                &mut crash_history,
+                &respawn_tx,
+                &mut respawn_tasks,
+                None,
+                None,
+            );
+            (
+                queue.pending_channels(),
+                queue.queued_event_count(&channel_id),
+            )
+        };
+
+        let batch = make_batch();
+        let (channels, events) = run(
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch,
+        )
+        .await;
+        assert_eq!(
+            channels, 1,
+            "hard-cap timeout with recent activity must requeue the batch"
+        );
+        assert_eq!(
+            events, 1,
+            "hard-cap timeout with recent activity must preserve the event"
+        );
+    }
+
+    /// The hard-timeout `death_message` must report what actually happened to
+    /// the batch, not just the `recently_active` eligibility flag: a
+    /// recently-active batch within its retry budget is requeued, so the
+    /// observer payload must say so.
+    #[tokio::test]
+    async fn hard_timeout_recently_active_requeue_success_reports_requeued_for_retry() {
+        let channel_id = Uuid::new_v4();
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: EventBuilder::new(Kind::Custom(9), "test")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!(
+                "Agent turn exceeded the maximum duration ({}s) — requeued for retry (recently active)",
+                config.max_turn_duration_secs
+            ),
+        );
+        assert_eq!(
+            queue.pending_channels(),
+            1,
+            "batch must be requeued, not dead-lettered, while within the retry budget"
+        );
+    }
+
+    /// Same recently-active hard timeout, but the channel has already
+    /// exhausted its retry budget ([`crate::queue::MAX_RETRIES`] prior
+    /// attempts) — `queue.requeue()` dead-letters instead of requeueing, and
+    /// the observer payload must report that fate, not the requeue wording
+    /// above.
+    #[tokio::test]
+    async fn hard_timeout_recently_active_budget_exhausted_reports_dead_lettered() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        // Simulate MAX_RETRIES prior failed attempts on this channel so the
+        // upcoming requeue() call in handle_prompt_result crosses the
+        // dead-letter threshold.
+        queue.set_retry_count_for_test(channel_id, crate::queue::MAX_RETRIES);
+
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: None,
+                turn_id: "test-turn-id".to_string(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+            },
+        );
+        let config = test_config();
+        let mut heartbeat_in_flight = false;
+        let removed_channels = HashSet::new();
+        let mut crash_history = vec![SlotCircuit {
+            crash_times: Vec::new(),
+            open_until: None,
+            respawn_in_flight: false,
+        }];
+        let (respawn_tx, _respawn_rx) = mpsc::channel(8);
+        let mut respawn_tasks = tokio::task::JoinSet::new();
+        let observer = ObserverHandle::in_process();
+        let batch = FlushBatch {
+            channel_id,
+            events: vec![BatchEvent {
+                event: EventBuilder::new(Kind::Custom(9), "final-attempt")
+                    .sign_with_keys(&Keys::generate())
+                    .unwrap(),
+                prompt_tag: "test".into(),
+                received_at: std::time::Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let result = PromptResult {
+            agent,
+            source: PromptSource::Channel(channel_id),
+            turn_id: "test-turn-id".to_string(),
+            outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true,
+            }),
+            batch: Some(batch),
+        };
+        handle_prompt_result(
+            &mut pool,
+            &mut queue,
+            &config,
+            result,
+            &mut heartbeat_in_flight,
+            &removed_channels,
+            &mut crash_history,
+            &respawn_tx,
+            &mut respawn_tasks,
+            Some(observer.clone()),
+            None,
+        );
+
+        let events = observer.snapshot();
+        let turn_error = events
+            .iter()
+            .find(|e| e.kind == "turn_error")
+            .expect("exactly one turn_error event must be emitted");
+        assert_eq!(
+            turn_error.payload["error"].as_str().unwrap(),
+            format!(
+                "Agent turn exceeded the maximum duration ({}s) — dead-lettered (retry budget exhausted)",
+                config.max_turn_duration_secs
+            ),
+        );
+        assert_eq!(
+            queue.queued_event_count(&channel_id),
+            0,
+            "batch with an exhausted retry budget must be dead-lettered, not requeued"
         );
     }
 

@@ -200,8 +200,16 @@ export function AgentConfigFields({
     () => getGlobalModelFallback(bakedEnv, effectiveProvider, config.env_vars),
     [bakedEnv, config.env_vars, effectiveProvider],
   );
+  const modelField = fieldModel.fields.find(
+    (field) => field.kind === "model" && field.render === "control",
+  );
+  // CLI-login harnesses apply this setting through ACP rather than an env var
+  // and provide their own default when no model override is persisted.
+  const modelIsOptional = modelField?.targetApplication.kind === "acpNative";
   const modelIsValid =
-    (config.model?.trim().length ?? 0) > 0 || fallbackModel !== null;
+    modelIsOptional ||
+    (config.model?.trim().length ?? 0) > 0 ||
+    fallbackModel !== null;
   React.useEffect(() => {
     onValidityChange?.(modelIsValid);
   }, [modelIsValid, onValidityChange]);
@@ -272,6 +280,16 @@ export function AgentConfigFields({
   const healOnMount =
     fieldModel.dependentValuePolicy.onCatalogMismatch === "onboardingCleanup";
   const userEditedProviderRef = React.useRef(false);
+  // Env vars live under a collapsed Advanced section (matching the create
+  // flow). Auto-open when a required key is missing so the field the user
+  // must fill is never hidden behind the toggle.
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+  const requiredAdvancedKeyMissing = advancedRequiredEnvKeys.some(
+    (key) => !(config.env_vars[key] ?? "").trim(),
+  );
+  React.useEffect(() => {
+    if (requiredAdvancedKeyMissing) setAdvancedOpen(true);
+  }, [requiredAdvancedKeyMissing]);
   // Read inside effects via ref so biome's exhaustive-deps stays honest:
   // refs are stable, and healOnMount is captured at declaration.
   const mayMutateDependentFieldsRef = React.useRef(false);
@@ -643,6 +661,7 @@ export function AgentConfigFields({
           isCustomModelEditing={isCustomModelEditing}
           isRequired={
             showRequiredIndicators &&
+            !modelIsOptional &&
             fallbackModel === null &&
             !dependentFieldsDisabled
           }
@@ -717,9 +736,23 @@ export function AgentConfigFields({
       ) : null}
 
       {showAdvancedFields ? (
-        <>
-          {/* Env vars */}
-          <div className={blockClassName}>
+        <div className={cn(blockClassName, "space-y-3")}>
+          <button
+            aria-expanded={advancedOpen}
+            className="inline-flex h-9 items-center gap-1.5 text-sm font-medium text-foreground transition-colors hover:text-foreground/80 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+            data-testid="global-agent-advanced-toggle"
+            onClick={() => setAdvancedOpen((current) => !current)}
+            type="button"
+          >
+            <span>Advanced</span>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 text-muted-foreground transition-transform duration-150 ease-out",
+                advancedOpen && "rotate-180",
+              )}
+            />
+          </button>
+          {advancedOpen ? (
             <EnvVarsEditor
               hiddenKeys={apiKeyEnvVar ? [apiKeyEnvVar] : []}
               inheritedRows={bakedGenericRows}
@@ -733,8 +766,8 @@ export function AgentConfigFields({
                 ),
               )}
             />
-          </div>
-        </>
+          ) : null}
+        </div>
       ) : null}
     </>
   );

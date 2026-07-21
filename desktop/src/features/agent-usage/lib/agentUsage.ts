@@ -272,7 +272,11 @@ export function deriveUsageIngressTrailing(series: AgentUsageSeries): string {
     parseTokenCount(inputTokens.value) !== null ||
     parseTokenCount(outputTokens.value) !== null
   ) {
-    return "Input/output reported";
+    const ioPartial =
+      isPartialField(inputTokens) || isPartialField(outputTokens);
+    return ioPartial
+      ? "Input/output reported · Partial"
+      : "Input/output reported";
   }
   return "No recent data";
 }
