@@ -542,6 +542,9 @@ export function InboxDetailPane({
                 profiles,
               );
 
+              const canEditMessage =
+                channel?.archivedAt === null && canManageMessage;
+
               return (
                 <InboxMessageRow
                   agentPubkeys={agentPubkeys}
@@ -552,7 +555,7 @@ export function InboxDetailPane({
                   isFocusHighlightVisible={isFocusHighlightVisible}
                   key={message.id}
                   message={message}
-                  onEdit={canManageMessage ? handleSelectEditTarget : undefined}
+                  onEdit={canEditMessage ? handleSelectEditTarget : undefined}
                   onSelectReplyTarget={handleSelectReplyTarget}
                   onToggleReaction={onToggleReaction}
                 />

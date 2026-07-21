@@ -22,6 +22,11 @@ type MockFeedItem = {
 };
 
 type MockWindow = Window & {
+  __BUZZ_E2E_INVALIDATE_CHANNELS__?: () => Promise<void>;
+  __BUZZ_E2E_INVOKE_MOCK_COMMAND__?: (
+    command: string,
+    payload?: Record<string, unknown>,
+  ) => Promise<unknown>;
   __BUZZ_E2E_PUSH_MOCK_FEED_ITEM__?: (item: MockFeedItem) => unknown;
 };
 
@@ -133,4 +138,24 @@ test("Inbox offers a working Edit action only for manageable messages", async ({
   await expect(
     page.getByTestId(`edit-message-${FOREIGN_MESSAGE_ID}`),
   ).toHaveCount(0);
+  await page.keyboard.press("Escape");
+
+  await page.evaluate(async (channelId) => {
+    const testWindow = window as MockWindow;
+    const invoke = testWindow.__BUZZ_E2E_INVOKE_MOCK_COMMAND__;
+    const invalidateChannels = testWindow.__BUZZ_E2E_INVALIDATE_CHANNELS__;
+    if (!invoke || !invalidateChannels) {
+      throw new Error("Mock channel helpers are not installed.");
+    }
+
+    await invoke("archive_channel", { channelId });
+    await invalidateChannels();
+  }, GENERAL_CHANNEL_ID);
+
+  await page.getByTestId(`home-inbox-item-${OWN_MESSAGE_ID}`).click();
+  await expect(detail).toContainText("My Inbox message after editing.");
+  await openMoreActions(page, OWN_MESSAGE_ID);
+  await expect(page.getByTestId(`edit-message-${OWN_MESSAGE_ID}`)).toHaveCount(
+    0,
+  );
 });
