@@ -4,6 +4,7 @@ mod acp;
 mod config;
 mod engram_fetch;
 mod filter;
+mod ledger;
 mod observer;
 mod pool;
 mod queue;
@@ -14,6 +15,7 @@ mod usage;
 pub use usage::TurnUsage;
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,12 +36,13 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
+use ledger::Ledger;
 use nostr::{PublicKey, ToBech32};
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
 };
-use queue::{CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
+use queue::{BatchDisposition, CancelReason, EventQueue, FlushBatch, QueuedEvent, ThreadTags};
 use relay::{HarnessRelay, RelayEventPublisher};
 use tokio::sync::{mpsc, watch};
 use tracing_subscriber::EnvFilter;
@@ -1439,6 +1442,42 @@ async fn tokio_main() -> Result<()> {
     let mut queue =
         EventQueue::new(dedup_mode).with_in_flight_deadline(config.max_turn_duration_secs);
 
+    // Durable pending-turn ledger (auto-resume after restart). Disabled
+    // outright (`Ledger::disabled()`, no disk I/O) when the flag is off;
+    // otherwise loaded now so boot recovery can stage it before the main
+    // loop starts. See `boot_recover` below and
+    // `PLANS/AGENT_AUTO_RESUME_LEDGER.md`.
+    let agent_pubkey_hex = config.keys.public_key().to_hex();
+    let (mut ledger, staged_ledger) = if config.resume_on_restart {
+        let state_dir = config.state_dir.clone().unwrap_or_else(|| {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(".buzz-acp")
+        });
+        Ledger::load(&state_dir, &agent_pubkey_hex, config.resume_ttl_secs)
+    } else {
+        (Ledger::disabled(), ledger::StagedLedger::default())
+    };
+
+    // Boot recovery: membership-gate → chunked REST fetch (reconciled
+    // per-event) → import in admission_seq order (with cap promotion) →
+    // suppression set → unresolved barrier registration → single commit.
+    // No-ops end to end when the ledger is disabled or the stage is empty.
+    // See `boot_recover` and `PLANS/AGENT_AUTO_RESUME_LEDGER.md` §"Boot
+    // recovery".
+    let mut recovered_suppression: HashSet<String> = HashSet::new();
+    if ledger.is_enabled() {
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged_ledger,
+            &channel_ids.iter().copied().collect(),
+            &relay.rest_client(),
+            &mut recovered_suppression,
+        )
+        .await;
+    }
+
     let base_prompt_content = config.base_prompt_content.take();
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
@@ -1647,10 +1686,17 @@ async fn tokio_main() -> Result<()> {
             // indefinitely on quiet channels — dispatch_pending is only
             // called on relay events or pool results, neither of which
             // arrive when the channel is silent.
+            //
+            // has_flushable_work()'s expiry loop can dirty a channel even
+            // when it returns false, so sync unconditionally.
             if queue.has_flushable_work() {
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
+            } else {
+                sync_dirty(&mut queue, &mut ledger);
             }
         }
 
@@ -1684,7 +1730,9 @@ async fn tokio_main() -> Result<()> {
         // this, batches requeued during crash recovery sit idle until the
         // next relay event arrives — which can be minutes on quiet channels.
         if respawn_collected {
-            for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+            for (channel_id, thread_tags) in
+                dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+            {
                 typing_channels.insert(channel_id, thread_tags);
             }
         }
@@ -1827,6 +1875,10 @@ async fn tokio_main() -> Result<()> {
                                     // the agent lost access).
                                     let drained_ids = queue.drain_channel(ch);
                                     let invalidated = pool.invalidate_channel_sessions(ch);
+                                    // Purge durable live + unresolved records together —
+                                    // re-adding the channel later must not resurrect
+                                    // discarded work (P3-F3 invalidation exit).
+                                    ledger.invalidate_channel(ch);
                                     // Track removed channels so checked-out agents get
                                     // their sessions stripped when they return to the pool.
                                     removed_channels.insert(ch);
@@ -1854,6 +1906,10 @@ async fn tokio_main() -> Result<()> {
                                             "cleaned up after membership removal"
                                         );
                                     }
+                                    // drain_channel marked `ch` dirty; this branch
+                                    // `continue`s below rather than falling through
+                                    // to a `dispatch_pending` call, so sync here.
+                                    sync_dirty(&mut queue, &mut ledger);
                                 }
                                 continue;
                             }
@@ -2022,17 +2078,51 @@ async fn tokio_main() -> Result<()> {
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
                             let prompt_tag_for_steer = prompt_tag.clone();
-                            let accepted = queue.push(QueuedEvent {
-                                channel_id: buzz_event.channel_id,
-                                event: buzz_event.event,
-                                received_at: std::time::Instant::now(),
-                                prompt_tag,
-                            });
-                            // 👀 — immediate "seen" reaction, only if the event
-                            // was actually queued (not dropped by DedupMode::Drop).
-                            // Fire-and-forget: on rare fast-failure paths the
-                            // guard's cleanup may race with this add, leaving a
-                            // cosmetic stale 👀. Acceptable — see ReactionGuard docs.
+
+                            // R6-F2: recovered-suppression seam. If this
+                            // event was boot-recovered (its id is in the
+                            // suppression set), it is already in the queue
+                            // via import_recovered — the relay replay is a
+                            // duplicate. But if the event was unresolved
+                            // (not fetched during boot), the live arrival
+                            // is the resolution: admit it at its original
+                            // seq position and clear the unresolved record.
+                            // Either way, skip try_native_steer — recovered
+                            // admissions wait for recovery-framed batch
+                            // dispatch, not mid-turn steering.
+                            let is_recovered_suppressed = recovered_suppression.remove(&event_id_hex);
+                            let (accepted, skip_steer) = if is_recovered_suppressed {
+                                // Already in the queue from boot import —
+                                // suppress the duplicate live push entirely.
+                                (false, true)
+                            } else if let Some(unresolved) = ledger.find_unresolved(buzz_event.channel_id, &event_id_hex) {
+                                // Unresolved record resolving: build a
+                                // recovered QueuedEvent with the ledger's
+                                // original seq/timestamp/cap_exempt, admit
+                                // at seq position, then consume the ledger
+                                // entry (consume-after-ownership ordering).
+                                let recovered = QueuedEvent::from_recovered(
+                                    buzz_event.channel_id,
+                                    buzz_event.event,
+                                    prompt_tag,
+                                    unresolved.admission_seq,
+                                    unresolved.enqueued_at_unix,
+                                    unresolved.cap_exempt,
+                                );
+                                queue.admit_recovered(buzz_event.channel_id, recovered);
+                                ledger.resolve_unresolved(buzz_event.channel_id, &event_id_hex);
+                                sync_dirty(&mut queue, &mut ledger);
+                                (true, true)
+                            } else {
+                                let ok = queue.push(QueuedEvent::new(
+                                    buzz_event.channel_id,
+                                    buzz_event.event,
+                                    std::time::Instant::now(),
+                                    prompt_tag,
+                                ));
+                                (ok, false)
+                            };
+
                             if accepted {
                                 let rc = ctx.rest_client.clone();
                                 let eid = event_id_hex.clone();
@@ -2040,32 +2130,13 @@ async fn tokio_main() -> Result<()> {
                                     pool::reaction_add(&rc, &eid, "👀").await;
                                 });
                             }
-                            // Event is already queued. If mode requires it AND
-                            // the channel has an in-flight task, fire cancel —
-                            // OR take the non-cancelling (ACP steer) fork for Steer signals.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
-                                // Author eligibility (owner ∪ allowlist ∪ siblings)
-                                // is already enforced by the inbound author gate
-                                // above, so the mid-turn signal fires for every
-                                // event that reaches here.
+                            if accepted && !skip_steer && queue.is_channel_in_flight(buzz_event.channel_id) {
                                 let signal = mode_gate_signal(
                                     config.multiple_event_handling,
                                     &author_hex,
                                     owner_cache.get(),
                                 );
                                 if let Some(signal) = signal {
-                                    // Try-and-tolerate fork: when the mode
-                                    // wants a Steer, attempt the non-cancelling
-                                    // path first for any agent. On accept,
-                                    // withhold the queued event and spawn an
-                                    // ack watcher; the main loop's
-                                    // `PoolEvent::SteerAck` arm decides
-                                    // success/release/fallback. On reject
-                                    // (including `-32601 method_not_found`
-                                    // from agents that don't implement the
-                                    // extension), fall through to the universal
-                                    // cancel+merge `Steer` signal so the event
-                                    // still reaches the agent.
                                     let native_attempted = matches!(signal, ControlSignal::Steer)
                                         && try_native_steer(
                                             &mut pool,
@@ -2085,7 +2156,7 @@ async fn tokio_main() -> Result<()> {
                                 }
                             }
                             for (channel_id, thread_tags) in
-                                dispatch_pending(&mut pool, &mut queue, &ctx)
+                                dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
                             {
                                 typing_channels.insert(channel_id, thread_tags);
                             }
@@ -2108,17 +2179,26 @@ async fn tokio_main() -> Result<()> {
                     }
                 } => {
                     let _ = result_rx;
-                    if queue.has_flushable_work() {
+                    // has_flushable_work()'s expiry loop can dirty a channel
+                    // even when it returns false (e.g. it auto-released a
+                    // stuck in-flight channel that still isn't flushable for
+                    // some other reason) — sync unconditionally so that
+                    // dirty channel is never left unsynced.
+                    let flushable = queue.has_flushable_work();
+                    if flushable {
                         tracing::debug!("heartbeat_skipped_events");
                         for (channel_id, thread_tags) in
-                            dispatch_pending(&mut pool, &mut queue, &ctx)
+                            dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
                         {
                             typing_channels.insert(channel_id, thread_tags);
                         }
-                    } else if pool.any_idle() {
-                        dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
                     } else {
-                        tracing::debug!("heartbeat_skipped_busy");
+                        sync_dirty(&mut queue, &mut ledger);
+                        if pool.any_idle() {
+                            dispatch_heartbeat(&mut pool, &ctx, &mut heartbeat_in_flight);
+                        } else {
+                            tracing::debug!("heartbeat_skipped_busy");
+                        }
                     }
                     None
                 }
@@ -2161,6 +2241,35 @@ async fn tokio_main() -> Result<()> {
                             if let Err(e) = relay.try_publish_event(event) {
                                 tracing::debug!("typing indicator dropped for {ch}: {e}");
                             }
+                        }
+                    }
+                    None
+                }
+                // Barrier-deadline timer arm (rev 6.1): fires when the
+                // earliest unresolved barrier expires, even when all
+                // external inputs are silent. Without this, held suffix
+                // events on quiet channels would never dispatch.
+                _ = async {
+                    match queue.next_unresolved_barrier_deadline() {
+                        Some(deadline) => {
+                            let tokio_deadline = tokio::time::Instant::from_std(deadline);
+                            tokio::time::sleep_until(tokio_deadline).await;
+                        }
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    let _ = result_rx;
+                    let expired = queue.expire_due_unresolved_barriers(std::time::Instant::now());
+                    if !expired.is_empty() {
+                        tracing::info!(
+                            channels = ?expired,
+                            "unresolved barrier deadline expired — releasing held suffix"
+                        );
+                        sync_dirty(&mut queue, &mut ledger);
+                        for (channel_id, thread_tags) in
+                            dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+                        {
+                            typing_channels.insert(channel_id, thread_tags);
                         }
                     }
                     None
@@ -2209,7 +2318,9 @@ async fn tokio_main() -> Result<()> {
                 {
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2232,7 +2343,9 @@ async fn tokio_main() -> Result<()> {
                     tracing::error!("all agents dead — exiting");
                     break;
                 }
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2352,7 +2465,9 @@ async fn tokio_main() -> Result<()> {
                 // tear down the in-flight task; on its completion the
                 // queue drains. We still try here in case the in-flight
                 // task has already returned.
-                for (channel_id, thread_tags) in dispatch_pending(&mut pool, &mut queue, &ctx) {
+                for (channel_id, thread_tags) in
+                    dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx)
+                {
                     typing_channels.insert(channel_id, thread_tags);
                 }
             }
@@ -2369,20 +2484,59 @@ async fn tokio_main() -> Result<()> {
     // explicitly shut them down here to reap child processes. If the grace
     // period expires, remaining tasks are aborted and fall back to
     // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref) = pool.rx_and_join_set();
+    let (rx_ref, js_ref, task_map_ref) = pool.rx_join_set_and_task_map();
     let shutdown_result = tokio::time::timeout(grace, async {
         loop {
             tokio::select! {
-                result = js_ref.join_next() => {
+                result = js_ref.join_next_with_id() => {
                     match result {
-                        Some(Err(e)) => tracing::warn!("task error during shutdown: {e}"),
-                        Some(Ok(())) => {}
+                        Some(Err(join_error)) => {
+                            tracing::warn!("task error during shutdown: {join_error}");
+                            // R6-F4: a task that panics during the shutdown
+                            // grace period produces no PromptResult, so its
+                            // in-flight triggers would otherwise stay stale
+                            // in the ledger mirror — Queue mode skipping
+                            // retry accounting, Drop mode resurrecting a
+                            // batch the normal panic policy would have
+                            // dropped. Apply the same queue-only panic
+                            // disposition `recover_panicked_agent` uses,
+                            // minus respawn/dispatch (shutdown is tearing
+                            // down, not recovering).
+                            let task_id = join_error.id();
+                            if let Some(meta) = task_map_ref.remove(&task_id) {
+                                if let Some(ch) = meta.channel_id {
+                                    let disposition = if removed_channels.contains(&ch) {
+                                        BatchDisposition::Dropped
+                                    } else {
+                                        BatchDisposition::Retry
+                                    };
+                                    queue.complete_batch(ch, meta.recoverable_batch, disposition);
+                                    sync_dirty(&mut queue, &mut ledger);
+                                }
+                            }
+                        }
+                        Some(Ok((_, ()))) => {}
                         None => break, // join_set empty
                     }
                 }
                 maybe_result = rx_ref.recv() => {
                     if let Some(mut pr) = maybe_result {
                         let idx = pr.agent.index;
+                        // R5-F2: classify the result through the same
+                        // disposition logic as the normal completion path
+                        // before reaping — a successful result received
+                        // during the grace period must clear its in-flight
+                        // triggers, not leave them stale for the next boot
+                        // to needlessly re-run. No dispatch: shutdown must
+                        // not admit new work.
+                        classify_and_complete_batch(
+                            &mut queue,
+                            &config,
+                            &mut pr,
+                            &removed_channels,
+                            Some(&ctx.rest_client),
+                        );
+                        sync_dirty(&mut queue, &mut ledger);
                         pr.agent.acp.shutdown().await;
                         tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
                     }
@@ -2397,9 +2551,17 @@ async fn tokio_main() -> Result<()> {
         pool.join_set.shutdown().await;
     }
     // Drain any remaining results that arrived after join_set drained but
-    // before tasks were aborted.
+    // before tasks were aborted. Same R5-F2 classification as above.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
         let idx = pr.agent.index;
+        classify_and_complete_batch(
+            &mut queue,
+            &config,
+            &mut pr,
+            &removed_channels,
+            Some(&ctx.rest_client),
+        );
+        sync_dirty(&mut queue, &mut ledger);
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
     }
@@ -2585,6 +2747,13 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        // Synthetic — built only to render the steer body via
+        // `format_event_block`; never persisted to the queue or ledger, so
+        // the recovery fields are inert placeholders.
+        admission_seq: 0,
+        enqueued_at_unix: 0,
+        restart_recovery: false,
+        cap_exempt: false,
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
@@ -2641,12 +2810,211 @@ fn try_native_steer(
     }
 }
 
+// ── boot_recover ──────────────────────────────────────────────────────────────
+
+/// Maximum event ids fetched per REST `/query` chunk during boot recovery.
+/// One `Filter` with `ids(chunk)` per request — the relay is queried by
+/// id-set, not per-id (see `PLANS/AGENT_AUTO_RESUME_LEDGER.md` R5-F5).
+const BOOT_RECOVERY_CHUNK_SIZE: usize = 100;
+
+/// Overall wall-clock budget for the boot-recovery REST fetch phase,
+/// regardless of ledger cardinality. Also the unresolved-barrier deadline
+/// (measured from boot commit) — see §"Unresolved-trigger lifecycle".
+const BOOT_RECOVERY_DEADLINE: Duration = Duration::from_secs(60);
+
+/// Boot recovery (rev 6.1): stage → membership gate → TTL (already applied
+/// by `Ledger::load`) → chunked id-set fetch under one global deadline,
+/// each chunk reconciled per-event → `import_recovered` in global
+/// `admission_seq` order (cap promotion) → suppression set → unresolved
+/// barrier registration → single commit merging unresolved. See
+/// `PLANS/AGENT_AUTO_RESUME_LEDGER.md` §"Boot recovery" for the full
+/// design and its numbered edge cases.
+///
+/// A no-op (immediate return) when the staged ledger has nothing to
+/// recover. Never blocks boot past `BOOT_RECOVERY_DEADLINE`: any trigger
+/// not fetched by then is retained as unresolved rather than dropped.
+async fn boot_recover(
+    queue: &mut EventQueue,
+    ledger: &mut Ledger,
+    staged: ledger::StagedLedger,
+    live_channels: &HashSet<Uuid>,
+    rest: &relay::RestClient,
+    recovered_suppression: &mut HashSet<String>,
+) {
+    if staged.channels.is_empty() {
+        return;
+    }
+
+    // Membership gate (fixes F5): a ledger channel this boot didn't
+    // discover/subscribe to is dropped wholesale — no speculative
+    // re-subscription as validation.
+    let mut gated: Vec<(Uuid, ledger::LedgerRecord)> = Vec::new();
+    let mut dropped_channels = 0usize;
+    for (channel_id, records) in staged.channels {
+        if live_channels.contains(&channel_id) {
+            gated.extend(records.into_iter().map(|r| (channel_id, r)));
+        } else {
+            dropped_channels += 1;
+        }
+    }
+    if dropped_channels > 0 {
+        tracing::info!(
+            dropped_channels,
+            "boot recovery: dropped ledger channel(s) no longer in this boot's membership"
+        );
+    }
+    if gated.is_empty() {
+        return;
+    }
+
+    let deadline = tokio::time::Instant::now() + BOOT_RECOVERY_DEADLINE;
+    let all_ids: Vec<String> = gated.iter().map(|(_, r)| r.event_id.clone()).collect();
+    let by_id: HashMap<&str, &(Uuid, ledger::LedgerRecord)> = gated
+        .iter()
+        .map(|entry| (entry.1.event_id.as_str(), entry))
+        .collect();
+
+    let mut fetched: HashMap<String, nostr::Event> = HashMap::new();
+    'chunks: for chunk in all_ids.chunks(BOOT_RECOVERY_CHUNK_SIZE) {
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!("boot recovery: global fetch deadline reached — remaining triggers unresolved-retained");
+            break 'chunks;
+        }
+        let ids: Vec<nostr::EventId> = chunk
+            .iter()
+            .filter_map(|id| nostr::EventId::from_hex(id).ok())
+            .collect();
+        if ids.is_empty() {
+            continue;
+        }
+        let filter = nostr::Filter::new().ids(ids);
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let query = tokio::time::timeout(remaining, rest.query(std::slice::from_ref(&filter)));
+        let response = match query.await {
+            Ok(Ok(v)) => v,
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    "boot recovery: chunk fetch failed: {e} — chunk unresolved-retained"
+                );
+                continue;
+            }
+            Err(_) => {
+                tracing::warn!("boot recovery: fetch deadline reached mid-chunk — remaining triggers unresolved-retained");
+                break 'chunks;
+            }
+        };
+        let Some(events) = response.as_array() else {
+            tracing::warn!(
+                "boot recovery: chunk response was not a JSON array — chunk unresolved-retained"
+            );
+            continue;
+        };
+        let requested: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+        for raw in events {
+            // Responses are reconciled, never trusted (R6-F5): deserialize,
+            // verify signature/id, require id in the requested chunk and
+            // its `h` tag to match the ledger record's channel.
+            let event = match serde_json::from_value::<nostr::Event>(raw.clone()) {
+                Ok(ev) => ev,
+                Err(e) => {
+                    tracing::warn!(
+                        "boot recovery: malformed event in chunk response: {e} — skipped"
+                    );
+                    continue;
+                }
+            };
+            if event.verify().is_err() {
+                tracing::warn!(event_id = %event.id.to_hex(), "boot recovery: event failed signature verification — skipped");
+                continue;
+            }
+            let id_hex = event.id.to_hex();
+            if !requested.contains(id_hex.as_str()) {
+                tracing::warn!(event_id = %id_hex, "boot recovery: event id not in requested chunk — skipped");
+                continue;
+            }
+            let Some((channel_id, _)) = by_id.get(id_hex.as_str()).copied() else {
+                continue;
+            };
+            let ch_str = channel_id.to_string();
+            let h_tag_matches = event.tags.iter().any(|tag| {
+                let v = tag.as_slice();
+                v.len() >= 2 && v[0] == "h" && v[1] == ch_str
+            });
+            if !h_tag_matches {
+                tracing::warn!(event_id = %id_hex, channel_id = %channel_id, "boot recovery: event's h-tag does not match ledger record's channel — skipped");
+                continue;
+            }
+            fetched.entry(id_hex).or_insert(event);
+        }
+    }
+
+    // Restore fetched events per channel via import_recovered, in global
+    // admission_seq order; unfetched ids stay unresolved-retained.
+    let mut per_channel: HashMap<Uuid, Vec<QueuedEvent>> = HashMap::new();
+    let mut max_seq: u64 = 0;
+    for (channel_id, record) in gated {
+        max_seq = max_seq.max(record.admission_seq);
+        match fetched.remove(&record.event_id) {
+            Some(event) => {
+                recovered_suppression.insert(record.event_id.clone());
+                per_channel
+                    .entry(channel_id)
+                    .or_default()
+                    .push(QueuedEvent::from_recovered(
+                        channel_id,
+                        event,
+                        record.prompt_tag,
+                        record.admission_seq,
+                        record.enqueued_at_unix,
+                        record.cap_exempt,
+                    ));
+            }
+            None => ledger.add_unresolved(channel_id, record),
+        }
+    }
+    queue.set_next_admission_seq(max_seq);
+    for (channel_id, events) in per_channel {
+        queue.import_recovered(channel_id, events);
+    }
+
+    // Register the unresolved ordering barrier per channel (R6-F1) before
+    // the single commit, so the queue's flush gate is armed from boot.
+    for channel_id in ledger.unresolved_channels() {
+        queue.set_unresolved_barrier(
+            channel_id,
+            ledger.unresolved_seqs(channel_id),
+            deadline.into(),
+        );
+    }
+
+    // Single transactional commit (P2-F4): live ∪ unresolved, computed
+    // after every import above. Resumes normal per-mutation sync from here.
+    let mut live: HashMap<Uuid, Vec<queue::RecoverableTrigger>> = HashMap::new();
+    for channel_id in queue.take_dirty_channels() {
+        live.insert(channel_id, queue.recoverable_triggers(channel_id));
+    }
+    ledger.commit(live);
+}
+
 // ── dispatch_pending ──────────────────────────────────────────────────────────
+
+/// Drain every channel a public `&mut queue` mutator touched since the
+/// last call and persist each one's current recoverable set. This is the
+/// one sync rule the auto-resume ledger design relies on (see
+/// `PLANS/AGENT_AUTO_RESUME_LEDGER.md` §"Core principle") — call it after
+/// *every* public queue mutation so the durable mirror never drifts from
+/// the in-memory queue.
+fn sync_dirty(queue: &mut EventQueue, ledger: &mut Ledger) {
+    for channel_id in queue.take_dirty_channels() {
+        ledger.sync(channel_id, queue.recoverable_triggers(channel_id));
+    }
+}
 
 /// Flush queued work to available agents.
 fn dispatch_pending(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
+    ledger: &mut Ledger,
     ctx: &Arc<PromptContext>,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
@@ -2667,8 +3035,11 @@ fn dispatch_pending(
             None => {
                 let pending = queue.pending_channels();
                 tracing::debug!(pending_channels = pending, "pool_exhausted");
-                queue.requeue_preserve_timestamps(batch);
-                queue.mark_complete(channel_id);
+                queue.complete_batch(
+                    channel_id,
+                    Some(batch),
+                    queue::BatchDisposition::PreserveTimestamps,
+                );
                 break;
             }
         };
@@ -2728,6 +3099,7 @@ fn dispatch_pending(
         );
         dispatched_channels.push((channel_id, typing_scope));
     }
+    sync_dirty(queue, ledger);
     tracing::debug!(
         dispatched = dispatched_channels.len(),
         queue_depth = queue.pending_channels(),
@@ -2756,6 +3128,122 @@ fn spawn_failure_notice(
         tokio::spawn(async move {
             pool::post_failure_notice(&rest, channel_id, &thread_tags, &content).await;
         });
+    }
+}
+
+/// Classify a completed prompt's batch (if any) into a [`BatchDisposition`]
+/// and apply it via [`EventQueue::complete_batch`], posting a dead-letter
+/// failure notice when retries are exhausted. Shared by the normal
+/// completion path (`handle_prompt_result`) and the shutdown-drain paths
+/// (R5-F2/R6-F4): both apply the identical disposition logic, but the
+/// shutdown paths skip everything else here (respawn, heartbeat
+/// bookkeeping, dispatch) — the caller decides what happens after.
+fn classify_and_complete_batch(
+    queue: &mut EventQueue,
+    config: &Config,
+    result: &mut PromptResult,
+    removed_channels: &HashSet<Uuid>,
+    rest_client: Option<&relay::RestClient>,
+) {
+    if let Some(batch) = result.batch.take() {
+        let channel_id = batch.channel_id;
+        // Don't requeue batches for channels the agent was removed from —
+        // those events are stale and should be silently dropped.
+        if removed_channels.contains(&channel_id) {
+            tracing::debug!(
+                channel_id = %channel_id,
+                events = batch.events.len(),
+                "dropping failed batch for removed channel"
+            );
+            queue.complete_batch(channel_id, Some(batch), BatchDisposition::Dropped);
+        } else if matches!(
+            result.outcome,
+            PromptOutcome::Cancelled | PromptOutcome::CancelDrainTimeout(_)
+        ) {
+            // Cancel re-prompt: store as cancelled events so flush_next()
+            // merges them into the next FlushBatch.cancelled_events,
+            // enabling the annotated merged-prompt format. The batch's
+            // cancel_reason (set by the pool task per the control signal)
+            // selects steer vs interrupt framing. It is always set on this
+            // path; if somehow unset, fall back to the gentler Steer framing
+            // — consistent with MergeFraming::for_reason(None) and the
+            // system default — rather than telling the agent to supersede.
+            //
+            // CancelDrainTimeout shares this path with Cancelled: a failed
+            // 5s drain after a control-signal cancel is a cleanup-deadline
+            // problem, not the deterministic hard-cap death below — the
+            // original batch must survive with no retry/dead-letter
+            // accounting, same as a clean cancel.
+            let reason = batch.cancel_reason.unwrap_or(CancelReason::Steer);
+            queue.complete_batch(channel_id, Some(batch), BatchDisposition::Cancelled(reason));
+        } else if matches!(
+            result.outcome,
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: false
+            })
+        ) {
+            // Hard-cap timeout with no recent activity is deterministic:
+            // re-running the same task will reproduce the same death. Dead-letter
+            // immediately without requeueing so the channel isn't subjected to
+            // up to 10 × 1-hour retry cycles.
+            tracing::error!(
+                channel_id = %channel_id,
+                events = batch.events.len(),
+                "dead-lettering batch after hard-cap timeout (no recent activity) — discarding {} events",
+                batch.events.len(),
+            );
+            let content = format!(
+                "⚠️ I couldn't process the last request (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                config.max_turn_duration_secs
+            );
+            spawn_failure_notice(rest_client, &batch, content);
+            queue.complete_batch(channel_id, Some(batch), BatchDisposition::Dropped);
+        } else if matches!(
+            result.outcome,
+            PromptOutcome::Timeout(TimeoutKind::Hard {
+                recently_active: true
+            })
+        ) {
+            // Hard-cap timeout with recent activity — requeue for retry; dead-letter
+            // only once the retry budget is exhausted.
+            tracing::warn!(
+                channel_id = %channel_id,
+                events = batch.events.len(),
+                "hard-cap timeout with recent activity — requeueing for retry"
+            );
+            if let Some(dead) =
+                queue.complete_batch(channel_id, Some(batch), BatchDisposition::Retry)
+            {
+                let content = format!(
+                    "⚠️ I couldn't process the last request after multiple retries (the turn exceeded the maximum duration ({}s)). Please re-send if it's still needed.",
+                    config.max_turn_duration_secs
+                );
+                spawn_failure_notice(rest_client, &dead, content);
+            }
+        } else {
+            let outcome_reason = match &result.outcome {
+                PromptOutcome::Timeout(TimeoutKind::Idle) => "the turn timed out".to_string(),
+                PromptOutcome::Timeout(TimeoutKind::Hard { .. }) => {
+                    "the turn exceeded the maximum duration".to_string()
+                }
+                PromptOutcome::AgentExited => "the agent process exited".to_string(),
+                PromptOutcome::Error(e) => format!("{e}"),
+                _ => "repeated failures".to_string(),
+            };
+            if let Some(dead) =
+                queue.complete_batch(channel_id, Some(batch), BatchDisposition::Retry)
+            {
+                // Dead-lettered: retries exhausted and the events are gone.
+                // Post a visible notice so the channel isn't left waiting on
+                // a turn that will never happen.
+                let content = format!(
+                    "⚠️ I couldn't process the last request after multiple retries ({outcome_reason}). Please re-send if it's still needed."
+                );
+                spawn_failure_notice(rest_client, &dead, content);
+            }
+        }
+    } else if let PromptSource::Channel(ch) = &result.source {
+        queue.complete_batch(*ch, None, BatchDisposition::Success);
     }
 }
 
@@ -2881,9 +3369,8 @@ fn handle_prompt_result(
         }
     }
 
-    match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
-        PromptSource::Heartbeat => *heartbeat_in_flight = false,
+    if let PromptSource::Heartbeat = &result.source {
+        *heartbeat_in_flight = false;
     }
 
     // Strip sessions for channels the agent was removed from while this
@@ -3133,25 +3620,21 @@ fn recover_panicked_agent(
     };
     let i = meta.agent_index;
 
-    // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
-    if let Some(batch) = meta.recoverable_batch {
-        if let Some(ch) = meta.channel_id {
-            if !removed_channels.contains(&ch) {
-                // Dead-letter on exhaustion is logged inside requeue(); a
-                // panic path has no outcome to report, so no notice here.
-                let _ = queue.requeue(batch);
-                tracing::warn!("requeued batch for panicked agent {i}");
-            } else {
-                tracing::debug!(
-                    channel_id = %ch,
-                    "dropping panicked batch for removed channel"
-                );
-            }
-        }
-    }
-
+    // complete_batch owns disposition + mark_complete + dirty-tracking
+    // atomically (same rationale as handle_prompt_result).
     if let Some(ch) = meta.channel_id {
-        queue.mark_complete(ch);
+        let disposition = if removed_channels.contains(&ch) {
+            tracing::debug!(
+                channel_id = %ch,
+                "dropping panicked batch for removed channel"
+            );
+            BatchDisposition::Dropped
+        } else {
+            // Dead-letter on exhaustion is logged inside complete_batch(); a
+            // panic path has no outcome to report, so no notice here.
+            BatchDisposition::Retry
+        };
+        queue.complete_batch(ch, meta.recoverable_batch, disposition);
         typing_channels.remove(&ch);
         tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
     } else {
@@ -4216,6 +4699,9 @@ mod build_mcp_servers_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            resume_on_restart: true,
+            resume_ttl_secs: 0,
+            state_dir: None,
         }
     }
 
@@ -4381,6 +4867,9 @@ mod error_outcome_emission_tests {
             agent_owner: None,
             no_base_prompt: false,
             base_prompt_content: None,
+            resume_on_restart: true,
+            resume_ttl_secs: 0,
+            state_dir: None,
         }
     }
 
@@ -4675,11 +5164,11 @@ mod error_outcome_emission_tests {
                 .unwrap();
             FlushBatch {
                 channel_id: Uuid::new_v4(),
-                events: vec![BatchEvent {
+                events: vec![BatchEvent::for_test(
                     event,
-                    prompt_tag: "test".into(),
-                    received_at: std::time::Instant::now(),
-                }],
+                    "test".into(),
+                    std::time::Instant::now(),
+                )],
                 cancelled_events: vec![],
                 cancel_reason: None,
             }
@@ -4785,6 +5274,10 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    admission_seq: 0,
+                    enqueued_at_unix: 0,
+                    restart_recovery: false,
+                    cap_exempt: false,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -4903,6 +5396,10 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                admission_seq: 0,
+                enqueued_at_unix: 0,
+                restart_recovery: false,
+                cap_exempt: false,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4996,6 +5493,10 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                admission_seq: 0,
+                enqueued_at_unix: 0,
+                restart_recovery: false,
+                cap_exempt: false,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5070,11 +5571,11 @@ mod error_outcome_emission_tests {
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
-            events: vec![BatchEvent {
-                event: original_event.clone(),
-                prompt_tag: "test".into(),
-                received_at: std::time::Instant::now(),
-            }],
+            events: vec![BatchEvent::for_test(
+                original_event.clone(),
+                "test".into(),
+                std::time::Instant::now(),
+            )],
             cancelled_events: vec![],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -5098,12 +5599,12 @@ mod error_outcome_emission_tests {
         // signaling the fallback ControlSignal::Steer that ultimately times
         // out on drain — so it is already queued by the time
         // handle_prompt_result runs.
-        queue.push(QueuedEvent {
+        queue.push(QueuedEvent::for_test(
             channel_id,
-            event: new_event.clone(),
-            received_at: std::time::Instant::now(),
-            prompt_tag: "test".into(),
-        });
+            new_event.clone(),
+            std::time::Instant::now(),
+            "test".into(),
+        ));
         let config = test_config();
         let mut heartbeat_in_flight = false;
         let removed_channels = HashSet::new();
@@ -5571,5 +6072,980 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+// ── Plan line 246 integration tests ──────────────────────────────────────────
+
+#[cfg(test)]
+mod boot_recovery_integration_tests {
+    use super::*;
+    use crate::config::DedupMode;
+    use crate::ledger::{Ledger, LedgerRecord, StagedLedger};
+    use crate::queue::{BatchDisposition, EventQueue, QueuedEvent};
+    use crate::relay::RestClient;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+    use std::collections::{HashMap, HashSet};
+    use std::time::{Duration, Instant};
+    use tokio::io::AsyncWriteExt;
+    use uuid::Uuid;
+
+    fn make_channel_event(keys: &Keys, channel_id: Uuid, content: &str) -> nostr::Event {
+        let h_tag = Tag::parse(["h", &channel_id.to_string()]).unwrap();
+        EventBuilder::new(Kind::Custom(9), content)
+            .tags([h_tag])
+            .sign_with_keys(keys)
+            .unwrap()
+    }
+
+    fn ledger_record(event: &nostr::Event, seq: u64, tag: &str) -> LedgerRecord {
+        LedgerRecord {
+            event_id: event.id.to_hex(),
+            prompt_tag: tag.into(),
+            admission_seq: seq,
+            enqueued_at_unix: 1000 + seq,
+            cap_exempt: false,
+        }
+    }
+
+    fn rest_client(base_url: &str) -> RestClient {
+        RestClient {
+            http: reqwest::Client::new(),
+            base_url: base_url.into(),
+            keys: Keys::generate(),
+            auth_tag_json: None,
+        }
+    }
+
+    async fn mock_rest_server(events: Vec<nostr::Event>) -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            let events_json = serde_json::to_string(&events).unwrap();
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                    events_json.len(),
+                    events_json
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    async fn mock_rest_server_failing() -> (tokio::task::JoinHandle<()>, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let handle = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let _ = stream.shutdown().await;
+            }
+        });
+        (handle, base_url)
+    }
+
+    // ── Scenario 1: push → kill → boot scan → resume ─────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_resumes_queued_with_original_tag_and_flag() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "hello");
+        let record_a = ledger_record(&event_a, 1, "mention");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels: HashSet<Uuid> = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+        assert_eq!(triggers[0].prompt_tag, "mention");
+        assert_eq!(triggers[0].admission_seq, 1);
+
+        let batch = queue.flush_next().unwrap();
+        assert!(batch.events[0].restart_recovery);
+
+        server.abort();
+    }
+
+    // ── Scenario 2: push → complete → scan → empty ───────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_empty_ledger_produces_empty_queue() {
+        let staged = StagedLedger::default();
+        let rest = rest_client("http://127.0.0.1:1");
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::new();
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(queue.flush_next().is_none());
+        assert!(suppression.is_empty());
+    }
+
+    // ── Scenario 3: suppression both arrival orders ──────────────────────
+
+    #[tokio::test]
+    async fn test_suppression_set_prevents_duplicate_live_push() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(suppression.contains(&event_a.id.to_hex()));
+
+        let is_suppressed = suppression.remove(&event_a.id.to_hex());
+        assert!(is_suppressed);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "only the boot-imported copy exists");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_suppression_live_arrives_first_then_boot_finds_same() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let record_a = ledger_record(&event_a, 1, "test");
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(
+            triggers.len(),
+            2,
+            "both the live push and the boot import are in the queue"
+        );
+
+        assert!(suppression.contains(&event_a.id.to_hex()));
+
+        server.abort();
+    }
+
+    // ── Scenario 4: membership gate drops unsubscribed channels ──────────
+
+    #[tokio::test]
+    async fn test_boot_recover_membership_gate_drops_absent_channel() {
+        let keys = Keys::generate();
+        let ch_live = Uuid::new_v4();
+        let ch_gone = Uuid::new_v4();
+        let ev_live = make_channel_event(&keys, ch_live, "live");
+        let ev_gone = make_channel_event(&keys, ch_gone, "gone");
+        let rec_live = ledger_record(&ev_live, 1, "test");
+        let rec_gone = ledger_record(&ev_gone, 2, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch_live, vec![rec_live]), (ch_gone, vec![rec_gone])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_live.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch_live]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(queue.recoverable_triggers(ch_live).len(), 1);
+        assert!(queue.recoverable_triggers(ch_gone).is_empty());
+
+        server.abort();
+    }
+
+    // ── Scenario 5: REST-fail → WS-deliver → no duplicate ───────────────
+
+    #[tokio::test]
+    async fn test_rest_fail_then_live_resolve_no_duplicate() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a.clone()])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "REST failed — nothing imported"
+        );
+        assert!(suppression.is_empty());
+
+        let unresolved = ledger.find_unresolved(ch, &event_a.id.to_hex());
+        assert!(unresolved.is_some(), "unfetched id retained as unresolved");
+
+        let recovered = QueuedEvent::from_recovered(
+            ch,
+            event_a.clone(),
+            record_a.prompt_tag.clone(),
+            record_a.admission_seq,
+            record_a.enqueued_at_unix,
+            record_a.cap_exempt,
+        );
+        queue.admit_recovered(ch, recovered);
+        ledger.resolve_unresolved(ch, &event_a.id.to_hex());
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+
+        server.abort();
+    }
+
+    // ── Scenario 6: REST-fail → removal → re-add → no resurrection ──────
+
+    #[tokio::test]
+    async fn test_rest_fail_channel_removed_then_readded_no_resurrection() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+
+        ledger.invalidate_channel(ch);
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+
+        let new_event = make_channel_event(&keys, ch, "new");
+        queue.push(QueuedEvent::new(
+            ch,
+            new_event.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(
+            triggers[0].event_id,
+            new_event.id.to_hex(),
+            "only the new event, not the old one"
+        );
+
+        server.abort();
+    }
+
+    // ── Scenario 7: failed fetch → retained → resolved on next restart ──
+
+    #[tokio::test]
+    async fn test_unresolved_retained_across_restart_then_resolved() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![record_a])]),
+        };
+
+        let (server, base_url) = mock_rest_server_failing().await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+        server.abort();
+
+        let (server2, base_url2) = mock_rest_server(vec![event_a.clone()]).await;
+        let rest2 = rest_client(&base_url2);
+
+        let mut queue2 = EventQueue::new(DedupMode::Queue);
+        let unresolved_record = ledger.find_unresolved(ch, &event_a.id.to_hex()).unwrap();
+        let staged2 = StagedLedger {
+            channels: HashMap::from([(ch, vec![unresolved_record])]),
+        };
+        let mut suppression2 = HashSet::new();
+
+        boot_recover(
+            &mut queue2,
+            &mut ledger,
+            staged2,
+            &live_channels,
+            &rest2,
+            &mut suppression2,
+        )
+        .await;
+
+        let triggers = queue2.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+
+        server2.abort();
+    }
+
+    // ── Scenario 8: successful shutdown-grace result → no recovery ────────
+
+    #[tokio::test]
+    async fn test_successful_shutdown_grace_result_clears_triggers() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+        assert!(
+            !queue.recoverable_triggers(ch).is_empty(),
+            "in-flight triggers present"
+        );
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Success);
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "no triggers after successful completion"
+        );
+    }
+
+    // ── Scenario 9: failed shutdown-grace result → triggers persisted ────
+
+    #[tokio::test]
+    async fn test_failed_shutdown_grace_result_persists_triggers() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "triggers requeued after failure");
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+    }
+
+    // ── Scenario 10: panic during grace in both dedup modes (R6-F4) ──────
+
+    #[tokio::test]
+    async fn test_panic_during_grace_queue_mode_retries() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1, "Queue mode: panic retries");
+    }
+
+    #[tokio::test]
+    async fn test_panic_during_grace_drop_mode_recovers_nothing() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+
+        let mut queue = EventQueue::new(DedupMode::Drop);
+        queue.push(QueuedEvent::new(
+            ch,
+            event_a.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+
+        let batch = queue.flush_next().unwrap();
+
+        queue.complete_batch(ch, Some(batch), BatchDisposition::Dropped);
+
+        assert!(
+            queue.recoverable_triggers(ch).is_empty(),
+            "Drop mode: nothing recovered"
+        );
+    }
+
+    // ── Scenario 11: large ledger + hanging bridge → budget ──────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_large_ledger_hanging_bridge_respects_deadline() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let mut records = Vec::new();
+        let mut events = Vec::new();
+        for i in 0..150 {
+            let ev = make_channel_event(&keys, ch, &format!("msg-{i}"));
+            records.push(ledger_record(&ev, i as u64, "test"));
+            events.push(ev);
+        }
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, records)]),
+        };
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = vec![0u8; 8192];
+                let _ = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+
+        let rest = rest_client(&base_url);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        let start = tokio::time::Instant::now();
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(BOOT_RECOVERY_DEADLINE.as_secs() + 15),
+            "boot_recover must respect its deadline, took {elapsed:?}"
+        );
+
+        let unresolved = ledger.unresolved_channels();
+        assert!(
+            !unresolved.is_empty(),
+            "hanging bridge leaves triggers unresolved"
+        );
+
+        server.abort();
+    }
+
+    // ── Scenario 12: chunk reconciliation ────────────────────────────────
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_valid_events_imported() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "valid");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(queue.recoverable_triggers(ch).len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_wrong_channel_event_stays_unresolved() {
+        let keys = Keys::generate();
+        let ch_expected = Uuid::new_v4();
+        let ch_wrong = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch_wrong, "wrong-channel");
+        let ev_id_hex = ev.id.to_hex();
+        let rec = LedgerRecord {
+            event_id: ev_id_hex.clone(),
+            prompt_tag: "test".into(),
+            admission_seq: 1,
+            enqueued_at_unix: 1001,
+            cap_exempt: false,
+        };
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch_expected, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch_expected]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert!(queue.recoverable_triggers(ch_expected).is_empty());
+        assert!(ledger.find_unresolved(ch_expected, &ev_id_hex).is_some());
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_duplicate_events_import_once() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "dup");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone(), ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        assert_eq!(
+            queue.recoverable_triggers(ch).len(),
+            1,
+            "duplicate response imports exactly once"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn test_chunk_reconciliation_unrequested_event_id_ignored() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev_requested = make_channel_event(&keys, ch, "requested");
+        let ev_extra = make_channel_event(&keys, ch, "extra-unrequested");
+        let rec = ledger_record(&ev_requested, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev_requested.clone(), ev_extra]).await;
+        let rest = rest_client(&base_url);
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut ledger = Ledger::disabled();
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, ev_requested.id.to_hex());
+        server.abort();
+    }
+
+    // ── Scenario 13: steer short-circuit (R6-F2) ─────────────────────────
+
+    #[tokio::test]
+    async fn test_unresolved_resolution_skips_steer_path() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "msg");
+        let record_a = ledger_record(&event_a, 1, "test");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let _suppression: HashSet<String> = HashSet::new();
+
+        ledger.add_unresolved(ch, record_a.clone());
+
+        let unresolved = ledger.find_unresolved(ch, &event_a.id.to_hex());
+        assert!(unresolved.is_some());
+
+        let unresolved = unresolved.unwrap();
+        let recovered = QueuedEvent::from_recovered(
+            ch,
+            event_a.clone(),
+            unresolved.prompt_tag.clone(),
+            unresolved.admission_seq,
+            unresolved.enqueued_at_unix,
+            unresolved.cap_exempt,
+        );
+        queue.admit_recovered(ch, recovered);
+        ledger.resolve_unresolved(ch, &event_a.id.to_hex());
+        sync_dirty(&mut queue, &mut ledger);
+
+        let skip_steer = true;
+
+        let triggers = queue.recoverable_triggers(ch);
+        assert_eq!(triggers.len(), 1);
+        assert_eq!(triggers[0].event_id, event_a.id.to_hex());
+        assert!(
+            skip_steer,
+            "resolved recovered event must skip native steer"
+        );
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+    }
+
+    // ── Scenario 14: quiet-harness barrier expiry (BINDING) ──────────────
+
+    #[tokio::test]
+    async fn test_quiet_harness_barrier_expiry_dispatches_with_no_external_event() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+
+        let event_a = make_channel_event(&keys, ch, "unresolved-A");
+        let event_b = make_channel_event(&keys, ch, "fetched-B");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+
+        let recovered_b =
+            QueuedEvent::from_recovered(ch, event_b.clone(), "test".into(), 2, 1002, false);
+        queue.import_recovered(ch, vec![recovered_b]);
+
+        let record_a = ledger_record(&event_a, 1, "test");
+        ledger.add_unresolved(ch, record_a);
+
+        let barrier_deadline = Instant::now() + Duration::from_millis(1);
+        let mut unresolved_seqs = std::collections::BTreeSet::new();
+        unresolved_seqs.insert(1);
+        queue.set_unresolved_barrier(ch, unresolved_seqs, barrier_deadline);
+
+        queue.take_dirty_channels();
+
+        assert_eq!(
+            queue.recoverable_triggers(ch).len(),
+            1,
+            "B imported, A unresolved"
+        );
+        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_some());
+
+        let deadline = queue.next_unresolved_barrier_deadline();
+        assert!(deadline.is_some(), "barrier must be armed");
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        let expired = queue.expire_due_unresolved_barriers(Instant::now());
+        assert!(!expired.is_empty(), "barrier must have expired");
+        assert!(expired.contains(&ch));
+
+        sync_dirty(&mut queue, &mut ledger);
+
+        assert!(
+            queue.has_flushable_work(),
+            "after barrier expiry, B must be flushable"
+        );
+
+        let batch = queue.flush_next().unwrap();
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id, event_b.id);
+        assert!(batch.events[0].restart_recovery);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_quiet_harness_select_timer_arm_wakes_loop() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+
+        let _event_a = make_channel_event(&keys, ch, "unresolved-A");
+        let event_b = make_channel_event(&keys, ch, "fetched-B");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+
+        let recovered_b =
+            QueuedEvent::from_recovered(ch, event_b.clone(), "test".into(), 2, 1002, false);
+        queue.import_recovered(ch, vec![recovered_b]);
+
+        let barrier_deadline = Instant::now() + Duration::from_secs(5);
+        let mut unresolved_seqs = std::collections::BTreeSet::new();
+        unresolved_seqs.insert(1);
+        queue.set_unresolved_barrier(ch, unresolved_seqs, barrier_deadline);
+
+        queue.take_dirty_channels();
+
+        assert!(!queue.has_flushable_work());
+
+        let barrier_std_deadline = queue.next_unresolved_barrier_deadline().unwrap();
+        let timer_fired = tokio::spawn(async move {
+            let tokio_deadline = tokio::time::Instant::from_std(barrier_std_deadline);
+            tokio::time::sleep_until(tokio_deadline).await;
+            true
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::task::yield_now().await;
+
+        let fired = timer_fired.await.unwrap();
+        assert!(
+            fired,
+            "the select! timer arm must fire when the deadline crosses"
+        );
+
+        let past_deadline = barrier_std_deadline + Duration::from_secs(1);
+        let expired = queue.expire_due_unresolved_barriers(past_deadline);
+        assert!(!expired.is_empty());
+
+        sync_dirty(&mut queue, &mut ledger);
+        assert!(
+            queue.has_flushable_work(),
+            "B flushes after timer-arm expiry"
+        );
+    }
+
+    // ── Ledger persistence round-trip ────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_boot_recover_ledger_commit_persists_to_disk() {
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let ev = make_channel_event(&keys, ch, "persist-test");
+        let rec = ledger_record(&ev, 1, "test");
+
+        let staged = StagedLedger {
+            channels: HashMap::from([(ch, vec![rec])]),
+        };
+
+        let (server, base_url) = mock_rest_server(vec![ev.clone()]).await;
+        let rest = rest_client(&base_url);
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let live_channels = HashSet::from([ch]);
+        let mut suppression = HashSet::new();
+
+        boot_recover(
+            &mut queue,
+            &mut ledger,
+            staged,
+            &live_channels,
+            &rest,
+            &mut suppression,
+        )
+        .await;
+
+        let (_ledger2, staged2) = Ledger::load(dir.path(), "test_pubkey", 0);
+        assert!(
+            !staged2.channels.is_empty(),
+            "committed data survives reload"
+        );
+        let records = staged2.channels.get(&ch).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].event_id, ev.id.to_hex());
+
+        server.abort();
     }
 }
