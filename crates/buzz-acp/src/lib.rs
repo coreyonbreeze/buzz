@@ -2095,39 +2095,16 @@ async fn tokio_main() -> Result<()> {
                             // seq position and clear the unresolved record.
                             // Either way, skip try_native_steer — recovered
                             // admissions wait for recovery-framed batch
-                            // dispatch, not mid-turn steering.
-                            let is_recovered_suppressed = recovered_suppression.remove(&event_id_hex);
-                            let (accepted, skip_steer) = if is_recovered_suppressed {
-                                // Already in the queue from boot import —
-                                // suppress the duplicate live push entirely.
-                                (false, true)
-                            } else if let Some(unresolved) = ledger.find_unresolved(buzz_event.channel_id, &event_id_hex) {
-                                // Unresolved record resolving: build a
-                                // recovered QueuedEvent with the ledger's
-                                // original seq/timestamp/cap_exempt, admit
-                                // at seq position, then consume the ledger
-                                // entry (consume-after-ownership ordering).
-                                let recovered = QueuedEvent::from_recovered(
-                                    buzz_event.channel_id,
-                                    buzz_event.event,
-                                    prompt_tag,
-                                    unresolved.admission_seq,
-                                    unresolved.enqueued_at_unix,
-                                    unresolved.cap_exempt,
-                                );
-                                queue.admit_recovered(buzz_event.channel_id, recovered);
-                                ledger.resolve_unresolved(buzz_event.channel_id, &event_id_hex);
-                                sync_dirty(&mut queue, &mut ledger);
-                                (true, true)
-                            } else {
-                                let ok = queue.push(QueuedEvent::new(
-                                    buzz_event.channel_id,
-                                    buzz_event.event,
-                                    std::time::Instant::now(),
-                                    prompt_tag,
-                                ));
-                                (ok, false)
-                            };
+                            // dispatch, not mid-turn steering. See
+                            // `admit_live_event`.
+                            let (accepted, skip_steer) = admit_live_event(
+                                &mut queue,
+                                &mut ledger,
+                                &mut recovered_suppression,
+                                buzz_event.channel_id,
+                                buzz_event.event,
+                                prompt_tag,
+                            );
 
                             if accepted {
                                 let rc = ctx.rest_client.clone();
@@ -2485,77 +2462,16 @@ async fn tokio_main() -> Result<()> {
     // 30 s is generous for in-flight prompts to be cancelled; using
     // max_turn_duration here would cause Ctrl+C to hang for up to an hour.
     let grace = Duration::from_secs(30);
-    // Best-effort drain of both join_set and result_rx during the grace period.
-    // Tasks that finish normally send their OwnedAgent through result_rx — we
-    // explicitly shut them down here to reap child processes. If the grace
-    // period expires, remaining tasks are aborted and fall back to
-    // AcpClient::Drop (start_kill + try_wait — best-effort, not guaranteed).
-    let (rx_ref, js_ref, task_map_ref) = pool.rx_join_set_and_task_map();
-    let shutdown_result = tokio::time::timeout(grace, async {
-        loop {
-            tokio::select! {
-                result = js_ref.join_next_with_id() => {
-                    match result {
-                        Some(Err(join_error)) => {
-                            tracing::warn!("task error during shutdown: {join_error}");
-                            // R6-F4: a task that panics during the shutdown
-                            // grace period produces no PromptResult, so its
-                            // in-flight triggers would otherwise stay stale
-                            // in the ledger mirror — Queue mode skipping
-                            // retry accounting, Drop mode resurrecting a
-                            // batch the normal panic policy would have
-                            // dropped. Apply the same queue-only panic
-                            // disposition `recover_panicked_agent` uses,
-                            // minus respawn/dispatch (shutdown is tearing
-                            // down, not recovering).
-                            let task_id = join_error.id();
-                            if let Some(meta) = task_map_ref.remove(&task_id) {
-                                if let Some(ch) = meta.channel_id {
-                                    let disposition = if removed_channels.contains(&ch) {
-                                        BatchDisposition::Dropped
-                                    } else {
-                                        BatchDisposition::Retry
-                                    };
-                                    queue.complete_batch(ch, meta.recoverable_batch, disposition);
-                                    sync_dirty(&mut queue, &mut ledger);
-                                }
-                            }
-                        }
-                        Some(Ok((_, ()))) => {}
-                        None => break, // join_set empty
-                    }
-                }
-                maybe_result = rx_ref.recv() => {
-                    if let Some(mut pr) = maybe_result {
-                        let idx = pr.agent.index;
-                        // R5-F2: classify the result through the same
-                        // disposition logic as the normal completion path
-                        // before reaping — a successful result received
-                        // during the grace period must clear its in-flight
-                        // triggers, not leave them stale for the next boot
-                        // to needlessly re-run. No dispatch: shutdown must
-                        // not admit new work.
-                        classify_and_complete_batch(
-                            &mut queue,
-                            &config,
-                            &mut pr,
-                            &removed_channels,
-                            Some(&ctx.rest_client),
-                        );
-                        sync_dirty(&mut queue, &mut ledger);
-                        pr.agent.acp.shutdown().await;
-                        tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
-                    }
-                    // If None, channel closed — tasks are done.
-                }
-            }
-        }
-    })
+    drain_shutdown_grace(
+        &mut pool,
+        &mut queue,
+        &mut ledger,
+        &config,
+        &removed_channels,
+        Some(&ctx.rest_client),
+        grace,
+    )
     .await;
-    if shutdown_result.is_err() {
-        tracing::warn!("grace period expired, aborting remaining tasks");
-        pool.join_set.shutdown().await;
-    }
     // Drain any remaining results that arrived after join_set drained but
     // before tasks were aborted. Same R5-F2 classification as above.
     while let Ok(mut pr) = pool.result_rx_try_recv() {
@@ -2650,6 +2566,62 @@ fn is_owner_control_command(
     kind_u32 == KIND_STREAM_MESSAGE
         && event.content.trim() == command
         && event_mentions_agent(event, agent_pubkey_hex)
+}
+
+// ── admit_live_event ─────────────────────────────────────────────────────────
+
+/// Admit a live relay event into the queue, resolving it against boot
+/// recovery's suppression set and unresolved barrier first (R6-F2).
+///
+/// Returns `(accepted, skip_steer)`: `accepted` is whether the event landed
+/// in the queue (mirrors `EventQueue::push`'s admission result on the normal
+/// path); `skip_steer` tells the caller whether to bypass `try_native_steer`
+/// for this event — recovered admissions (whether a suppressed duplicate or
+/// a just-resolved unresolved record) wait for recovery-framed batch
+/// dispatch, not mid-turn steering.
+///
+/// This is the exact decision the main loop's relay-event arm makes inline;
+/// extracted so tests can drive it directly instead of mirroring it.
+fn admit_live_event(
+    queue: &mut EventQueue,
+    ledger: &mut Ledger,
+    recovered_suppression: &mut HashSet<String>,
+    channel_id: uuid::Uuid,
+    event: nostr::Event,
+    prompt_tag: String,
+) -> (bool, bool) {
+    let event_id_hex = event.id.to_hex();
+    let is_recovered_suppressed = recovered_suppression.remove(&event_id_hex);
+    if is_recovered_suppressed {
+        // Already in the queue from boot import — suppress the duplicate
+        // live push entirely.
+        (false, true)
+    } else if let Some(unresolved) = ledger.find_unresolved(channel_id, &event_id_hex) {
+        // Unresolved record resolving: build a recovered QueuedEvent with
+        // the ledger's original seq/timestamp/cap_exempt, admit at seq
+        // position, then consume the ledger entry (consume-after-ownership
+        // ordering).
+        let recovered = QueuedEvent::from_recovered(
+            channel_id,
+            event,
+            prompt_tag,
+            unresolved.admission_seq,
+            unresolved.enqueued_at_unix,
+            unresolved.cap_exempt,
+        );
+        queue.admit_recovered(channel_id, recovered);
+        ledger.resolve_unresolved(channel_id, &event_id_hex);
+        sync_dirty(queue, ledger);
+        (true, true)
+    } else {
+        let ok = queue.push(QueuedEvent::new(
+            channel_id,
+            event,
+            std::time::Instant::now(),
+            prompt_tag,
+        ));
+        (ok, false)
+    }
 }
 
 // ── signal_in_flight_task ─────────────────────────────────────────────────────
@@ -3276,6 +3248,88 @@ fn classify_and_complete_batch(
         }
     } else if let PromptSource::Channel(ch) = &result.source {
         queue.complete_batch(*ch, None, BatchDisposition::Success);
+    }
+}
+
+/// Best-effort drain of both `join_set` and `result_rx` during the shutdown
+/// grace period. Tasks that finish normally send their `OwnedAgent` through
+/// `result_rx` — reaped here to shut down child processes. If `grace`
+/// expires with tasks still outstanding, the caller must abort the
+/// remaining join_set tasks and fall back to `AcpClient::Drop` (best-effort,
+/// not guaranteed).
+///
+/// Extracted from `run()`'s shutdown sequence so tests can drive the real
+/// `select!` arms — including a task that panics mid-grace (R6-F4) and a
+/// result that arrives mid-grace (R5-F2) — instead of calling
+/// `queue.complete_batch()` directly and asserting the same disposition the
+/// production code was supposed to apply.
+async fn drain_shutdown_grace(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    ledger: &mut Ledger,
+    config: &Config,
+    removed_channels: &HashSet<Uuid>,
+    rest_client: Option<&relay::RestClient>,
+    grace: Duration,
+) {
+    let (rx_ref, js_ref, task_map_ref) = pool.rx_join_set_and_task_map();
+    let shutdown_result = tokio::time::timeout(grace, async {
+        loop {
+            tokio::select! {
+                result = js_ref.join_next_with_id() => {
+                    match result {
+                        Some(Err(join_error)) => {
+                            tracing::warn!("task error during shutdown: {join_error}");
+                            // R6-F4: a task that panics during the shutdown
+                            // grace period produces no PromptResult, so its
+                            // in-flight triggers would otherwise stay stale
+                            // in the ledger mirror — Queue mode skipping
+                            // retry accounting, Drop mode resurrecting a
+                            // batch the normal panic policy would have
+                            // dropped. Apply the same queue-only panic
+                            // disposition `recover_panicked_agent` uses,
+                            // minus respawn/dispatch (shutdown is tearing
+                            // down, not recovering).
+                            let task_id = join_error.id();
+                            if let Some(meta) = task_map_ref.remove(&task_id) {
+                                if let Some(ch) = meta.channel_id {
+                                    let disposition = if removed_channels.contains(&ch) {
+                                        BatchDisposition::Dropped
+                                    } else {
+                                        BatchDisposition::Retry
+                                    };
+                                    queue.complete_batch(ch, meta.recoverable_batch, disposition);
+                                    sync_dirty(queue, ledger);
+                                }
+                            }
+                        }
+                        Some(Ok((_, ()))) => {}
+                        None => break, // join_set empty
+                    }
+                }
+                maybe_result = rx_ref.recv() => {
+                    if let Some(mut pr) = maybe_result {
+                        let idx = pr.agent.index;
+                        classify_and_complete_batch(
+                            queue,
+                            config,
+                            &mut pr,
+                            removed_channels,
+                            rest_client,
+                        );
+                        sync_dirty(queue, ledger);
+                        pr.agent.acp.shutdown().await;
+                        tracing::debug!(agent = idx, "reaped checked-out agent on shutdown");
+                    }
+                    // If None, channel closed — tasks are done.
+                }
+            }
+        }
+    })
+    .await;
+    if shutdown_result.is_err() {
+        tracing::warn!("grace period expired, aborting remaining tasks");
+        pool.join_set.shutdown().await;
     }
 }
 
@@ -6114,7 +6168,7 @@ mod boot_recovery_integration_tests {
     use super::*;
     use crate::config::DedupMode;
     use crate::ledger::{Ledger, LedgerRecord, StagedLedger};
-    use crate::queue::{BatchDisposition, EventQueue, QueuedEvent};
+    use crate::queue::{EventQueue, QueuedEvent};
     use crate::relay::RestClient;
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use std::collections::{HashMap, HashSet};
@@ -6159,10 +6213,70 @@ mod boot_recovery_integration_tests {
         }
     }
 
+    /// Same shape as `error_outcome_emission_tests::test_config` /
+    /// `build_mcp_servers_tests::test_config` — duplicated here because
+    /// those helpers are private to their own test modules. Only used by
+    /// the shutdown-drain tests, which need a real `Config` to pass to
+    /// `drain_shutdown_grace`/`classify_and_complete_batch`.
+    fn test_config() -> Config {
+        Config {
+            keys: Keys::generate(),
+            relay_url: "ws://localhost:3000".into(),
+            agent_command: "goose".into(),
+            agent_args: vec!["acp".into()],
+            mcp_command: "test-mcp-server".into(),
+            idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
+            max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
+            agents: 1,
+            heartbeat_interval_secs: 0,
+            turn_liveness_secs: 10,
+            heartbeat_prompt: None,
+            system_prompt: None,
+            team_instructions: None,
+            initial_message: None,
+            subscribe_mode: config::SubscribeMode::All,
+            dedup_mode: config::DedupMode::Queue,
+            multiple_event_handling: config::MultipleEventHandling::Queue,
+            ignore_self: true,
+            kinds_override: None,
+            channels_override: None,
+            no_mention_filter: false,
+            config_path: std::path::PathBuf::from("./buzz-acp.toml"),
+            context_message_limit: 12,
+            max_turns_per_session: 0,
+            presence_enabled: true,
+            typing_enabled: true,
+            memory_enabled: false,
+            model: None,
+            permission_mode: config::PermissionMode::BypassPermissions,
+            respond_to: config::RespondTo::Anyone,
+            respond_to_allowlist: HashSet::new(),
+            allowed_respond_to: vec![],
+            persona_env_vars: vec![],
+            has_generated_codex_config: false,
+            relay_observer: false,
+            agent_owner: None,
+            no_base_prompt: false,
+            base_prompt_content: None,
+            resume_on_restart: true,
+            resume_ttl_secs: 0,
+            state_dir: None,
+        }
+    }
+
     /// Minimal `PromptContext` for driving `dispatch_pending` directly —
     /// same shape as `pool::tests::make_prompt_context_impl`, duplicated
     /// here because that helper is private to `pool`'s test module.
     fn test_prompt_context() -> Arc<PromptContext> {
+        test_prompt_context_with_dedup_mode(DedupMode::Queue)
+    }
+
+    /// Variant of [`test_prompt_context`] with an explicit `dedup_mode` —
+    /// `dispatch_pending` reads `ctx.dedup_mode` (not the `EventQueue`'s
+    /// own mode) to decide whether to clone a recoverable batch into
+    /// `TaskMeta`, so panic/shutdown-drain tests that need to exercise
+    /// `DedupMode::Drop`'s "nothing recovered" behavior must set it here.
+    fn test_prompt_context_with_dedup_mode(dedup_mode: DedupMode) -> Arc<PromptContext> {
         let agent_keys = Keys::generate();
         Arc::new(PromptContext {
             mcp_servers: vec![],
@@ -6170,7 +6284,7 @@ mod boot_recovery_integration_tests {
             idle_timeout: Duration::from_secs(60),
             max_turn_duration: Duration::from_secs(120),
             turn_liveness_interval: Duration::ZERO,
-            dedup_mode: DedupMode::Queue,
+            dedup_mode,
             system_prompt: None,
             team_instructions: None,
             heartbeat_prompt: None,
@@ -6880,6 +6994,39 @@ mod boot_recovery_integration_tests {
     }
 
     // ── Scenario 8: successful shutdown-grace result → no recovery ────────
+    //
+    // All four scenarios below (8, 9, 10a, 10b) drive the real
+    // `drain_shutdown_grace` seam (lib.rs) — the exact `select!`/timeout
+    // wrapper `run()` awaits during Ctrl+C shutdown — instead of calling
+    // `queue.complete_batch()` directly and asserting the disposition the
+    // production code was "supposed to" apply. A regression that stops
+    // routing a shutdown-grace result/panic through `classify_and_complete_batch`
+    // (or drops the panic-handling arm entirely) now fails these tests.
+
+    /// Dispatch one real in-flight task via `dispatch_pending` so the pool's
+    /// `task_map`/`join_set` are in the exact state `drain_shutdown_grace`
+    /// expects at shutdown — mirrors the production call sequence
+    /// (`dispatch_pending` in the main loop, then `drain_shutdown_grace` at
+    /// Ctrl+C) instead of hand-rolling a `TaskMeta` insert.
+    async fn dispatch_one_in_flight(
+        queue: &mut EventQueue,
+        ledger: &mut Ledger,
+        ch: Uuid,
+        event: &nostr::Event,
+    ) -> AgentPool {
+        queue.push(QueuedEvent::new(
+            ch,
+            event.clone(),
+            Instant::now(),
+            "test".into(),
+        ));
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let ctx = test_prompt_context();
+        let dispatched = dispatch_pending(&mut pool, queue, ledger, &ctx);
+        assert_eq!(dispatched.len(), 1, "setup: exactly one batch dispatched");
+        pool
+    }
 
     #[tokio::test]
     async fn test_successful_shutdown_grace_result_clears_triggers() {
@@ -6888,24 +7035,46 @@ mod boot_recovery_integration_tests {
         let event_a = make_channel_event(&keys, ch, "msg");
 
         let mut queue = EventQueue::new(DedupMode::Queue);
-        queue.push(QueuedEvent::new(
-            ch,
-            event_a.clone(),
-            Instant::now(),
-            "test".into(),
-        ));
-
-        let batch = queue.flush_next().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let mut pool = dispatch_one_in_flight(&mut queue, &mut ledger, ch, &event_a).await;
         assert!(
             !queue.recoverable_triggers(ch).is_empty(),
-            "in-flight triggers present"
+            "in-flight triggers present before shutdown"
         );
 
-        queue.complete_batch(ch, Some(batch), BatchDisposition::Success);
+        // The in-flight task is `cat` — it never sends a PromptResult on its
+        // own, so drive success by pushing one through the same
+        // `result_tx` the pool hands the real spawned task, then let
+        // `drain_shutdown_grace` reap it.
+        let agent = dummy_agent(1).await;
+        let result_tx = pool.result_tx();
+        result_tx
+            .send(PromptResult {
+                agent,
+                source: PromptSource::Channel(ch),
+                turn_id: "shutdown-test".into(),
+                outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
+                batch: None, // Success path: handle_prompt_result also passes None here.
+            })
+            .unwrap();
+
+        let config = test_config();
+        let removed_channels = HashSet::new();
+        drain_shutdown_grace(
+            &mut pool,
+            &mut queue,
+            &mut ledger,
+            &config,
+            &removed_channels,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert!(
             queue.recoverable_triggers(ch).is_empty(),
-            "no triggers after successful completion"
+            "no triggers after successful completion drains through the real grace loop"
         );
     }
 
@@ -6918,31 +7087,68 @@ mod boot_recovery_integration_tests {
         let event_a = make_channel_event(&keys, ch, "msg");
 
         let mut queue = EventQueue::new(DedupMode::Queue);
-        queue.push(QueuedEvent::new(
-            ch,
-            event_a.clone(),
-            Instant::now(),
-            "test".into(),
-        ));
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let mut pool = dispatch_one_in_flight(&mut queue, &mut ledger, ch, &event_a).await;
 
-        let batch = queue.flush_next().unwrap();
+        // Recover the batch dispatch_pending cloned into TaskMeta so the
+        // failure result carries the same recoverable batch the real
+        // read-loop would attach on an error outcome.
+        let recoverable_batch = pool
+            .task_map()
+            .values()
+            .find(|m| m.channel_id == Some(ch))
+            .and_then(|m| m.recoverable_batch.clone())
+            .expect("dispatch_pending must have cloned a recoverable batch in Queue mode");
 
-        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+        let agent = dummy_agent(1).await;
+        let result_tx = pool.result_tx();
+        result_tx
+            .send(PromptResult {
+                agent,
+                source: PromptSource::Channel(ch),
+                turn_id: "shutdown-test".into(),
+                outcome: PromptOutcome::AgentExited,
+                batch: Some(recoverable_batch),
+            })
+            .unwrap();
+
+        let config = test_config();
+        let removed_channels = HashSet::new();
+        drain_shutdown_grace(
+            &mut pool,
+            &mut queue,
+            &mut ledger,
+            &config,
+            &removed_channels,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
 
         let triggers = queue.recoverable_triggers(ch);
-        assert_eq!(triggers.len(), 1, "triggers requeued after failure");
+        assert_eq!(
+            triggers.len(),
+            1,
+            "triggers requeued after a failure result arrives mid-grace"
+        );
         assert_eq!(triggers[0].event_id, event_a.id.to_hex());
     }
 
     // ── Scenario 10: panic during grace in both dedup modes (R6-F4) ──────
 
-    #[tokio::test]
-    async fn test_panic_during_grace_queue_mode_retries() {
+    /// Drive a real join_set task panic through `drain_shutdown_grace`,
+    /// asserting the post-panic recoverable_triggers state for `dedup_mode`.
+    /// Returns `(queue, channel_id)` since the test drives channel state
+    /// through `recoverable_triggers`, which needs the id back.
+    async fn panic_during_grace(dedup_mode: DedupMode) -> (EventQueue, Uuid) {
         let keys = Keys::generate();
         let ch = Uuid::new_v4();
         let event_a = make_channel_event(&keys, ch, "msg");
 
-        let mut queue = EventQueue::new(DedupMode::Queue);
+        let mut queue = EventQueue::new(dedup_mode);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
         queue.push(QueuedEvent::new(
             ch,
             event_a.clone(),
@@ -6950,35 +7156,55 @@ mod boot_recovery_integration_tests {
             "test".into(),
         ));
 
-        let batch = queue.flush_next().unwrap();
+        let agent = dummy_agent(0).await;
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+        let ctx = test_prompt_context_with_dedup_mode(dedup_mode);
+        let dispatched = dispatch_pending(&mut pool, &mut queue, &mut ledger, &ctx);
+        assert_eq!(dispatched.len(), 1, "setup: exactly one batch dispatched");
 
-        queue.complete_batch(ch, Some(batch), BatchDisposition::Retry);
+        // Real join_set task panics mid-grace: abort the dispatched task
+        // (the actual spawned `cat`-reading prompt task) instead of
+        // spawning a synthetic panicking future — this is the exact
+        // in-flight task drain_shutdown_grace's join_next_with_id() arm
+        // must classify via task_map, not a hand-inserted TaskMeta.
+        // `abort_all` is used (JoinSet exposes no by-id abort) — safe here
+        // because exactly one task is ever in flight in this harness.
+        assert_eq!(
+            pool.task_map().len(),
+            1,
+            "exactly one in-flight task to abort"
+        );
+        pool.join_set.abort_all();
 
+        let config = test_config();
+        let removed_channels = HashSet::new();
+        drain_shutdown_grace(
+            &mut pool,
+            &mut queue,
+            &mut ledger,
+            &config,
+            &removed_channels,
+            None,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        (queue, ch)
+    }
+
+    #[tokio::test]
+    async fn test_panic_during_grace_queue_mode_retries() {
+        let (queue, ch) = panic_during_grace(DedupMode::Queue).await;
         let triggers = queue.recoverable_triggers(ch);
         assert_eq!(triggers.len(), 1, "Queue mode: panic retries");
     }
 
     #[tokio::test]
     async fn test_panic_during_grace_drop_mode_recovers_nothing() {
-        let keys = Keys::generate();
-        let ch = Uuid::new_v4();
-        let event_a = make_channel_event(&keys, ch, "msg");
-
-        let mut queue = EventQueue::new(DedupMode::Drop);
-        queue.push(QueuedEvent::new(
-            ch,
-            event_a.clone(),
-            Instant::now(),
-            "test".into(),
-        ));
-
-        let batch = queue.flush_next().unwrap();
-
-        queue.complete_batch(ch, Some(batch), BatchDisposition::Dropped);
-
+        let (queue, ch) = panic_during_grace(DedupMode::Drop).await;
         assert!(
             queue.recoverable_triggers(ch).is_empty(),
-            "Drop mode: nothing recovered"
+            "Drop mode: nothing recovered after a mid-grace panic"
         );
     }
 
@@ -7314,6 +7540,13 @@ mod boot_recovery_integration_tests {
 
     #[tokio::test]
     async fn test_unresolved_resolution_skips_steer_path() {
+        // Drives the real admission decision (`admit_live_event`, the exact
+        // function the main loop's relay-event arm calls) instead of
+        // hand-rolling the ledger/queue calls and asserting a hardcoded
+        // `skip_steer = true`. A regression that stops routing resolving
+        // events through the unresolved-lookup branch (e.g. skips
+        // `find_unresolved` or returns `skip_steer = false`) now fails this
+        // test.
         let keys = Keys::generate();
         let ch = Uuid::new_v4();
         let event_a = make_channel_event(&keys, ch, "msg");
@@ -7322,36 +7555,100 @@ mod boot_recovery_integration_tests {
         let mut queue = EventQueue::new(DedupMode::Queue);
         let dir = tempfile::tempdir().unwrap();
         let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
-        let _suppression: HashSet<String> = HashSet::new();
+        let mut suppression: HashSet<String> = HashSet::new();
 
         ledger.add_unresolved(ch, record_a.clone());
 
-        let unresolved = ledger.find_unresolved(ch, &event_a.id.to_hex());
-        assert!(unresolved.is_some());
-
-        let unresolved = unresolved.unwrap();
-        let recovered = QueuedEvent::from_recovered(
+        // The live relay redelivers event_a — same path the main loop takes
+        // when a resolving event arrives for an unresolved barrier record.
+        let (accepted, skip_steer) = admit_live_event(
+            &mut queue,
+            &mut ledger,
+            &mut suppression,
             ch,
             event_a.clone(),
-            unresolved.prompt_tag.clone(),
-            unresolved.admission_seq,
-            unresolved.enqueued_at_unix,
-            unresolved.cap_exempt,
+            "test".into(),
         );
-        queue.admit_recovered(ch, recovered);
-        ledger.resolve_unresolved(ch, &event_a.id.to_hex());
-        sync_dirty(&mut queue, &mut ledger);
 
-        let skip_steer = true;
+        assert!(accepted, "resolving event must be admitted into the queue");
+        assert!(
+            skip_steer,
+            "resolved recovered event must skip native steer"
+        );
 
         let triggers = queue.recoverable_triggers(ch);
         assert_eq!(triggers.len(), 1);
         assert_eq!(triggers[0].event_id, event_a.id.to_hex());
         assert!(
-            skip_steer,
-            "resolved recovered event must skip native steer"
+            ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none(),
+            "unresolved record must be consumed on resolution"
         );
-        assert!(ledger.find_unresolved(ch, &event_a.id.to_hex()).is_none());
+    }
+
+    #[tokio::test]
+    async fn test_live_event_with_no_unresolved_record_takes_steer_path() {
+        // Companion to the scenario above: an ordinary live event with no
+        // matching unresolved ledger record and no suppression entry must
+        // go through the normal `queue.push` admission and NOT skip steer.
+        // Without this case, a mutation that makes `admit_live_event`
+        // always return `skip_steer = true` would slip through undetected.
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "unrelated");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let mut suppression: HashSet<String> = HashSet::new();
+
+        let (accepted, skip_steer) = admit_live_event(
+            &mut queue,
+            &mut ledger,
+            &mut suppression,
+            ch,
+            event_a.clone(),
+            "test".into(),
+        );
+
+        assert!(accepted, "ordinary live event must be admitted");
+        assert!(
+            !skip_steer,
+            "an ordinary live event with no unresolved record must take the native steer path"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovered_suppressed_event_skips_steer_and_is_not_readmitted() {
+        // Third branch: a duplicate live delivery for an event already
+        // imported by boot recovery. Must be suppressed (not pushed again)
+        // and must still skip steer.
+        let keys = Keys::generate();
+        let ch = Uuid::new_v4();
+        let event_a = make_channel_event(&keys, ch, "already-imported");
+
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let dir = tempfile::tempdir().unwrap();
+        let (mut ledger, _) = Ledger::load(dir.path(), "test_pubkey", 0);
+        let mut suppression: HashSet<String> = HashSet::from([event_a.id.to_hex()]);
+
+        let (accepted, skip_steer) = admit_live_event(
+            &mut queue,
+            &mut ledger,
+            &mut suppression,
+            ch,
+            event_a.clone(),
+            "test".into(),
+        );
+
+        assert!(
+            !accepted,
+            "suppressed duplicate must not be pushed into the queue again"
+        );
+        assert!(skip_steer, "suppressed duplicate must skip native steer");
+        assert!(
+            !suppression.contains(&event_a.id.to_hex()),
+            "suppression entry must be consumed on the matching live delivery"
+        );
     }
 
     // ── Scenario 14: quiet-harness barrier expiry (BINDING) ──────────────
