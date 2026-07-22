@@ -1,6 +1,7 @@
 use super::import::{
-    decode_snapshot_from_bytes, reject_legacy_persona_filename, resolve_snapshot_import_behavior,
-    AgentSnapshotImportResult, MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOT_PNG_BYTES,
+    build_agent_snapshot_import_preview, decode_snapshot_from_bytes,
+    reject_legacy_persona_filename, resolve_snapshot_import_behavior, AgentSnapshotImportResult,
+    MAX_SNAPSHOT_JSON_BYTES, MAX_SNAPSHOT_PNG_BYTES,
 };
 use super::*;
 use crate::managed_agents::{
@@ -94,6 +95,7 @@ fn make_snapshot(
         version: FORMAT_VERSION,
         definition: AgentSnapshotDefinition {
             name: "Test Agent".to_string(),
+            source_is_builtin: false,
             system_prompt: Some("You are helpful.".to_string()),
             runtime: None,
             model: None,
@@ -549,6 +551,22 @@ fn import_preview_flags_non_empty_source_allowlist() {
         has_source_allowlist,
         "preview must flag non-empty source allowlist"
     );
+}
+
+#[test]
+fn import_preview_includes_exported_definition_metadata() {
+    let mut snapshot = make_snapshot(MemoryLevel::None, vec![]);
+    snapshot.definition.source_is_builtin = true;
+    snapshot.definition.model = Some("claude-opus-4-5".to_string());
+    snapshot.definition.runtime = Some("goose".to_string());
+    let bytes = crate::managed_agents::agent_snapshot::encode_snapshot_json(&snapshot).unwrap();
+    let decoded = decode_snapshot_from_bytes(&bytes).unwrap();
+
+    let preview = build_agent_snapshot_import_preview(&decoded);
+
+    assert!(preview.is_builtin);
+    assert_eq!(preview.model.as_deref(), Some("claude-opus-4-5"));
+    assert_eq!(preview.runtime.as_deref(), Some("goose"));
 }
 
 // ── Import: resolve_snapshot_import_behavior — the production selection path

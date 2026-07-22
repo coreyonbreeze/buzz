@@ -28,7 +28,7 @@ export function isPersonaVisibleInCatalog(
   persona: AgentPersona,
   sharedCatalogPersonaIds: ReadonlySet<string> = new Set(),
 ) {
-  return persona.isBuiltIn || sharedCatalogPersonaIds.has(persona.id);
+  return !persona.isBuiltIn && sharedCatalogPersonaIds.has(persona.id);
 }
 
 export function getCatalogPersonas(

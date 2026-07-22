@@ -18,7 +18,10 @@ import {
   type AgentSnapshotImportResult,
 } from "@/features/agents/hooks";
 import { getPersonaLibraryState } from "@/features/agents/lib/catalog";
-import { clearLegacyPersonaCatalogVisibility } from "@/features/agents/lib/legacyPersonaCatalogVisibility";
+import {
+  readSharedCatalogPersonaIds,
+  writeSharedCatalogPersonaIds,
+} from "@/features/agents/lib/personaCatalogVisibility";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
 import type {
   SnapshotFormat,
@@ -88,6 +91,9 @@ export function usePersonaActions() {
   const [snapshotImportConfirmError, setSnapshotImportConfirmError] =
     React.useState<string | null>(null);
   const [isCatalogDialogOpen, setIsCatalogDialogOpen] = React.useState(false);
+  const [sharedCatalogPersonaIds, setSharedCatalogPersonaIds] = React.useState<
+    string[]
+  >(readSharedCatalogPersonaIds);
   const [personaNoticeMessage, setPersonaNoticeMessage] = React.useState<
     string | null
   >(null);
@@ -101,9 +107,10 @@ export function usePersonaActions() {
     React.useState(false);
 
   const personas = personasQuery.data ?? [];
-  React.useEffect(() => {
-    clearLegacyPersonaCatalogVisibility();
-  }, []);
+  const sharedCatalogPersonaIdSet = React.useMemo(
+    () => new Set(sharedCatalogPersonaIds),
+    [sharedCatalogPersonaIds],
+  );
   const availableRuntimes = React.useMemo(
     () =>
       (acpRuntimesQuery.data ?? []).filter(
@@ -113,8 +120,8 @@ export function usePersonaActions() {
     [acpRuntimesQuery.data],
   );
   const { catalogPersonas, libraryPersonas, personaLabelsById } = React.useMemo(
-    () => getPersonaLibraryState(personas),
-    [personas],
+    () => getPersonaLibraryState(personas, sharedCatalogPersonaIdSet),
+    [personas, sharedCatalogPersonaIdSet],
   );
 
   function clearFeedback(
@@ -386,6 +393,27 @@ export function usePersonaActions() {
     );
   }
 
+  function setPersonaCatalogVisibility(
+    persona: AgentPersona,
+    visible: boolean,
+  ) {
+    if (persona.isBuiltIn) return;
+
+    clearFeedback("library");
+    setSharedCatalogPersonaIds((current) => {
+      const next = new Set(current);
+      if (visible) {
+        next.add(persona.id);
+      } else {
+        next.delete(persona.id);
+      }
+
+      const ids = Array.from(next);
+      writeSharedCatalogPersonaIds(ids);
+      return ids;
+    });
+  }
+
   const isPending =
     isPersonaSubmitPending ||
     createPersonaMutation.isPending ||
@@ -431,6 +459,8 @@ export function usePersonaActions() {
     personaToExportSnapshot,
     setPersonaToExportSnapshot,
     handleExportSnapshot,
+    setPersonaCatalogVisibility,
+    sharedCatalogPersonaIdSet,
     clearFeedback,
     snapshotImportState,
     snapshotImportResult,

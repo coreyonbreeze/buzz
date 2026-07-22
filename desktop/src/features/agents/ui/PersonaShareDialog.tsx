@@ -1,6 +1,7 @@
 import * as React from "react";
 import {
   AlertCircle,
+  BookUser,
   Check,
   ChevronRight,
   Download,
@@ -41,6 +42,7 @@ import {
 } from "@/shared/ui/dialog";
 import { Separator } from "@/shared/ui/separator";
 import { Spinner } from "@/shared/ui/spinner";
+import { Switch } from "@/shared/ui/switch";
 
 import {
   formatShareRecipientName,
@@ -51,8 +53,10 @@ import { resolveSnapshotAvatarPng } from "./snapshotAvatarPng";
 import { useSnapshotSendController } from "./useSnapshotSendController";
 
 type PersonaShareDialogProps = {
+  isCatalogVisible: boolean;
   isPending: boolean;
   linkedAgentPubkey: string | null;
+  onCatalogVisibilityChange: (visible: boolean) => void;
   onExport: () => void;
   onOpenChange: (open: boolean) => void;
   open: boolean;
@@ -60,6 +64,7 @@ type PersonaShareDialogProps = {
 };
 
 type SnapshotShareDialogProps = {
+  beforeExport?: React.ReactNode;
   displayName: string;
   encodeSnapshot: (
     memoryLevel: SnapshotMemoryLevel,
@@ -231,6 +236,7 @@ function ShareLevelControl({
 }
 
 export function SnapshotShareDialog({
+  beforeExport,
   displayName,
   encodeSnapshot,
   hasMemoryOptions,
@@ -691,6 +697,7 @@ export function SnapshotShareDialog({
             </section>
           </div>
         </div>
+        {beforeExport}
         <button
           className="relative flex min-h-14 w-full items-center gap-3 rounded-2xl bg-background px-5 py-4 text-left text-sm font-medium shadow-2xl outline-hidden transition-colors hover:bg-muted focus-visible:bg-muted disabled:cursor-default disabled:opacity-100"
           data-testid={`${testIdPrefix}-export`}
@@ -715,13 +722,16 @@ export function SnapshotShareDialog({
 }
 
 export function PersonaShareDialog({
+  isCatalogVisible,
   isPending,
   linkedAgentPubkey,
+  onCatalogVisibilityChange,
   onExport,
   onOpenChange,
   open,
   persona,
 }: PersonaShareDialogProps) {
+  const switchId = `persona-share-catalog-${persona.id}`;
   const encodeSnapshotMutation = useEncodeAgentSnapshotForSendMutation();
   const encodeSnapshot = React.useCallback(
     async (memoryLevel: SnapshotMemoryLevel) =>
@@ -742,6 +752,31 @@ export function PersonaShareDialog({
 
   return (
     <SnapshotShareDialog
+      beforeExport={
+        persona.isBuiltIn ? null : (
+          <section
+            className="relative flex min-h-16 w-full items-center gap-3 rounded-2xl bg-background px-5 py-4 shadow-2xl"
+            data-testid="persona-share-catalog"
+          >
+            <BookUser className="h-4 w-4 shrink-0 text-muted-foreground" />
+            <div className="min-w-0 flex-1">
+              <label className="text-sm font-medium" htmlFor={switchId}>
+                Share to catalog
+              </label>
+              <p className="text-xs text-secondary-foreground/75">
+                Let anyone on this relay find and use this agent.
+              </p>
+            </div>
+            <Switch
+              checked={isCatalogVisible}
+              data-testid="persona-share-show-in-catalog"
+              disabled={isPending}
+              id={switchId}
+              onCheckedChange={onCatalogVisibilityChange}
+            />
+          </section>
+        )
+      }
       displayName={persona.displayName}
       encodeSnapshot={encodeSnapshot}
       hasMemoryOptions={linkedAgentPubkey !== null}

@@ -8,7 +8,6 @@ import type {
   UpdatePersonaInput,
 } from "@/shared/api/types";
 import { cn } from "@/shared/lib/cn";
-import { Button } from "@/shared/ui/button";
 import { ChooserDialogContent } from "@/shared/ui/chooser-dialog-content";
 import { Dialog } from "@/shared/ui/dialog";
 import { Input } from "@/shared/ui/input";
@@ -83,6 +82,7 @@ import {
 } from "./agentAiConfigurationPolicy";
 import { useProviderApiKeyFieldState } from "./providerApiKeyFieldState";
 import { buildRuntimeModelProviderPayload } from "./agentDefinitionSubmitPayload";
+import { AgentDefinitionDialogFooter } from "./AgentDefinitionDialogFooter";
 
 type AgentDefinitionDialogProps = {
   open: boolean;
@@ -734,41 +734,14 @@ export function AgentDefinitionDialog({
         headerClassName="pb-2"
         title={title}
         footer={
-          <div className="flex w-full items-center justify-between gap-3">
-            <div className="flex min-h-9 items-center">
-              {submitBlockReason ? (
-                <p
-                  className="text-2xs text-muted-foreground"
-                  data-testid="persona-dialog-submit-reason"
-                >
-                  {submitBlockReason}
-                </p>
-              ) : null}
-            </div>
-
-            <div className="flex items-center gap-2">
-              <Button
-                disabled={isPending || isAvatarUploadPending}
-                onClick={() => handleOpenChange(false)}
-                type="button"
-                variant="outline"
-              >
-                Cancel
-              </Button>
-              <Button
-                data-testid="persona-dialog-submit"
-                disabled={!canSubmit}
-                form="persona-dialog-form"
-                type="submit"
-              >
-                {isPending
-                  ? "Saving..."
-                  : isAvatarUploadPending
-                    ? "Uploading..."
-                    : submitLabel}
-              </Button>
-            </div>
-          </div>
+          <AgentDefinitionDialogFooter
+            canSubmit={canSubmit}
+            isAvatarUploadPending={isAvatarUploadPending}
+            isPending={isPending}
+            onCancel={() => handleOpenChange(false)}
+            submitBlockReason={displayName.trim() ? submitBlockReason : null}
+            submitLabel={submitLabel}
+          />
         }
       >
         <form

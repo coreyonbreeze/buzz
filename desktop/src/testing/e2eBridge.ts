@@ -7282,9 +7282,7 @@ function ensureMockPersonaIsActive(personaId: string) {
     throw new Error(`agent ${personaId} not found`);
   }
   if (!persona.is_active) {
-    throw new Error(
-      `${persona.display_name} is not in My Agents. Choose it from Agent Catalog first.`,
-    );
+    throw new Error(`${persona.display_name} is not in My Agents.`);
   }
 }
 
@@ -9957,6 +9955,9 @@ export function maybeInstallE2eTauriMocks() {
         // Return a minimal preview — no writes performed.
         return {
           displayName: "Imported Agent",
+          isBuiltIn: true,
+          model: "claude-opus-4-5",
+          runtime: "goose",
           systemPrompt: null,
           avatarUrl: null,
           memoryLevel: "none",
