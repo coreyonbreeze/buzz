@@ -341,6 +341,7 @@ fn extract_search_mode(raw: &Value) -> buzz_search::SearchMode {
         .and_then(Value::as_str)
     {
         Some("prefix") => buzz_search::SearchMode::Prefix,
+        Some("contains") => buzz_search::SearchMode::Contains,
         _ => buzz_search::SearchMode::FullText,
     }
 }
@@ -2260,6 +2261,20 @@ mod tests {
         assert_eq!(
             extract_search_mode(&serde_json::json!({ "search": "pro", "searchMode": "prefix" })),
             buzz_search::SearchMode::Prefix
+        );
+    }
+
+    #[test]
+    fn bridge_search_mode_extension_accepts_contains() {
+        assert_eq!(
+            extract_search_mode(
+                &serde_json::json!({ "search": "kurs", "search_mode": "contains" })
+            ),
+            buzz_search::SearchMode::Contains
+        );
+        assert_eq!(
+            extract_search_mode(&serde_json::json!({ "search": "kurs", "searchMode": "contains" })),
+            buzz_search::SearchMode::Contains
         );
     }
 
