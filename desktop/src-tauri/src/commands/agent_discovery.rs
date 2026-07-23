@@ -591,7 +591,7 @@ fn install_shell_command(command: &str) -> Result<std::process::Command, String>
     let inherited: Vec<std::path::PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let use_inherited = !had_login && cfg!(windows);
+    let use_inherited = crate::managed_agents::should_use_inherited(had_login, true, cfg!(windows));
     let path_parts =
         crate::managed_agents::compose_path_entries(managed, login, inherited, use_inherited);
     if !path_parts.is_empty() {
