@@ -21,6 +21,7 @@ import type { RelayEvent } from "@/shared/api/types";
 import {
   createArchivePagingState,
   applyChannelReset,
+  runHydrationLoop,
 } from "./archivePagingState";
 export type { ArchivePagingState } from "./archivePagingState";
 
@@ -143,10 +144,12 @@ export function useLoadArchivedObserverEvents(
   // Reset per-channel paging state when channelId changes. Backfill state is
   // identity-level (not per-channel) and must NOT be reset here — the backfill
   // index covers all channels and only needs to run once per identity mount.
-  // Only the cursor, exhaustion flag, and fetching lock are channel-scoped.
+  // Only the cursor, exhaustion flag, fetching lock, and channel token are
+  // channel-scoped. activeChannelId is updated here so in-flight reads from
+  // the old channel can detect they are stale and discard their results.
   // biome-ignore lint/correctness/useExhaustiveDependencies: channelId is the intentional reset key; ps is a stable ref excluded from deps by convention; setHasOlderArchived is a stable React state setter
   React.useEffect(() => {
-    applyChannelReset(ps);
+    applyChannelReset(ps, channelId);
     setHasOlderArchived(true);
   }, [channelId]);
 
@@ -264,7 +267,7 @@ export function useLoadArchivedObserverEvents(
     ps.backfillPromise = promise;
   }, [enabled, hasSubscription]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ps is a stable ref; ps.isFetching/ps.cursor/ps.backfillPromise/ps.hasOlderArchived are read via the stable ref object, not reactive values
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ps is a stable ref; all per-page state (isFetching, cursor, hasOlderArchived, activeChannelId) is read from the ref rather than React state, so this callback is intentionally stable across exhaustion/channel changes
   const fetchOlderArchived = React.useCallback(async () => {
     if (
       !enabled ||
@@ -272,10 +275,16 @@ export function useLoadArchivedObserverEvents(
       !hasSubscription ||
       !channelId ||
       ps.isFetching ||
-      !hasOlderArchived
+      !ps.hasOlderArchived
     ) {
       return;
     }
+
+    // Snapshot the channelId at the start of this request. After the async
+    // Tauri read resolves we compare against ps.activeChannelId; if they
+    // differ, a channel switch happened mid-flight and we discard the result
+    // rather than corrupting the new channel's cursor/exhaustion state.
+    const requestChannelId = channelId;
 
     // Await backfill completion before reading the channel index. This
     // guarantees the index is populated before the first paginated read, so
@@ -285,19 +294,28 @@ export function useLoadArchivedObserverEvents(
       await ps.backfillPromise;
     }
 
-    // Re-check after awaiting: hasOlderArchived might have been set false
-    // while we were waiting (e.g. subscription check failed).
-    if (!hasOlderArchived) {
+    // Re-check after awaiting: channel may have switched or archive exhausted
+    // while we were waiting for backfill.
+    if (!ps.hasOlderArchived || requestChannelId !== ps.activeChannelId) {
       return;
     }
 
     ps.isFetching = true;
     try {
       const before = ps.cursor ?? undefined;
-      const events = await readArchivedObserverEventsForChannel(channelId, {
-        before: before ?? null,
-        limit: ARCHIVED_EVENTS_PAGE_SIZE,
-      });
+      const events = await readArchivedObserverEventsForChannel(
+        requestChannelId,
+        {
+          before: before ?? null,
+          limit: ARCHIVED_EVENTS_PAGE_SIZE,
+        },
+      );
+
+      // Discard result if the channel changed while the Tauri read was in
+      // flight. The new channel will start its own read with a null cursor.
+      if (requestChannelId !== ps.activeChannelId) {
+        return;
+      }
 
       if (events.length > 0) {
         // Cursor = the last row in newest-first order = the oldest event on
@@ -321,7 +339,7 @@ export function useLoadArchivedObserverEvents(
     } finally {
       ps.isFetching = false;
     }
-  }, [enabled, identityPubkey, hasSubscription, channelId, hasOlderArchived]);
+  }, [enabled, identityPubkey, hasSubscription, channelId]);
 
   // Eager initial hydration: on panel open (or channel switch), load archive
   // pages automatically until the budget is reached or the channel is exhausted.
@@ -332,7 +350,12 @@ export function useLoadArchivedObserverEvents(
   // (which resets initialHydrationDone) so channel switches trigger a fresh
   // pass. Uses fetchOlderArchived's existing lock/cursor/backfill-await
   // machinery — no parallel state machine.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: ps is a stable ref; initialHydrationDone from ps is read inside the effect via ps.initialHydrationDone (not as a reactive dep) to avoid triggering re-runs; the effect re-runs on the deps that actually indicate a new hydration is needed
+  //
+  // fetchOlderArchived is now stable (it no longer captures hasOlderArchived
+  // from React state — it reads ps.hasOlderArchived from the ref), so it is
+  // safe to call from this effect without coupling the hydration lifecycle to
+  // React state identity changes.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ps is a stable ref; initialHydrationDone is read from ps (not as a reactive dep) to avoid triggering re-runs; fetchOlderArchived is stable and intentionally omitted
   React.useEffect(() => {
     if (
       !enabled ||
@@ -344,26 +367,21 @@ export function useLoadArchivedObserverEvents(
       return;
     }
 
-    let cancelled = false;
-    // Mark running immediately to prevent concurrent hydration loops if
-    // fetchOlderArchived identity changes mid-run (it changes when hasOlderArchived
-    // flips). The loop completes asynchronously; cancelled handles cleanup.
+    // Mark done immediately to prevent concurrent hydration loops. The loop
+    // runs asynchronously; the signal object handles mid-loop cancellation on
+    // channel switch (the cleanup fn sets signal.cancelled = true).
     ps.initialHydrationDone = true;
-    const runHydration = async () => {
-      for (let page = 0; page < INITIAL_HYDRATION_BUDGET_PAGES; page++) {
-        if (cancelled || !ps.hasOlderArchived) {
-          break;
-        }
-        await fetchOlderArchived();
-        // If fetchOlderArchived exhausted the channel, ps.hasOlderArchived is
-        // now false — the loop will exit on the next iteration check.
-      }
-    };
-    void runHydration();
+    const signal = { cancelled: false };
+    void runHydrationLoop(
+      ps,
+      fetchOlderArchived,
+      INITIAL_HYDRATION_BUDGET_PAGES,
+      signal,
+    );
     return () => {
-      cancelled = true;
+      signal.cancelled = true;
     };
-  }, [enabled, identityPubkey, hasSubscription, channelId, fetchOlderArchived]);
+  }, [enabled, identityPubkey, hasSubscription, channelId]);
 
   return { fetchOlderArchived, hasOlderArchived };
 }
