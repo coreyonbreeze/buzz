@@ -165,7 +165,8 @@ function IssueRow({
   );
 }
 
-function IssueDetail({
+/** Full issue conversation and comment composer. */
+export function ProjectIssueDetail({
   issue,
   profiles,
   project,
@@ -372,7 +373,7 @@ export function ProjectIssuesPanel({
 
   if (selectedIssue) {
     return (
-      <IssueDetail
+      <ProjectIssueDetail
         issue={selectedIssue}
         profiles={profiles}
         project={project}

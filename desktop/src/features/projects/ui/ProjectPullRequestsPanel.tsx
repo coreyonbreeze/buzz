@@ -446,7 +446,8 @@ export function PullRequestMetaRail({
   );
 }
 
-function PullRequestDetail({
+/** Full pull-request conversation, review actions, and comment composer. */
+export function ProjectPullRequestDetail({
   mode,
   onOpenCommit,
   onOpenTerminal,
@@ -744,7 +745,7 @@ export function PullRequestsPanel({
 
   if (selectedPullRequest) {
     return (
-      <PullRequestDetail
+      <ProjectPullRequestDetail
         mode={mode}
         onOpenCommit={onOpenCommit}
         onOpenTerminal={onOpenTerminal}
