@@ -35,6 +35,23 @@ export function AgentDefinitionDialogFooter({
             {submitBlockReason}
           </p>
         ) : null}
+        {showPublishUpdates ? (
+          <label
+            className="flex cursor-pointer items-center gap-2 text-sm font-medium text-foreground"
+            htmlFor="persona-dialog-publish-updates"
+          >
+            <Checkbox
+              checked={publishUpdatesChecked}
+              data-testid="persona-dialog-publish-updates"
+              disabled={isPending || isAvatarUploadPending}
+              id="persona-dialog-publish-updates"
+              onCheckedChange={(checked) =>
+                onPublishUpdatesCheckedChange(checked === true)
+              }
+            />
+            <span>Publish updates</span>
+          </label>
+        ) : null}
       </div>
 
       <div className="flex items-center gap-2">
@@ -58,23 +75,6 @@ export function AgentDefinitionDialogFooter({
               ? "Uploading..."
               : submitLabel}
         </Button>
-        {showPublishUpdates ? (
-          <label
-            className="ml-1 flex cursor-pointer items-center gap-2 text-sm font-medium text-foreground"
-            htmlFor="persona-dialog-publish-updates"
-          >
-            <Checkbox
-              checked={publishUpdatesChecked}
-              data-testid="persona-dialog-publish-updates"
-              disabled={isPending || isAvatarUploadPending}
-              id="persona-dialog-publish-updates"
-              onCheckedChange={(checked) =>
-                onPublishUpdatesCheckedChange(checked === true)
-              }
-            />
-            <span>Publish updates</span>
-          </label>
-        ) : null}
       </div>
     </div>
   );

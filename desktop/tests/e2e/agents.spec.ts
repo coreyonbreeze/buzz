@@ -1388,13 +1388,14 @@ This deliberately long fenced-code example must not establish the minimum width 
     "data-state",
     "unchecked",
   );
-  const [saveButtonBox, publishUpdatesCheckboxBox] = await Promise.all([
-    editDialog.getByRole("button", { name: "Save changes" }).boundingBox(),
+  const [cancelButtonBox, publishUpdatesCheckboxBox] = await Promise.all([
+    editDialog.getByRole("button", { name: "Cancel" }).boundingBox(),
     publishUpdatesCheckbox.boundingBox(),
   ]);
-  expect(publishUpdatesCheckboxBox?.x ?? 0).toBeGreaterThan(
-    (saveButtonBox?.x ?? 0) + (saveButtonBox?.width ?? 0),
-  );
+  expect(
+    (publishUpdatesCheckboxBox?.x ?? 0) +
+      (publishUpdatesCheckboxBox?.width ?? 0),
+  ).toBeLessThan(cancelButtonBox?.x ?? 0);
   await editDialog.getByRole("button", { name: "Save changes" }).click();
   await expect(editDialog).toHaveCount(0);
 
