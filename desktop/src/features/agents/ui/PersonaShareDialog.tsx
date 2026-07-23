@@ -53,6 +53,7 @@ import { resolveSnapshotAvatarPng } from "./snapshotAvatarPng";
 import { useSnapshotSendController } from "./useSnapshotSendController";
 
 type PersonaShareDialogProps = {
+  hasCatalogUpdates: boolean;
   isCatalogVisible: boolean;
   isPending: boolean;
   linkedAgentPubkey: string | null;
@@ -60,6 +61,7 @@ type PersonaShareDialogProps = {
   onExport: () => void;
   onOpenChange: (open: boolean) => void;
   open: boolean;
+  onPublishCatalogUpdates: () => void;
   persona: AgentPersona;
 };
 
@@ -722,12 +724,14 @@ export function SnapshotShareDialog({
 }
 
 export function PersonaShareDialog({
+  hasCatalogUpdates,
   isCatalogVisible,
   isPending,
   linkedAgentPubkey,
   onCatalogVisibilityChange,
   onExport,
   onOpenChange,
+  onPublishCatalogUpdates,
   open,
   persona,
 }: PersonaShareDialogProps) {
@@ -767,13 +771,26 @@ export function PersonaShareDialog({
                 Let anyone on this relay find and use this agent.
               </p>
             </div>
-            <Switch
-              checked={isCatalogVisible}
-              data-testid="persona-share-show-in-catalog"
-              disabled={isPending}
-              id={switchId}
-              onCheckedChange={onCatalogVisibilityChange}
-            />
+            <div className="flex shrink-0 items-center gap-2">
+              <Switch
+                checked={isCatalogVisible}
+                data-testid="persona-share-show-in-catalog"
+                disabled={isPending}
+                id={switchId}
+                onCheckedChange={onCatalogVisibilityChange}
+              />
+              {isCatalogVisible && hasCatalogUpdates ? (
+                <Button
+                  data-testid="persona-share-publish-catalog-updates"
+                  disabled={isPending}
+                  onClick={onPublishCatalogUpdates}
+                  size="sm"
+                  variant="outline"
+                >
+                  Publish updates
+                </Button>
+              ) : null}
+            </div>
           </section>
         )
       }

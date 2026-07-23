@@ -19,7 +19,9 @@ import {
 } from "@/features/agents/hooks";
 import { getPersonaLibraryState } from "@/features/agents/lib/catalog";
 import {
+  readPublishedCatalogPersonaVersions,
   readSharedCatalogPersonaIds,
+  writePublishedCatalogPersonaVersions,
   writeSharedCatalogPersonaIds,
 } from "@/features/agents/lib/personaCatalogVisibility";
 import { useCreatedAgentChannelAttachment } from "@/features/agents/useCreatedAgentChannelAttachment";
@@ -94,6 +96,8 @@ export function usePersonaActions() {
   const [sharedCatalogPersonaIds, setSharedCatalogPersonaIds] = React.useState<
     string[]
   >(readSharedCatalogPersonaIds);
+  const [publishedCatalogPersonaVersions, setPublishedCatalogPersonaVersions] =
+    React.useState<Record<string, string>>(readPublishedCatalogPersonaVersions);
   const [personaNoticeMessage, setPersonaNoticeMessage] = React.useState<
     string | null
   >(null);
@@ -137,6 +141,7 @@ export function usePersonaActions() {
     intent?: AgentCreateIntent,
     backendIntent?: BackendIntent | null,
     targetChannel?: Pick<Channel, "id" | "name"> | null,
+    options?: { publishCatalogUpdates?: boolean },
   ): Promise<boolean> {
     if (isPersonaSubmitPending) {
       return false;
@@ -146,7 +151,10 @@ export function usePersonaActions() {
     setIsPersonaSubmitPending(true);
     try {
       if ("id" in input) {
-        await updatePersonaMutation.mutateAsync(input);
+        const updatedPersona = await updatePersonaMutation.mutateAsync(input);
+        if (options?.publishCatalogUpdates) {
+          publishPersonaCatalogUpdates(updatedPersona);
+        }
         setPersonaNoticeMessage(`Updated ${input.displayName}.`);
       } else {
         const runtime = availableRuntimes.find(
@@ -354,6 +362,16 @@ export function usePersonaActions() {
     linkedAgent: ManagedAgent | undefined,
   ) {
     clearFeedback("library");
+    if (
+      sharedCatalogPersonaIdSet.has(persona.id) &&
+      publishedCatalogPersonaVersions[persona.id] === undefined
+    ) {
+      setPublishedCatalogPersonaVersions((current) => {
+        const next = { ...current, [persona.id]: persona.updatedAt };
+        writePublishedCatalogPersonaVersions(next);
+        return next;
+      });
+    }
     setPersonaToShare({
       persona,
       linkedAgentPubkey: linkedAgent?.pubkey ?? null,
@@ -412,6 +430,35 @@ export function usePersonaActions() {
       writeSharedCatalogPersonaIds(ids);
       return ids;
     });
+    setPublishedCatalogPersonaVersions((current) => {
+      const next = { ...current };
+      if (visible) {
+        next[persona.id] = persona.updatedAt;
+      } else {
+        delete next[persona.id];
+      }
+      writePublishedCatalogPersonaVersions(next);
+      return next;
+    });
+  }
+
+  function hasPersonaCatalogUpdates(persona: AgentPersona) {
+    const publishedVersion = publishedCatalogPersonaVersions[persona.id];
+    return (
+      sharedCatalogPersonaIdSet.has(persona.id) &&
+      publishedVersion !== undefined &&
+      publishedVersion !== persona.updatedAt
+    );
+  }
+
+  function publishPersonaCatalogUpdates(persona: AgentPersona) {
+    if (persona.isBuiltIn || !sharedCatalogPersonaIdSet.has(persona.id)) return;
+
+    setPublishedCatalogPersonaVersions((current) => {
+      const next = { ...current, [persona.id]: persona.updatedAt };
+      writePublishedCatalogPersonaVersions(next);
+      return next;
+    });
   }
 
   const isPending =
@@ -460,6 +507,8 @@ export function usePersonaActions() {
     setPersonaToExportSnapshot,
     handleExportSnapshot,
     setPersonaCatalogVisibility,
+    hasPersonaCatalogUpdates,
+    publishPersonaCatalogUpdates,
     sharedCatalogPersonaIdSet,
     clearFeedback,
     snapshotImportState,

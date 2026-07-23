@@ -1288,6 +1288,11 @@ test("custom personas share with people and keep export separate", async ({
 test("custom personas can be shared to the relay catalog", async ({ page }) => {
   const personaId = "custom:catalog-analyst";
   await installMockBridge(page, {
+    globalAgentConfig: {
+      env_vars: { ANTHROPIC_API_KEY: "sk-ant-test" },
+      provider: "anthropic",
+      model: "claude-opus-4-5",
+    },
     personas: [
       {
         id: personaId,
@@ -1319,9 +1324,14 @@ This deliberately long fenced-code example must not establish the minimum width 
   await page.getByLabel("Open actions for Catalog Analyst").click();
   await page.getByRole("menuitem", { name: "Share" }).click();
   const catalogToggle = page.getByTestId("persona-share-show-in-catalog");
+  const publishCatalogUpdatesButton = page.getByTestId(
+    "persona-share-publish-catalog-updates",
+  );
   await expect(catalogToggle).toHaveAttribute("aria-checked", "false");
+  await expect(publishCatalogUpdatesButton).toHaveCount(0);
   await catalogToggle.click();
   await expect(catalogToggle).toHaveAttribute("aria-checked", "true");
+  await expect(publishCatalogUpdatesButton).toHaveCount(0);
   await page
     .getByTestId("persona-share-dialog")
     .getByRole("button", { name: "Close" })
@@ -1348,8 +1358,64 @@ This deliberately long fenced-code example must not establish the minimum width 
   await page.keyboard.press("Escape");
 
   await page.getByLabel("Open actions for Catalog Analyst").click();
+  await page.getByRole("menuitem", { name: "Edit" }).click();
+  const editDialog = page.getByTestId("persona-dialog");
+  const publishUpdatesCheckbox = editDialog.getByTestId(
+    "persona-dialog-publish-updates",
+  );
+  await expect(publishUpdatesCheckbox).toHaveCount(0);
+  await editDialog
+    .getByLabel("Agent instructions")
+    .fill("Review the latest catalog changes.");
+  await expect(publishUpdatesCheckbox).toBeVisible();
+  await expect(publishUpdatesCheckbox).toHaveAttribute(
+    "data-state",
+    "unchecked",
+  );
+  const [saveButtonBox, publishUpdatesCheckboxBox] = await Promise.all([
+    editDialog.getByRole("button", { name: "Save changes" }).boundingBox(),
+    publishUpdatesCheckbox.boundingBox(),
+  ]);
+  expect(publishUpdatesCheckboxBox?.x ?? 0).toBeGreaterThan(
+    (saveButtonBox?.x ?? 0) + (saveButtonBox?.width ?? 0),
+  );
+  await editDialog.getByRole("button", { name: "Save changes" }).click();
+  await expect(editDialog).toHaveCount(0);
+
+  await page.getByLabel("Open actions for Catalog Analyst").click();
   await page.getByRole("menuitem", { name: "Share" }).click();
   await expect(catalogToggle).toHaveAttribute("aria-checked", "true");
+  await expect(publishCatalogUpdatesButton).toBeVisible();
+  const [catalogToggleBox, publishCatalogUpdatesButtonBox] = await Promise.all([
+    catalogToggle.boundingBox(),
+    publishCatalogUpdatesButton.boundingBox(),
+  ]);
+  expect(publishCatalogUpdatesButtonBox?.x ?? 0).toBeGreaterThan(
+    (catalogToggleBox?.x ?? 0) + (catalogToggleBox?.width ?? 0),
+  );
+  await publishCatalogUpdatesButton.click();
+  await expect(publishCatalogUpdatesButton).toHaveCount(0);
+  await expect(catalogToggle).toHaveAttribute("aria-checked", "true");
+  await page
+    .getByTestId("persona-share-dialog")
+    .getByRole("button", { name: "Close" })
+    .click();
+
+  await page.getByLabel("Open actions for Catalog Analyst").click();
+  await page.getByRole("menuitem", { name: "Edit" }).click();
+  await editDialog
+    .getByLabel("Agent instructions")
+    .fill("Review and publish the latest catalog changes.");
+  await expect(publishUpdatesCheckbox).toBeVisible();
+  await publishUpdatesCheckbox.click();
+  await expect(publishUpdatesCheckbox).toHaveAttribute("data-state", "checked");
+  await editDialog.getByRole("button", { name: "Save changes" }).click();
+  await expect(editDialog).toHaveCount(0);
+
+  await page.getByLabel("Open actions for Catalog Analyst").click();
+  await page.getByRole("menuitem", { name: "Share" }).click();
+  await expect(catalogToggle).toHaveAttribute("aria-checked", "true");
+  await expect(publishCatalogUpdatesButton).toHaveCount(0);
   await catalogToggle.click();
   await page
     .getByTestId("persona-share-dialog")

@@ -1,10 +1,14 @@
 import { Button } from "@/shared/ui/button";
+import { Checkbox } from "@/shared/ui/checkbox";
 
 type AgentDefinitionDialogFooterProps = {
   canSubmit: boolean;
   isAvatarUploadPending: boolean;
   isPending: boolean;
   onCancel: () => void;
+  onPublishUpdatesCheckedChange: (checked: boolean) => void;
+  publishUpdatesChecked: boolean;
+  showPublishUpdates: boolean;
   submitBlockReason: string | null;
   submitLabel: string;
 };
@@ -14,6 +18,9 @@ export function AgentDefinitionDialogFooter({
   isAvatarUploadPending,
   isPending,
   onCancel,
+  onPublishUpdatesCheckedChange,
+  publishUpdatesChecked,
+  showPublishUpdates,
   submitBlockReason,
   submitLabel,
 }: AgentDefinitionDialogFooterProps) {
@@ -51,6 +58,23 @@ export function AgentDefinitionDialogFooter({
               ? "Uploading..."
               : submitLabel}
         </Button>
+        {showPublishUpdates ? (
+          <label
+            className="ml-1 flex cursor-pointer items-center gap-2 text-sm font-medium text-foreground"
+            htmlFor="persona-dialog-publish-updates"
+          >
+            <Checkbox
+              checked={publishUpdatesChecked}
+              data-testid="persona-dialog-publish-updates"
+              disabled={isPending || isAvatarUploadPending}
+              id="persona-dialog-publish-updates"
+              onCheckedChange={(checked) =>
+                onPublishUpdatesCheckedChange(checked === true)
+              }
+            />
+            <span>Publish updates</span>
+          </label>
+        ) : null}
       </div>
     </div>
   );

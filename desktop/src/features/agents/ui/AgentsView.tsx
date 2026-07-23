@@ -322,8 +322,22 @@ export function AgentsView() {
               personas.setPersonaDialogState(null);
             }
           }}
-          onSubmit={personas.handleSubmit}
+          onSubmit={(input, options) =>
+            personas.handleSubmit(
+              input,
+              undefined,
+              undefined,
+              undefined,
+              options,
+            )
+          }
           open={personas.personaDialogState !== null}
+          showPublishUpdatesOption={
+            "id" in personas.personaDialogState.initialValues &&
+            personas.sharedCatalogPersonaIdSet.has(
+              personas.personaDialogState.initialValues.id,
+            )
+          }
           submitLabel={personas.personaDialogState.submitLabel}
           title={personas.personaDialogState.title}
         />
@@ -349,6 +363,9 @@ export function AgentsView() {
       ) : null}
       {personas.personaToShare ? (
         <PersonaShareDialog
+          hasCatalogUpdates={personas.hasPersonaCatalogUpdates(
+            personas.personaToShare.persona,
+          )}
           isCatalogVisible={
             personas.personaToShare.persona.isBuiltIn ||
             personas.sharedCatalogPersonaIdSet.has(
@@ -372,6 +389,11 @@ export function AgentsView() {
             if (!open) {
               personas.setPersonaToShare(null);
             }
+          }}
+          onPublishCatalogUpdates={() => {
+            const shareTarget = personas.personaToShare;
+            if (!shareTarget) return;
+            personas.publishPersonaCatalogUpdates(shareTarget.persona);
           }}
           open={personas.personaToShare !== null}
           persona={personas.personaToShare.persona}
