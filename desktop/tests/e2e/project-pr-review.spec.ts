@@ -111,12 +111,11 @@ test("PR creator/owner can toggle draft, request reviews, and approve", async ({
   const reviewHistoryToggle = page.getByTestId(
     "project-pull-request-review-history-toggle",
   );
-  await expect(reviewHistoryToggle).toHaveAttribute("aria-expanded", "false");
+  await expect(reviewHistoryToggle).toHaveAttribute("aria-expanded", "true");
   await expect(
     page.getByTestId("project-pull-request-timeline-row"),
-  ).toHaveCount(0);
-  await reviewHistoryToggle.click();
-  // The requested reviewer appears in the reviewers row and expanded timeline.
+  ).toHaveCount(1);
+  // The requested reviewer appears in the reviewers row and default timeline.
   await expect(page.getByText("Requested a review from bob")).toBeVisible({
     timeout: 10_000,
   });
@@ -250,6 +249,34 @@ test("PR creator/owner can toggle draft, request reviews, and approve", async ({
     fullPage: false,
     path: `${SHOTS}/02-approved.png`,
   });
+
+  // Histories over three entries show only the latest three until explicitly
+  // expanded. Collapsing the whole timeline preserves that inner choice.
+  await commentComposer
+    .locator('[contenteditable="true"]')
+    .fill("Remember the expanded history state.");
+  await commentComposer.getByRole("button", { name: "Send message" }).click();
+  await expect(page.getByText("Comment posted.")).toBeVisible();
+  const timelineRows = page.getByTestId("project-pull-request-timeline-row");
+  const earlierActivities = page.getByTestId(
+    "project-pull-request-earlier-activities",
+  );
+  await expect(timelineRows).toHaveCount(3);
+  await expect(earlierActivities).toContainText("Show 1 earlier activity");
+
+  await reviewHistoryToggle.click();
+  await expect(timelineRows).toHaveCount(0);
+  await reviewHistoryToggle.click();
+  await expect(timelineRows).toHaveCount(3);
+  await expect(earlierActivities).toBeVisible();
+
+  await earlierActivities.click();
+  await expect(timelineRows).toHaveCount(4);
+  await reviewHistoryToggle.click();
+  await expect(timelineRows).toHaveCount(0);
+  await reviewHistoryToggle.click();
+  await expect(timelineRows).toHaveCount(4);
+  await expect(earlierActivities).toHaveCount(0);
 
   // Convert to draft: badge flips to Draft and the ready button appears.
   await morePullRequestActions.click();

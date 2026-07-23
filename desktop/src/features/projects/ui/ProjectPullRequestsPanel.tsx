@@ -348,9 +348,6 @@ export function PullRequestDetailHeader({
       </h3>
       <p className="flex items-center gap-1 text-xs font-medium text-muted-foreground">
         <GitPullRequest className="h-3.5 w-3.5" />
-        <span title={formatExactTimestamp(pullRequest.createdAt)}>
-          Created {relativeTime(pullRequest.createdAt)} by
-        </span>
         <span className="flex min-w-0 items-center gap-1">
           <AuthorIdentity
             avatarSize="xs"
@@ -361,6 +358,9 @@ export function PullRequestDetailHeader({
           <ProfileAuthorName pubkey={pullRequest.author}>
             {authorLabel}
           </ProfileAuthorName>
+        </span>
+        <span title={formatExactTimestamp(pullRequest.createdAt)}>
+          created {relativeTime(pullRequest.createdAt)}
         </span>
         {sourceChannelId ? (
           <>
@@ -499,9 +499,13 @@ function PullRequestDetail({
   const identityQuery = useIdentityQuery();
   const commentMutation = useCreateProjectPullRequestCommentMutation(project);
   const [
-    expandedReviewHistoryBoxPullRequestId,
-    setExpandedReviewHistoryBoxPullRequestId,
-  ] = React.useState<string | null>(null);
+    expandedReviewHistoryPullRequestIds,
+    setExpandedReviewHistoryPullRequestIds,
+  ] = React.useState<Set<string>>(() => new Set());
+  const [
+    collapsedReviewHistoryPullRequestIds,
+    setCollapsedReviewHistoryPullRequestIds,
+  ] = React.useState<Set<string>>(() => new Set());
   const members = React.useMemo(
     () => pullRequestMembers(project, pullRequest, profiles),
     [profiles, project, pullRequest],
@@ -602,9 +606,20 @@ function PullRequestDetail({
         left.item.createdAt - right.item.createdAt ||
         left.item.id.localeCompare(right.item.id),
     );
-  const reviewHistoryCollapsed =
-    expandedReviewHistoryBoxPullRequestId !== pullRequest.id;
-  const displayedReviewHistory = reviewHistoryCollapsed ? [] : reviewHistory;
+  const reviewHistoryCollapsed = collapsedReviewHistoryPullRequestIds.has(
+    pullRequest.id,
+  );
+  const reviewHistoryExpanded = expandedReviewHistoryPullRequestIds.has(
+    pullRequest.id,
+  );
+  const earlierReviewHistoryCount = Math.max(0, reviewHistory.length - 3);
+  const visibleReviewHistory =
+    reviewHistoryExpanded || earlierReviewHistoryCount === 0
+      ? reviewHistory
+      : reviewHistory.slice(-3);
+  const displayedReviewHistory = reviewHistoryCollapsed
+    ? []
+    : visibleReviewHistory;
   const canRequestChanges = canReviewProjectPullRequest(
     project,
     pullRequest,
@@ -656,17 +671,23 @@ function PullRequestDetail({
       ) : null}
 
       <section className="space-y-3 p-4">
-        <div className="group/timeline -mx-4 overflow-hidden border-border/50 border-y">
+        <div className="group/timeline -mx-4 overflow-hidden border-border/50 border-b">
           {reviewHistory.length > 0 ? (
             <button
               aria-expanded={!reviewHistoryCollapsed}
               className="flex min-h-10 w-full items-center gap-2 px-3 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
               data-testid="project-pull-request-review-history-toggle"
-              onClick={() =>
-                setExpandedReviewHistoryBoxPullRequestId(
-                  reviewHistoryCollapsed ? pullRequest.id : null,
-                )
-              }
+              onClick={() => {
+                setCollapsedReviewHistoryPullRequestIds((current) => {
+                  const next = new Set(current);
+                  if (reviewHistoryCollapsed) {
+                    next.delete(pullRequest.id);
+                  } else {
+                    next.add(pullRequest.id);
+                  }
+                  return next;
+                });
+              }}
               type="button"
             >
               <span className="relative flex w-5 shrink-0 justify-center self-stretch">
@@ -675,7 +696,7 @@ function PullRequestDetail({
                 ) : (
                   <span className="absolute top-2.5 -bottom-[1.875rem] w-px bg-border/80" />
                 )}
-                <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-background ring-1 ring-border/70">
+                <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary ring-1 ring-primary/35">
                   <History className="h-3 w-3" />
                 </span>
               </span>
@@ -691,6 +712,33 @@ function PullRequestDetail({
               ) : (
                 <ChevronUp className="mt-0.5 h-3.5 w-3.5" />
               )}
+            </button>
+          ) : null}
+          {!reviewHistoryCollapsed &&
+          earlierReviewHistoryCount > 0 &&
+          !reviewHistoryExpanded ? (
+            <button
+              className="flex min-h-10 w-full items-center gap-2 px-3 py-2.5 text-sm font-semibold text-muted-foreground transition-colors hover:text-foreground"
+              data-testid="project-pull-request-earlier-activities"
+              onClick={() => {
+                setExpandedReviewHistoryPullRequestIds((current) => {
+                  const next = new Set(current);
+                  next.add(pullRequest.id);
+                  return next;
+                });
+              }}
+              type="button"
+            >
+              <span className="relative flex w-5 shrink-0 justify-center self-stretch">
+                <span className="absolute top-2.5 -bottom-[1.875rem] w-px bg-border/80" />
+                <span className="relative z-10 flex h-5 w-5 items-center justify-center rounded-full bg-background ring-1 ring-border/70">
+                  <ChevronDown className="h-3 w-3" />
+                </span>
+              </span>
+              <span className="min-w-0 flex-1 text-left">
+                Show {earlierReviewHistoryCount} earlier{" "}
+                {earlierReviewHistoryCount === 1 ? "activity" : "activities"}
+              </span>
             </button>
           ) : null}
           {displayedReviewHistory.map(({ item, timelineKind }, index) => {
