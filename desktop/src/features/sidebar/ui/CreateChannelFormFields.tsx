@@ -18,7 +18,7 @@ const CREATE_LABEL_OPTIONAL_CLASS =
 export const CREATE_CHANNEL_FORM_ID = "create-channel-form";
 
 /**
- * The body of the create-channel form (name, description, permissions,
+ * The body of the create-channel form (name, description, visibility,
  * optional template). Rendered inside both the standalone dialog and the
  * "Add channel" browser's create mode. Wrap in a `<form>` with
  * `id={CREATE_CHANNEL_FORM_ID}` and hook up `form.handleSubmit`.

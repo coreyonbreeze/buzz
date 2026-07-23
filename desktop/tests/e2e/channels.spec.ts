@@ -2309,7 +2309,7 @@ test("manage channel updates visibility and ephemeral lifecycle independently", 
   ).toBeVisible();
   await expect(
     page.getByTestId("channel-management-permissions"),
-  ).toHaveAccessibleName("Permissions: Private");
+  ).toHaveAccessibleName("Visibility: Private");
   await page.getByTestId("channel-management-channel-type").click();
   await page.getByLabel("Temporary channel").click();
   await expect(page.getByTestId("channel-management-ttl")).toBeVisible();
@@ -2353,7 +2353,7 @@ test("manage channel updates visibility and ephemeral lifecycle independently", 
 
   await expect(
     page.getByTestId("channel-management-permissions"),
-  ).toHaveAccessibleName("Permissions: Private");
+  ).toHaveAccessibleName("Visibility: Private");
   await expect(
     page.getByTestId("channel-management-channel-type"),
   ).toContainText("Temporary");
@@ -2368,7 +2368,7 @@ test("manage channel updates visibility and ephemeral lifecycle independently", 
   ).toBeVisible();
   await expect(
     page.getByTestId("channel-management-permissions"),
-  ).toHaveAccessibleName("Permissions: Public");
+  ).toHaveAccessibleName("Visibility: Public");
   await page.getByTestId("channel-management-channel-type").click();
   await page.getByLabel("Ongoing channel").click();
   await expect(saveChangesButton).toBeEnabled();
@@ -2410,7 +2410,7 @@ test("manage channel updates visibility and ephemeral lifecycle independently", 
 
   await expect(
     page.getByTestId("channel-management-permissions"),
-  ).toHaveAccessibleName("Permissions: Public");
+  ).toHaveAccessibleName("Visibility: Public");
   await expect(
     page.getByTestId("channel-management-channel-type"),
   ).toContainText("Ongoing");

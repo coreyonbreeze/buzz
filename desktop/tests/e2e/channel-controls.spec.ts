@@ -35,7 +35,7 @@ async function selectTemporaryChannelType(
 }
 
 test.describe("channel controls", () => {
-  test("01 — lifecycle section: permissions + channel type", async ({
+  test("01 — lifecycle section: visibility + channel type", async ({
     page,
   }) => {
     await installMockBridge(page);
@@ -53,7 +53,7 @@ test.describe("channel controls", () => {
     ).toBeVisible();
     await expect(
       page.getByTestId("channel-management-permissions"),
-    ).toHaveAccessibleName("Permissions: Public");
+    ).toHaveAccessibleName("Visibility: Public");
     await expect(
       page.getByTestId("channel-management-save-changes"),
     ).toBeDisabled();
@@ -83,7 +83,7 @@ test.describe("channel controls", () => {
     await settle(page);
   });
 
-  test("02 — permissions update immediately", async ({ page }) => {
+  test("02 — visibility updates immediately", async ({ page }) => {
     await installMockBridge(page, { updateChannelDelayMs: 500 });
     await openManagementSheet(page);
     await openEditDialog(page);
@@ -100,7 +100,7 @@ test.describe("channel controls", () => {
     await expect(
       page.getByRole("dialog", { name: "Edit private channel" }),
     ).toBeVisible();
-    await expect(permissions).toHaveAccessibleName("Permissions: Private");
+    await expect(permissions).toHaveAccessibleName("Visibility: Private");
     await expect(
       page.getByTestId("channel-management-save-changes"),
     ).toBeDisabled();
@@ -112,7 +112,7 @@ test.describe("channel controls", () => {
     await expect(
       page.getByRole("dialog", { name: "Edit public channel" }),
     ).toBeVisible();
-    await expect(permissions).toHaveAccessibleName("Permissions: Public");
+    await expect(permissions).toHaveAccessibleName("Visibility: Public");
     await expect(
       page.getByTestId("channel-management-save-changes"),
     ).toBeDisabled();
@@ -253,7 +253,7 @@ test.describe("channel controls", () => {
     await lifecycle.scrollIntoViewIfNeeded();
     await expect(
       page.getByTestId("channel-management-permissions"),
-    ).toHaveAccessibleName("Permissions: Private");
+    ).toHaveAccessibleName("Visibility: Private");
     await expect(
       page.getByTestId("channel-management-channel-type"),
     ).toContainText("Temporary");

@@ -34,15 +34,15 @@ export function ChannelPermissionsSettings({
       )}
       data-testid={`${testIdPrefix}-permissions-container`}
     >
-      <span className="text-sm font-medium text-foreground">Permissions</span>
+      <span className="text-sm font-medium text-foreground">Visibility</span>
       <DropdownMenu modal={false}>
         <DropdownMenuTrigger asChild>
           <Button
             aria-busy={isPending}
             aria-label={
               isPending
-                ? "Updating permissions"
-                : `Permissions: ${visibilityLabel}`
+                ? "Updating visibility"
+                : `Visibility: ${visibilityLabel}`
             }
             className="-mr-2.5 ml-auto h-9 w-fit justify-end px-2.5 text-right text-sm font-medium text-foreground hover:bg-muted/50"
             data-testid={`${testIdPrefix}-permissions`}
