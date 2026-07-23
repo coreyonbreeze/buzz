@@ -17,7 +17,7 @@ use crate::{
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
 pub(crate) use path::compose_path_entries;
-pub(crate) use path::is_batch_shim;
+pub(crate) use path::should_skip_claude_executable;
 pub(crate) use path::should_use_inherited;
 
 mod stop;
@@ -1610,7 +1610,8 @@ pub(crate) fn configure_runtime_cli(
         // adapter tries to spawn them (issue #2397). Skip setting
         // `CLAUDE_CODE_EXECUTABLE` for shim paths so the adapter falls back to
         // its own PATH lookup and finds the real binary instead.
-        if is_batch_shim(&cli_path) {
+        // Non-Windows: `.cmd`/`.bat` are valid executables and must be assigned.
+        if should_skip_claude_executable(&cli_path, cfg!(windows)) {
             return;
         }
         command.env("CLAUDE_CODE_EXECUTABLE", cli_path);

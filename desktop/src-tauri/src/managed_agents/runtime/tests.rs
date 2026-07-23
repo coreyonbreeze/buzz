@@ -630,7 +630,7 @@ fn codex_spawn_does_not_set_a_claude_executable() {
 #[test]
 fn batch_shim_cmd_extension_is_rejected() {
     assert!(
-        super::is_batch_shim(std::path::Path::new("claude.cmd")),
+        super::path::is_batch_shim(std::path::Path::new("claude.cmd")),
         "claude.cmd must be identified as a batch shim"
     );
 }
@@ -638,7 +638,7 @@ fn batch_shim_cmd_extension_is_rejected() {
 #[test]
 fn batch_shim_cmd_extension_uppercase_is_rejected() {
     assert!(
-        super::is_batch_shim(std::path::Path::new("claude.CMD")),
+        super::path::is_batch_shim(std::path::Path::new("claude.CMD")),
         "claude.CMD must be identified as a batch shim (case-insensitive)"
     );
 }
@@ -646,7 +646,7 @@ fn batch_shim_cmd_extension_uppercase_is_rejected() {
 #[test]
 fn batch_shim_bat_extension_is_rejected() {
     assert!(
-        super::is_batch_shim(std::path::Path::new("claude.bat")),
+        super::path::is_batch_shim(std::path::Path::new("claude.bat")),
         "claude.bat must be identified as a batch shim"
     );
 }
@@ -654,7 +654,7 @@ fn batch_shim_bat_extension_is_rejected() {
 #[test]
 fn batch_shim_bat_extension_uppercase_is_rejected() {
     assert!(
-        super::is_batch_shim(std::path::Path::new("claude.BAT")),
+        super::path::is_batch_shim(std::path::Path::new("claude.BAT")),
         "claude.BAT must be identified as a batch shim (case-insensitive)"
     );
 }
@@ -662,7 +662,7 @@ fn batch_shim_bat_extension_uppercase_is_rejected() {
 #[test]
 fn batch_shim_exe_extension_is_not_rejected() {
     assert!(
-        !super::is_batch_shim(std::path::Path::new("claude.exe")),
+        !super::path::is_batch_shim(std::path::Path::new("claude.exe")),
         "claude.exe must not be identified as a batch shim"
     );
 }
@@ -670,7 +670,7 @@ fn batch_shim_exe_extension_is_not_rejected() {
 #[test]
 fn batch_shim_no_extension_is_not_rejected() {
     assert!(
-        !super::is_batch_shim(std::path::Path::new("claude")),
+        !super::path::is_batch_shim(std::path::Path::new("claude")),
         "claude (no extension) must not be identified as a batch shim"
     );
 }

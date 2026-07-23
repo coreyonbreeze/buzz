@@ -16,6 +16,17 @@ pub(crate) fn is_batch_shim(path: &std::path::Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Return `true` when the resolved CLI path should be skipped for
+/// `CLAUDE_CODE_EXECUTABLE` assignment.
+///
+/// On Windows, `.cmd`/`.bat` batch shims cannot be passed directly to
+/// `CreateProcess` (EINVAL, issue #2397). On non-Windows those extensions are
+/// valid executables and must not be suppressed — the `is_windows` flag keeps
+/// this decision testable cross-host on macOS CI.
+pub(crate) fn should_skip_claude_executable(path: &std::path::Path, is_windows: bool) -> bool {
+    is_windows && is_batch_shim(path)
+}
+
 /// Decide whether the inherited process PATH should be appended to the
 /// composed PATH.
 ///
@@ -487,10 +498,11 @@ mod compose_tests {
     // compute the same `should_use_inherited` decision for equivalent inputs.
     // Tests the policy function directly to confirm the wrappers can't drift.
 
-    /// install and runtime wrappers derive `use_inherited` from the same pure
-    /// policy function. Verify all four relevant input combinations agree.
+    /// Exhaustive truth-table for `should_use_inherited` — all four input
+    /// combinations that affect real callers. Confirms the policy is correct
+    /// before either wrapper binds to it.
     #[test]
-    fn wrapper_policy_parity_install_and_runtime_agree() {
+    fn should_use_inherited_policy_truth_table() {
         // (had_shell, has_context, is_windows) → expected
         let cases = [
             (false, true, true, true),   // Windows, no shell, context → USE
@@ -537,5 +549,58 @@ mod compose_tests {
     #[test]
     fn batch_shim_no_extension_not_shim() {
         assert!(!is_batch_shim(Path::new("claude")));
+    }
+
+    // ── should_skip_claude_executable policy tests ────────────────────────────
+    //
+    // Cross-host policy: shim + Windows → skip; shim + non-Windows → assign;
+    // non-shim either OS → assign. Mirrors the `should_use_inherited` pattern.
+
+    #[test]
+    fn skip_claude_executable_shim_windows_returns_true() {
+        assert!(
+            super::should_skip_claude_executable(Path::new("claude.cmd"), true),
+            "shim + windows=true must skip"
+        );
+        assert!(
+            super::should_skip_claude_executable(Path::new("claude.BAT"), true),
+            "shim + windows=true must skip"
+        );
+    }
+
+    #[test]
+    fn skip_claude_executable_shim_non_windows_returns_false() {
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude.cmd"), false),
+            "shim + windows=false must NOT skip (valid executable on non-Windows)"
+        );
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude.bat"), false),
+            "shim + windows=false must NOT skip"
+        );
+    }
+
+    #[test]
+    fn skip_claude_executable_exe_both_platforms_returns_false() {
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude.exe"), true),
+            "non-shim + windows=true must NOT skip"
+        );
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude.exe"), false),
+            "non-shim + windows=false must NOT skip"
+        );
+    }
+
+    #[test]
+    fn skip_claude_executable_no_ext_both_platforms_returns_false() {
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude"), true),
+            "no-ext + windows=true must NOT skip"
+        );
+        assert!(
+            !super::should_skip_claude_executable(Path::new("claude"), false),
+            "no-ext + windows=false must NOT skip"
+        );
     }
 }
