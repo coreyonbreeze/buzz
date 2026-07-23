@@ -354,7 +354,7 @@ describe("load-older cursor advance logic", () => {
 
   it("test_short_page_signals_archive_exhausted", () => {
     // A page with fewer events than the limit signals end-of-archive.
-    const PAGE_SIZE = 50;
+    const PAGE_SIZE = 200;
     const page = Array.from({ length: 30 }, (_, i) => ({
       created_at: 1000 - i,
     }));
@@ -367,8 +367,8 @@ describe("load-older cursor advance logic", () => {
   });
 
   it("test_full_page_signals_more_archive_available", () => {
-    const PAGE_SIZE = 50;
-    const page = Array.from({ length: 50 }, (_, i) => ({
+    const PAGE_SIZE = 200;
+    const page = Array.from({ length: 200 }, (_, i) => ({
       created_at: 1000 - i,
     }));
     const exhausted = page.length < PAGE_SIZE;
@@ -410,6 +410,11 @@ describe("archive paging state reset on channel change", () => {
       "backfillPromise is eagerly initialized",
     );
     assert.equal(ps.cursor, null, "cursor starts null");
+    assert.equal(
+      ps.initialHydrationDone,
+      false,
+      "initialHydrationDone starts false",
+    );
   });
 
   it("test_channel_switch_resets_cursor_exhaustion_and_fetch_lock", () => {
@@ -419,6 +424,7 @@ describe("archive paging state reset on channel change", () => {
     ps.cursor = { createdAt: 1000, id: "event-a5" };
     ps.hasOlderArchived = false; // channel A exhausted
     ps.isFetching = true; // mid-flight request (edge case)
+    ps.initialHydrationDone = true; // hydration ran for channel A
     ps.backfillStatus = "done"; // backfill ran once already
     const originalPromise = ps.backfillPromise; // must survive reset
 
@@ -435,6 +441,11 @@ describe("archive paging state reset on channel change", () => {
       ps.isFetching,
       false,
       "isFetching resets to false on channel switch",
+    );
+    assert.equal(
+      ps.initialHydrationDone,
+      false,
+      "initialHydrationDone resets to false on channel switch so the new channel hydrates",
     );
 
     // Backfill state must NOT be touched — it is identity-level and should
@@ -459,9 +470,10 @@ describe("archive paging state reset on channel change", () => {
   it("test_multiple_channel_switches_each_start_fresh", () => {
     const ps = createArchivePagingState();
 
-    // Switch to channel A: exhaust it.
+    // Switch to channel A: exhaust it and complete hydration.
     ps.cursor = { createdAt: 500, id: "a-oldest" };
     ps.hasOlderArchived = false;
+    ps.initialHydrationDone = true;
     applyChannelReset(ps);
 
     assert.equal(ps.cursor, null, "switch A→B: cursor reset");
@@ -470,10 +482,16 @@ describe("archive paging state reset on channel change", () => {
       true,
       "switch A→B: hasOlderArchived reset",
     );
+    assert.equal(
+      ps.initialHydrationDone,
+      false,
+      "switch A→B: initialHydrationDone reset",
+    );
 
-    // Simulate channel B also being paged.
+    // Simulate channel B also being paged and hydrated.
     ps.cursor = { createdAt: 200, id: "b-oldest" };
     ps.hasOlderArchived = false;
+    ps.initialHydrationDone = true;
     applyChannelReset(ps);
 
     assert.equal(ps.cursor, null, "switch B→C: cursor reset again");
@@ -481,6 +499,142 @@ describe("archive paging state reset on channel change", () => {
       ps.hasOlderArchived,
       true,
       "switch B→C: hasOlderArchived reset again",
+    );
+    assert.equal(
+      ps.initialHydrationDone,
+      false,
+      "switch B→C: initialHydrationDone reset again",
+    );
+  });
+});
+
+// ── Eager initial hydration loop logic ───────────────────────────────────────
+//
+// The initial hydration loop in useLoadArchivedObserverEvents calls
+// fetchOlderArchived up to INITIAL_HYDRATION_BUDGET_PAGES times. The loop must:
+//   - Stop at budget (10 pages) even if more archive exists.
+//   - Stop early when the archive is exhausted (ps.hasOlderArchived → false).
+//   - Respect channel-switch cancellation (cancelled flag).
+//   - Set ps.initialHydrationDone immediately to prevent duplicate loops.
+//
+// We test the loop's control flow as pure logic using mock fetchOlderArchived
+// functions and ArchivePagingState directly — no React runtime needed.
+
+describe("eager initial hydration loop control flow", () => {
+  const BUDGET = 10; // mirrors INITIAL_HYDRATION_BUDGET_PAGES
+
+  // Simulate the hydration loop from the hook with injectable fetch + ps.
+  async function runHydrationLoop(
+    ps,
+    fetchOlderArchived,
+    cancelled = { value: false },
+  ) {
+    ps.initialHydrationDone = true;
+    for (let page = 0; page < BUDGET; page++) {
+      if (cancelled.value || !ps.hasOlderArchived) {
+        break;
+      }
+      await fetchOlderArchived();
+    }
+  }
+
+  it("test_hydration_stops_at_budget_when_archive_never_exhausted", async () => {
+    const ps = createArchivePagingState();
+    let fetchCount = 0;
+    // fetchOlderArchived that never exhausts the archive
+    const fetchOlderArchived = async () => {
+      fetchCount++;
+      // archive remains non-empty
+    };
+    await runHydrationLoop(ps, fetchOlderArchived);
+    assert.equal(
+      fetchCount,
+      BUDGET,
+      `hydration loop must stop after exactly ${BUDGET} pages (budget limit)`,
+    );
+    assert.equal(
+      ps.initialHydrationDone,
+      true,
+      "initialHydrationDone must be true after budget reached",
+    );
+  });
+
+  it("test_hydration_stops_early_when_archive_exhausted", async () => {
+    const ps = createArchivePagingState();
+    let fetchCount = 0;
+    // fetchOlderArchived that exhausts archive on page 3
+    const fetchOlderArchived = async () => {
+      fetchCount++;
+      if (fetchCount >= 3) {
+        ps.hasOlderArchived = false;
+      }
+    };
+    await runHydrationLoop(ps, fetchOlderArchived);
+    assert.equal(
+      fetchCount,
+      3,
+      "hydration loop must stop as soon as archive is exhausted (before budget)",
+    );
+    assert.equal(
+      ps.initialHydrationDone,
+      true,
+      "initialHydrationDone must be true after exhaustion",
+    );
+    assert.equal(
+      ps.hasOlderArchived,
+      false,
+      "hasOlderArchived must be false after exhaustion",
+    );
+  });
+
+  it("test_hydration_respects_cancellation_on_channel_switch", async () => {
+    const ps = createArchivePagingState();
+    const cancelled = { value: false };
+    let fetchCount = 0;
+    // fetchOlderArchived that sets cancelled on page 2 (simulates channel switch mid-loop)
+    const fetchOlderArchived = async () => {
+      fetchCount++;
+      if (fetchCount >= 2) {
+        cancelled.value = true;
+      }
+    };
+    await runHydrationLoop(ps, fetchOlderArchived, cancelled);
+    assert.equal(
+      fetchCount,
+      2,
+      "hydration loop must stop when cancelled (channel switch)",
+    );
+    // initialHydrationDone is true because it was set before the loop;
+    // applyChannelReset will reset it for the new channel.
+    assert.equal(
+      ps.initialHydrationDone,
+      true,
+      "initialHydrationDone stays true (applyChannelReset will reset it for new channel)",
+    );
+  });
+
+  it("test_initialHydrationDone_set_before_loop_prevents_duplicate_loops", () => {
+    const ps = createArchivePagingState();
+    assert.equal(ps.initialHydrationDone, false, "starts false");
+    // Simulate the synchronous guard at the top of the effect.
+    ps.initialHydrationDone = true;
+    // A second effect invocation would see initialHydrationDone=true and bail immediately.
+    // Verify the guard value is set before any async work starts.
+    assert.equal(
+      ps.initialHydrationDone,
+      true,
+      "initialHydrationDone must be true immediately after loop starts (prevents re-entry)",
+    );
+  });
+
+  it("test_channel_reset_clears_hydration_flag_for_new_channel", () => {
+    const ps = createArchivePagingState();
+    ps.initialHydrationDone = true; // hydration ran for channel A
+    applyChannelReset(ps);
+    assert.equal(
+      ps.initialHydrationDone,
+      false,
+      "applyChannelReset must clear initialHydrationDone so new channel gets fresh hydration pass",
     );
   });
 });

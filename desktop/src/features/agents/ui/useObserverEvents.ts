@@ -88,7 +88,12 @@ export function useArchivedChannelEvents(
   return React.useSyncExternalStore(subscribeToStore, getSnapshot);
 }
 
-const ARCHIVED_EVENTS_PAGE_SIZE = 50;
+const ARCHIVED_EVENTS_PAGE_SIZE = 200;
+
+// Number of pages to load eagerly on panel open (before any scroll). Each page
+// is ARCHIVED_EVENTS_PAGE_SIZE frames; 10 pages = 2000 frames, which covers
+// agent turns that emit hundreds of frames (e.g. a full code-review turn ~900).
+const INITIAL_HYDRATION_BUDGET_PAGES = 10;
 
 /**
  * Load-older-on-scroll for archived observer frames, scoped to a single channel.
@@ -317,6 +322,48 @@ export function useLoadArchivedObserverEvents(
       ps.isFetching = false;
     }
   }, [enabled, identityPubkey, hasSubscription, channelId, hasOlderArchived]);
+
+  // Eager initial hydration: on panel open (or channel switch), load archive
+  // pages automatically until the budget is reached or the channel is exhausted.
+  // This makes archived history visible immediately without any scrolling.
+  //
+  // Runs when: enabled + subscription confirmed + channelId resolved +
+  // hydration not yet done for this channel. Respects `applyChannelReset`
+  // (which resets initialHydrationDone) so channel switches trigger a fresh
+  // pass. Uses fetchOlderArchived's existing lock/cursor/backfill-await
+  // machinery — no parallel state machine.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: ps is a stable ref; initialHydrationDone from ps is read inside the effect via ps.initialHydrationDone (not as a reactive dep) to avoid triggering re-runs; the effect re-runs on the deps that actually indicate a new hydration is needed
+  React.useEffect(() => {
+    if (
+      !enabled ||
+      !identityPubkey ||
+      !hasSubscription ||
+      !channelId ||
+      ps.initialHydrationDone
+    ) {
+      return;
+    }
+
+    let cancelled = false;
+    // Mark running immediately to prevent concurrent hydration loops if
+    // fetchOlderArchived identity changes mid-run (it changes when hasOlderArchived
+    // flips). The loop completes asynchronously; cancelled handles cleanup.
+    ps.initialHydrationDone = true;
+    const runHydration = async () => {
+      for (let page = 0; page < INITIAL_HYDRATION_BUDGET_PAGES; page++) {
+        if (cancelled || !ps.hasOlderArchived) {
+          break;
+        }
+        await fetchOlderArchived();
+        // If fetchOlderArchived exhausted the channel, ps.hasOlderArchived is
+        // now false — the loop will exit on the next iteration check.
+      }
+    };
+    void runHydration();
+    return () => {
+      cancelled = true;
+    };
+  }, [enabled, identityPubkey, hasSubscription, channelId, fetchOlderArchived]);
 
   return { fetchOlderArchived, hasOlderArchived };
 }

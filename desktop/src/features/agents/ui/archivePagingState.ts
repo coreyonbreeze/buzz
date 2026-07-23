@@ -28,6 +28,10 @@ export interface ArchivePagingState {
    *  Mirrors SQL ORDER BY created_at DESC, id DESC so same-second siblings are
    *  never skipped at a page boundary. */
   cursor: { createdAt: number; id: string } | null;
+  /** True once the initial eager-hydration pass for the current channel has
+   *  completed (budget reached or archive exhausted). Resets on channel change
+   *  so switching channels triggers a fresh hydration pass. */
+  initialHydrationDone: boolean;
 }
 
 /**
@@ -43,6 +47,7 @@ export function createArchivePagingState(): ArchivePagingState {
     backfillPromise: null,
     backfillResolve: null,
     cursor: null,
+    initialHydrationDone: false,
   };
   state.backfillPromise = new Promise<void>((resolve) => {
     state.backfillResolve = resolve;
@@ -64,4 +69,5 @@ export function applyChannelReset(state: ArchivePagingState): void {
   state.cursor = null;
   state.isFetching = false;
   state.hasOlderArchived = true;
+  state.initialHydrationDone = false;
 }
