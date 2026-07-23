@@ -181,6 +181,10 @@ where
 /// Tracks active Nostr WebSocket connections and provides message routing by connection ID.
 pub struct ConnectionManager {
     connections: DashMap<Uuid, ConnEntry>,
+    /// Sticky drain flag set by [`Self::drain_all`]. Registrations that land
+    /// after the drain snapshot self-signal, so no upgrade-vs-shutdown
+    /// interleaving can produce a connection that misses the restart close.
+    draining: AtomicBool,
 }
 
 impl ConnectionManager {
@@ -188,6 +192,7 @@ impl ConnectionManager {
     pub fn new() -> Self {
         Self {
             connections: DashMap::new(),
+            draining: AtomicBool::new(false),
         }
     }
 
@@ -208,6 +213,8 @@ impl ConnectionManager {
         subscriptions: ConnectionSubscriptions,
         grace_limit: u8,
     ) {
+        let drain_ctrl_tx = ctrl_tx.clone();
+        let drain_cancel = cancel.clone();
         self.connections.insert(
             conn_id,
             ConnEntry {
@@ -221,6 +228,14 @@ impl ConnectionManager {
                 grace_limit,
             },
         );
+        // Insert-then-check pairs with drain_all's store-then-iterate: either
+        // the drain iteration sees this entry, or this check sees the flag.
+        // A registration that raced past the snapshot self-signals here, so
+        // no connection can outlive graceful shutdown unclosed.
+        if self.draining.load(Ordering::SeqCst) {
+            let _ = drain_ctrl_tx.try_send(Self::restart_close_frame());
+            drain_cancel.cancel();
+        }
     }
 
     /// Removes a connection from the registry.
@@ -335,10 +350,11 @@ impl ConnectionManager {
     ///
     /// Returns the number of connections signalled.
     pub fn drain_all(&self) -> usize {
-        let frame = WsMessage::Close(Some(axum::extract::ws::CloseFrame {
-            code: axum::extract::ws::close_code::RESTART,
-            reason: axum::extract::ws::Utf8Bytes::from_static("relay restarting"),
-        }));
+        // Store-then-iterate pairs with register's insert-then-check: a
+        // registration that misses this iteration observes the flag and
+        // self-signals instead. The flag is sticky — drain is one-way.
+        self.draining.store(true, Ordering::SeqCst);
+        let frame = Self::restart_close_frame();
         let mut closed = 0usize;
         for entry in self.connections.iter() {
             let _ = entry.ctrl_tx.try_send(frame.clone());
@@ -346,6 +362,14 @@ impl ConnectionManager {
             closed += 1;
         }
         closed
+    }
+
+    /// The WS close frame announcing a graceful restart: 1012 Service Restart.
+    fn restart_close_frame() -> WsMessage {
+        WsMessage::Close(Some(axum::extract::ws::CloseFrame {
+            code: axum::extract::ws::close_code::RESTART,
+            reason: axum::extract::ws::Utf8Bytes::from_static("relay restarting"),
+        }))
     }
 
     /// Return the server-resolved community that the connection's host bound to.
@@ -1859,5 +1883,50 @@ mod tests {
             WsMessage::Text(_)
         ));
         assert!(ctrl_rx.try_recv().is_err(), "no second frame queued");
+    }
+
+    #[tokio::test]
+    async fn register_after_drain_self_signals_restart_close_and_cancel() {
+        // The shutdown-boundary race: an upgrade accepted before SIGTERM can
+        // finish its async admission check and register AFTER drain_all's
+        // one-shot snapshot. The sticky drain flag makes that interleaving
+        // deterministic — register itself queues the 1012 and cancels, so no
+        // late registration can ride out graceful shutdown unclosed.
+        let mgr = ConnectionManager::new();
+
+        // Drain with zero connections — sets the sticky flag.
+        assert_eq!(mgr.drain_all(), 0);
+
+        // Late registration lands after the snapshot.
+        let conn_id = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(8);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        mgr.register(
+            conn_id,
+            tx,
+            ctrl_tx,
+            cancel.clone(),
+            buzz_core::tenant::CommunityId::from_uuid(Uuid::nil()),
+            Arc::new(AtomicU8::new(0)),
+            Arc::new(Mutex::new(HashMap::new())),
+            3,
+        );
+
+        assert!(
+            cancel.is_cancelled(),
+            "late registration is cancelled by the sticky drain flag"
+        );
+        match ctrl_rx.try_recv().expect("close frame delivered") {
+            WsMessage::Close(Some(close)) => {
+                assert_eq!(
+                    close.code,
+                    axum::extract::ws::close_code::RESTART,
+                    "late registration still gets the 1012 restart close"
+                );
+                assert_eq!(close.reason.as_str(), "relay restarting");
+            }
+            other => panic!("expected a restart close frame, got {other:?}"),
+        }
     }
 }
