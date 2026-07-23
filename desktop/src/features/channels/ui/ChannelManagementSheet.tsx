@@ -124,6 +124,8 @@ export function ChannelManagementSheet({
   const deleteChannelMutation = useDeleteChannelMutation(channelId);
   const joinChannelMutation = useJoinChannelMutation(channelId);
   const leaveChannelMutation = useLeaveChannelMutation(channelId);
+  const channelIdRef = React.useRef(channelId);
+  channelIdRef.current = channelId;
 
   const detail = detailsQuery.data ?? channel;
   const members = React.useMemo(() => {
@@ -302,8 +304,12 @@ export function ChannelManagementSheet({
     }
     setIsConvertingVisibility(true);
     try {
-      await updateChannelDetailsMutation.mutateAsync({ visibility });
-      setIsPrivateDraft(visibility === "private");
+      const updatedChannel = await updateChannelDetailsMutation.mutateAsync({
+        visibility,
+      });
+      if (channelIdRef.current === updatedChannel.id) {
+        setIsPrivateDraft(visibility === "private");
+      }
     } catch {
       // React Query stores mutation errors; keep the dialog open and render them.
     } finally {

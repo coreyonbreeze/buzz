@@ -301,4 +301,48 @@ test.describe("channel controls", () => {
       page.getByTestId("channel-management-save-changes"),
     ).toBeDisabled();
   });
+
+  test("10 — stale visibility updates do not affect a new channel", async ({
+    page,
+  }) => {
+    await installMockBridge(page, { updateChannelDelayMs: 1_500 });
+    await openManagementSheet(page);
+    await openEditDialog(page);
+
+    const permissions = page.getByTestId("channel-management-permissions");
+    await permissions.click();
+    await page
+      .getByTestId("channel-management-permissions-option-private")
+      .click();
+    await expect(permissions).toHaveAttribute("aria-busy", "true");
+
+    const agentsChannelId = await page
+      .getByTestId("channel-agents")
+      .getAttribute("data-channel-id");
+    if (!agentsChannelId) {
+      throw new Error("Expected the agents channel id.");
+    }
+    await page.evaluate((channelId) => {
+      const hash = window.location.hash.replace(/^#/, "") || "/";
+      const [, query = ""] = hash.split("?");
+      const nextHash = `#/channels/${channelId}${query ? `?${query}` : ""}`;
+      window.history.pushState(
+        {},
+        "",
+        `${window.location.pathname}${nextHash}`,
+      );
+      window.dispatchEvent(new HashChangeEvent("hashchange"));
+      window.dispatchEvent(new PopStateEvent("popstate"));
+    }, agentsChannelId);
+    await expect(page.getByTestId("chat-title")).toHaveText("agents");
+    await expect(
+      page.getByRole("dialog", { name: "Edit public channel" }),
+    ).toBeVisible();
+
+    await expect(permissions).toHaveAttribute("aria-busy", "false");
+    await expect(permissions).toHaveAccessibleName("Visibility: Public");
+    await expect(
+      page.getByRole("dialog", { name: "Edit public channel" }),
+    ).toBeVisible();
+  });
 });
