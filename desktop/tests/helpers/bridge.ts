@@ -393,6 +393,7 @@ type MockBridgeOptions = {
     model: string | null;
     preferred_runtime?: string | null;
   };
+  internalBuild?: boolean;
   bakedBuildEnv?: Array<{
     key: string;
     masked: boolean;

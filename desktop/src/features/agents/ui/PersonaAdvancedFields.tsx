@@ -26,6 +26,7 @@ export function PersonaAdvancedFields({
   requiredEnvKeys = [],
   fileSatisfiedEnvKeys = [],
   hiddenEnvKeys = [],
+  hideAgentAccess = false,
 }: {
   behaviorDraft: PersonaBehaviorDraft;
   disabled: boolean;
@@ -46,24 +47,27 @@ export function PersonaAdvancedFields({
   requiredEnvKeys?: readonly string[];
   fileSatisfiedEnvKeys?: readonly string[];
   hiddenEnvKeys?: readonly string[];
+  hideAgentAccess?: boolean;
 }) {
   return (
     <div className="space-y-5 pt-2">
-      <CreateAgentRespondToField
-        allowlist={behaviorDraft.respondToAllowlist}
-        disabled={disabled}
-        mode={behaviorDraft.respondTo ?? "owner-only"}
-        onAllowlistChange={(allowlist) =>
-          onBehaviorDraftChange({
-            ...behaviorDraft,
-            respondToAllowlist: allowlist,
-          })
-        }
-        onModeChange={(mode) =>
-          onBehaviorDraftChange({ ...behaviorDraft, respondTo: mode })
-        }
-        variant="persona"
-      />
+      {!hideAgentAccess ? (
+        <CreateAgentRespondToField
+          allowlist={behaviorDraft.respondToAllowlist}
+          disabled={disabled}
+          mode={behaviorDraft.respondTo ?? "owner-only"}
+          onAllowlistChange={(allowlist) =>
+            onBehaviorDraftChange({
+              ...behaviorDraft,
+              respondToAllowlist: allowlist,
+            })
+          }
+          onModeChange={(mode) =>
+            onBehaviorDraftChange({ ...behaviorDraft, respondTo: mode })
+          }
+          variant="persona"
+        />
+      ) : null}
 
       <div className="grid gap-5 sm:grid-cols-2">
         <div className="space-y-1.5">

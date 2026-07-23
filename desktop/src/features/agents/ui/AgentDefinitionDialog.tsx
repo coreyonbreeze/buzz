@@ -67,7 +67,11 @@ import {
   MODEL_DISCOVERY_LOADING_VALUE,
   usePersonaModelDiscovery,
 } from "./usePersonaModelDiscovery";
-import { useBakedBuildEnvKeysQuery, useRuntimeFileConfigQuery } from "../hooks";
+import {
+  useAgentAccessOwnerOnlyQuery,
+  useBakedBuildEnvKeysQuery,
+  useRuntimeFileConfigQuery,
+} from "../hooks";
 import { useAgentDialogDefaults } from "./useAgentDialogDefaults";
 import { AgentAiDefaultsNotice } from "./AgentAiDefaults";
 import { AgentDefaultsDialog } from "./AgentDefaultsDialog";
@@ -361,6 +365,9 @@ export function AgentDefinitionDialog({
   }
   const { data: bakedEnvKeys, isLoading: bakedLoading } =
     useBakedBuildEnvKeysQuery({ enabled: open });
+  const { data: agentAccessOwnerOnly } = useAgentAccessOwnerOnlyQuery({
+    enabled: open,
+  });
   const credentialSettled = !fileConfigLoading && !bakedLoading;
   const localModeGate = React.useMemo(
     () =>
@@ -1008,6 +1015,7 @@ export function AgentDefinitionDialog({
                       hiddenEnvKeys={
                         topLevelSecretEnvVar ? [topLevelSecretEnvVar] : []
                       }
+                      hideAgentAccess={agentAccessOwnerOnly === true}
                       inheritedEnvVars={inheritedEnvVarsForAdvanced}
                       model={model}
                       modelTuningRuntimeId={runtime}

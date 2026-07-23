@@ -79,6 +79,46 @@ async function pickDropdownOption(
 }
 
 test.describe("edit agent dialog", () => {
+  test("internal build hides the managed-agent access control", async ({
+    page,
+  }) => {
+    await installMockBridge(page, {
+      internalBuild: true,
+      bakedBuildEnv: BAKED_DEFAULTS,
+      managedAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: AGENT_NAME,
+          status: "stopped",
+          channelNames: ["agents"],
+          respondTo: "anyone",
+        },
+      ],
+    });
+
+    await openEditDialog(page);
+
+    await expect(page.getByTestId("agent-respond-to")).toHaveCount(0);
+  });
+
+  test("OSS build keeps the managed-agent access control", async ({ page }) => {
+    await installMockBridge(page, {
+      bakedBuildEnv: BAKED_DEFAULTS,
+      managedAgents: [
+        {
+          pubkey: AGENT_PUBKEY,
+          name: AGENT_NAME,
+          status: "stopped",
+          channelNames: ["agents"],
+        },
+      ],
+    });
+
+    await openEditDialog(page);
+
+    await expect(page.getByTestId("agent-respond-to")).toBeVisible();
+  });
+
   test("edits the agent name and persists it across a dialog reopen", async ({
     page,
   }) => {

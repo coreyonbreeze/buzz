@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import {
   useAcpRuntimesQuery,
+  useAgentAccessOwnerOnlyQuery,
   useAgentConfigSurface,
   useBakedBuildEnvKeysQuery,
   usePersonasQuery,
@@ -389,6 +390,9 @@ export function AgentInstanceEditDialog({
   });
 
   const { data: bakedEnvKeys } = useBakedBuildEnvKeysQuery({ enabled: open });
+  const { data: agentAccessOwnerOnly } = useAgentAccessOwnerOnlyQuery({
+    enabled: open,
+  });
 
   // Merge global env as the base layer so credential keys satisfied via global
   // config (e.g. ANTHROPIC_API_KEY) are available to model discovery. Use
@@ -920,15 +924,16 @@ export function AgentInstanceEditDialog({
               </div>
             </div>
 
-            {/* Who can talk to this agent */}
-            <CreateAgentRespondToField
-              allowlist={respondToAllowlist}
-              disabled={updateMutation.isPending}
-              mode={respondTo}
-              onAllowlistChange={setRespondToAllowlist}
-              onModeChange={setRespondTo}
-              variant="persona"
-            />
+            {!agentAccessOwnerOnly || agent.backend.type !== "local" ? (
+              <CreateAgentRespondToField
+                allowlist={respondToAllowlist}
+                disabled={updateMutation.isPending}
+                mode={respondTo}
+                onAllowlistChange={setRespondToAllowlist}
+                onModeChange={setRespondTo}
+                variant="persona"
+              />
+            ) : null}
 
             {/* Provider (runtime) */}
             <div className="space-y-1.5">
