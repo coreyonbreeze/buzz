@@ -1029,6 +1029,18 @@ declare global {
        * so the Share toggle must stay off. Drives the toggle-on regression test.
        */
       nodeMode?: "serve" | "client" | null;
+      /** Seed host-side serving usage to exercise the "who's using my compute" indicator. */
+      servingUsage?: Partial<{
+        inflight: number;
+        peakInflight: number;
+        requestsServed: number;
+        tokensServed: number;
+        tokensPerSecond: number;
+        localAttempts: number;
+        remoteAttempts: number;
+        endpointAttempts: number;
+        peers: number;
+      }>;
     }) => void;
     __BUZZ_E2E_SEED_ACTIVE_TURNS__?: (input: {
       agentPubkey: string;
@@ -2742,12 +2754,37 @@ function resetMockSaveSubscriptions(config: E2eConfig | undefined) {
 // in a browser. They deliberately do NOT model real admission, real inference,
 // or real mesh routing — those are proven by the Rust layer-2 tests and the
 // on-hardware layer-1 example. Do not port any of this into production code.
+type MockServingUsage = {
+  inflight: number;
+  peakInflight: number;
+  requestsServed: number;
+  tokensServed: number;
+  tokensPerSecond: number;
+  localAttempts: number;
+  remoteAttempts: number;
+  endpointAttempts: number;
+  peers: number;
+};
+
+const ZERO_SERVING_USAGE: MockServingUsage = {
+  inflight: 0,
+  peakInflight: 0,
+  requestsServed: 0,
+  tokensServed: 0,
+  tokensPerSecond: 0,
+  localAttempts: 0,
+  remoteAttempts: 0,
+  endpointAttempts: 0,
+  peers: 0,
+};
+
 const mockMeshState: {
   admitted: boolean;
   models: Array<{ id: string; name: string | null }>;
   denyReason: string;
   nodeState: "off" | "running";
   nodeMode: "serve" | "client" | null;
+  servingUsage: MockServingUsage;
 } = {
   admitted: true,
   models: [
@@ -2756,6 +2793,7 @@ const mockMeshState: {
   denyReason: "not a relay member",
   nodeState: "off",
   nodeMode: null,
+  servingUsage: { ...ZERO_SERVING_USAGE },
 };
 
 function resetMockMesh() {
@@ -2766,6 +2804,7 @@ function resetMockMesh() {
   mockMeshState.denyReason = "not a relay member";
   mockMeshState.nodeState = "off";
   mockMeshState.nodeMode = null;
+  mockMeshState.servingUsage = { ...ZERO_SERVING_USAGE };
 }
 let mockPersonas: RawPersona[] = [];
 let mockTeams: RawTeam[] = [];
@@ -9076,6 +9115,11 @@ export function maybeInstallE2eTauriMocks() {
       mockMeshState.denyReason = mesh.denyReason;
     if (mesh.nodeState !== undefined) mockMeshState.nodeState = mesh.nodeState;
     if (mesh.nodeMode !== undefined) mockMeshState.nodeMode = mesh.nodeMode;
+    if (mesh.servingUsage !== undefined)
+      mockMeshState.servingUsage = {
+        ...mockMeshState.servingUsage,
+        ...mesh.servingUsage,
+      };
   };
   let seedTurnSeq = Date.now();
   window.__BUZZ_E2E_SEED_ACTIVE_TURNS__ = ({
@@ -9195,6 +9239,8 @@ export function maybeInstallE2eTauriMocks() {
         return mockMeshState.models;
       case "mesh_node_status":
         return meshNodeStatus(mockMeshState.nodeState, mockMeshState.nodeMode);
+      case "mesh_serving_usage":
+        return mockMeshState.servingUsage;
       case "mesh_start_node": {
         const req = (
           payload as { request?: { mode?: "serve" | "client" } } | null

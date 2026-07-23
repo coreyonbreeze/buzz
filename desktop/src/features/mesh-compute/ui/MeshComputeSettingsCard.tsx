@@ -29,7 +29,9 @@ import {
   useMeshDownloadProgress,
 } from "../hooks/useMeshDownloadProgress";
 import { useMeshNodeStatus } from "../hooks/useMeshNodeStatus";
+import { useMeshServingUsage } from "../hooks/useMeshServingUsage";
 import { deriveMeshShareToggle } from "../shareToggleState";
+import { deriveServingIndicator } from "../servingUsage";
 
 const MODEL_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.model.v1";
 const MAX_VRAM_DRAFT_STORAGE_KEY = "buzz.mesh-compute.share.max-vram-gb.v1";
@@ -137,6 +139,10 @@ export function MeshComputeSettingsCard() {
   // toggling off must never tear down that unrelated consume session.
   const { isSharing, isConsuming, slotOccupied } =
     deriveMeshShareToggle(status);
+  // Host-side "who is using the compute I'm sharing" — only polled while
+  // actively sharing (serve mode). Read-only; reads the node's own metrics.
+  const servingUsage = useMeshServingUsage(isSharing);
+  const servingIndicator = deriveServingIndicator(servingUsage, isSharing);
   // Any occupying runtime (serve or client, healthy or failed) locks the model
   // inputs and blocks a fresh start — stop it before reconfiguring.
   const controlsDisabled = slotOccupied || actionInFlight;
@@ -222,6 +228,25 @@ export function MeshComputeSettingsCard() {
               pendingAction={pendingAction}
               status={status}
             />
+            {servingIndicator.show ? (
+              <p
+                className={
+                  servingIndicator.hasRemoteConsumers
+                    ? "mt-0.5 text-2xs text-emerald-600 dark:text-emerald-400"
+                    : "mt-0.5 text-2xs text-muted-foreground"
+                }
+                data-testid="mesh-serving-usage"
+                title={servingIndicator.detail ?? undefined}
+              >
+                {servingIndicator.label}
+                {servingIndicator.detail ? (
+                  <span className="text-muted-foreground">
+                    {" "}
+                    · {servingIndicator.detail}
+                  </span>
+                ) : null}
+              </p>
+            ) : null}
           </div>
           <Switch
             checked={isSharing}

@@ -462,6 +462,20 @@ pub async fn mesh_node_status(state: State<'_, AppState>) -> CmdResult<mesh_llm:
     }
 }
 
+/// Read-only host-side usage: who/what is using the compute this machine is
+/// sharing. Returns a zeroed snapshot when no runtime is active. No new trust
+/// surface — it reads the serving node's own runtime metrics.
+#[tauri::command]
+pub async fn mesh_serving_usage(
+    state: State<'_, AppState>,
+) -> CmdResult<mesh_llm::MeshServingUsage> {
+    let runtime = state.mesh_llm_runtime.lock().await;
+    match runtime.as_ref() {
+        Some(runtime) => runtime.serving_usage().await.map_err(|e| e.to_string()),
+        None => Ok(mesh_llm::MeshServingUsage::default()),
+    }
+}
+
 #[tauri::command]
 pub async fn mesh_installed_models(
     state: State<'_, AppState>,
