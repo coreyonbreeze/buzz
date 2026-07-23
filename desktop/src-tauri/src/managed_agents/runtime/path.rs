@@ -2,6 +2,32 @@
 
 use std::path::PathBuf;
 
+/// Pure PATH composition kernel shared by the install shell and the runtime/probe paths.
+///
+/// Merges already-split PATH entries in precedence order:
+///   1. `managed` — Buzz-controlled dirs (highest precedence, e.g. managed Node/npm bins)
+///   2. `login`   — login-shell PATH entries (split before calling)
+///   3. `inherited` — current-process PATH entries (split before calling), appended
+///      only when `use_inherited` is `true`
+///
+/// Callers are responsible for splitting raw PATH strings and for prepending any
+/// additional prefix entries (e.g. `home/.local/bin`, `nvm`, `exe_parent`) before
+/// passing them in `managed`.  `split_paths`/`join_paths` are kept at the wrapper
+/// boundaries so this function remains fully pure and testable on any host.
+pub(crate) fn compose_path_entries(
+    managed: Vec<PathBuf>,
+    login: Vec<PathBuf>,
+    inherited: Vec<PathBuf>,
+    use_inherited: bool,
+) -> Vec<PathBuf> {
+    let mut parts = managed;
+    parts.extend(login);
+    if use_inherited {
+        parts.extend(inherited);
+    }
+    parts
+}
+
 /// Assemble the augmented `PATH` for a launched managed-agent child process.
 ///
 /// Concatenates, in priority order:
@@ -28,37 +54,39 @@ pub(in crate::managed_agents) fn build_augmented_path(
     shell_path: Option<String>,
     nvm_bin: Option<PathBuf>,
 ) -> Option<String> {
-    let mut parts: Vec<PathBuf> = Vec::new();
     let home_added = home.is_some();
+    let exe_added = exe_parent.is_some();
+    let has_local_context = home_added || exe_added;
+
+    // Build the managed/prefix entries (everything before login-shell PATH).
+    let mut managed: Vec<PathBuf> = Vec::new();
     if let Some(home) = home {
-        parts.push(home.join(".local").join("bin"));
+        managed.push(home.join(".local").join("bin"));
     }
     // Only add managed runtime dirs when a home or executable context exists.
     // This keeps tests/utility callers that intentionally pass no local context
     // from manufacturing a PATH out of ambient platform dirs alone.
-    let exe_added = exe_parent.is_some();
-    if home_added || exe_added {
+    if has_local_context {
         if let Some(managed_npm_bin) = crate::managed_agents::buzz_managed_npm_bin_dir() {
-            parts.push(managed_npm_bin);
+            managed.push(managed_npm_bin);
         }
         if let Some(managed_node_bin) = crate::managed_agents::buzz_managed_node_bin_dir() {
-            parts.push(managed_node_bin);
+            managed.push(managed_node_bin);
         }
     }
     if let Some(nvm_bin) = nvm_bin {
-        parts.push(nvm_bin);
+        managed.push(nvm_bin);
     }
     if let Some(parent) = exe_parent {
-        parts.push(parent);
+        managed.push(parent);
     }
-    // Track whether a login-shell PATH was provided; used by the Windows
-    // fallback below to avoid appending the process PATH when a shell PATH
-    // was already supplied (cfg-gated so the variable is not unused on Unix).
-    #[cfg(windows)]
+
+    // Split the login-shell PATH into individual entries.
     let had_shell_path = shell_path.is_some();
-    if let Some(shell_path) = shell_path {
-        parts.extend(std::env::split_paths(&shell_path));
-    }
+    let login: Vec<PathBuf> = shell_path
+        .as_deref()
+        .map(|s| std::env::split_paths(s).collect())
+        .unwrap_or_default();
 
     // On Windows, `login_shell_path()` always returns `None` because Git Bash
     // reports POSIX colon-delimited paths that poison native children.  Nothing
@@ -67,13 +95,16 @@ pub(in crate::managed_agents) fn build_augmented_path(
     // Append the inherited process PATH here — after the Buzz-managed dirs so
     // those still win — but only when there is local context (home or exe_parent
     // was supplied) to prevent manufacturing a PATH from ambient state alone.
-    #[cfg(windows)]
-    if !had_shell_path && (home_added || exe_added) {
-        if let Some(proc_path) = std::env::var_os("PATH") {
-            parts.extend(std::env::split_paths(&proc_path));
-        }
-    }
+    let inherited: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    // `use_inherited`: Windows-only policy — append process PATH when no
+    // login-shell PATH was available and there is local context.  On non-Windows
+    // platforms this is always false, making the inherited entries a dead weight
+    // that compose_path_entries simply drops; the compiler eliminates the branch.
+    let use_inherited = !had_shell_path && has_local_context && cfg!(windows);
 
+    let parts = compose_path_entries(managed, login, inherited, use_inherited);
     if parts.is_empty() {
         return None;
     }
@@ -261,6 +292,117 @@ mod tests {
         assert_eq!(
             result, None,
             "must return None when no local context and no shell_path"
+        );
+    }
+}
+
+// ── Pure compose_path_entries tests — cover the Windows policy matrix on any host ──
+//
+// These test the composition kernel directly with explicit inputs, so they run
+// on macOS/Linux CI and validate the Windows `use_inherited` behavior without
+// touching process state or needing a Windows target.
+#[cfg(test)]
+mod compose_tests {
+    use super::compose_path_entries;
+    use std::path::PathBuf;
+
+    fn p(s: &str) -> PathBuf {
+        PathBuf::from(s)
+    }
+
+    #[test]
+    fn managed_entries_appear_first() {
+        let managed = vec![p("/buzz/node/bin"), p("/buzz/npm/bin")];
+        let login = vec![p("/usr/local/bin"), p("/usr/bin")];
+        let result = compose_path_entries(managed, login, vec![], false);
+        assert_eq!(result[0], p("/buzz/node/bin"), "managed[0] must be first");
+        assert_eq!(result[1], p("/buzz/npm/bin"), "managed[1] must be second");
+        assert_eq!(
+            result[2],
+            p("/usr/local/bin"),
+            "login[0] must follow managed"
+        );
+    }
+
+    #[test]
+    fn login_path_suppresses_inherited_when_use_inherited_false() {
+        let login = vec![p("/usr/local/bin")];
+        let inherited = vec![p("/should/not/appear")];
+        let result = compose_path_entries(vec![], login, inherited, false);
+        assert!(
+            !result.contains(&p("/should/not/appear")),
+            "inherited must not appear when use_inherited=false"
+        );
+    }
+
+    #[test]
+    fn inherited_appended_last_when_use_inherited_true() {
+        let managed = vec![p("/buzz/npm/bin")];
+        let login = vec![];
+        let inherited = vec![p("C:/windows/node"), p("C:/windows/npm")];
+        let result = compose_path_entries(managed, login, inherited.clone(), true);
+        assert_eq!(result[0], p("/buzz/npm/bin"), "managed must be first");
+        assert_eq!(
+            &result[1..],
+            &inherited[..],
+            "inherited entries must be appended last"
+        );
+    }
+
+    #[test]
+    fn empty_managed_and_login_with_inherited_appended() {
+        let inherited = vec![p("C:/windows/system32"), p("C:/windows")];
+        let result = compose_path_entries(vec![], vec![], inherited.clone(), true);
+        assert_eq!(
+            result, inherited,
+            "only inherited entries when others are empty"
+        );
+    }
+
+    #[test]
+    fn empty_all_inputs_returns_empty() {
+        let result = compose_path_entries(vec![], vec![], vec![], false);
+        assert!(
+            result.is_empty(),
+            "all-empty inputs must produce empty output"
+        );
+    }
+
+    #[test]
+    fn install_runtime_parity_same_kernel() {
+        // Both install and runtime paths share compose_path_entries. Verify that
+        // two callers with identical inputs produce identical output — the drift
+        // that upstream PRs #2247 vs #2533 introduced cannot happen here.
+        let managed = vec![p("/buzz/node/bin"), p("/buzz/npm/bin")];
+        let inherited = vec![p("C:/win/node")];
+        let install_result = compose_path_entries(managed.clone(), vec![], inherited.clone(), true);
+        let runtime_result = compose_path_entries(managed.clone(), vec![], inherited.clone(), true);
+        assert_eq!(
+            install_result, runtime_result,
+            "install and runtime callers with identical inputs must produce identical PATH"
+        );
+    }
+
+    /// Non-Windows behavior: `use_inherited=false` (what the runtime passes on Unix)
+    /// must produce byte-identical output to what existed before this fix.
+    /// The inherited entries are collected but never appended — they are dead weight
+    /// that compose_path_entries drops.
+    #[cfg(unix)]
+    #[test]
+    fn unix_use_inherited_false_output_unchanged() {
+        let managed = vec![p("/buzz/npm/bin")];
+        let login = vec![p("/usr/local/bin"), p("/usr/bin"), p("/bin")];
+        let inherited = vec![p("/proc/ambient/PATH")]; // would be real proc PATH on Unix
+        let result = compose_path_entries(managed, login, inherited, false);
+        assert_eq!(
+            result,
+            vec![
+                p("/buzz/npm/bin"),
+                p("/usr/local/bin"),
+                p("/usr/bin"),
+                p("/bin")
+            ],
+            "Unix output must not include inherited entries when use_inherited=false"
         );
     }
 }

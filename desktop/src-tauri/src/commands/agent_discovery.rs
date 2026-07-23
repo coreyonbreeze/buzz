@@ -568,29 +568,32 @@ fn install_shell_command(command: &str) -> Result<std::process::Command, String>
         cmd.env("npm_config_cache", prefix.join("cache"));
     }
 
-    let mut path_parts = Vec::new();
-    if let Some(managed_node_bin) = crate::managed_agents::buzz_managed_node_bin_dir() {
-        path_parts.push(managed_node_bin);
-    }
-    if let Some(managed_bin) = crate::managed_agents::buzz_managed_npm_bin_dir() {
-        path_parts.push(managed_bin);
-    }
+    // Compose the PATH for the install shell using the same kernel as the
+    // runtime/probe path so the two can never drift.  managed entries first
+    // (Node/npm bins keep precedence); login-shell entries next; inherited
+    // process PATH appended last on Windows when no login-shell PATH exists
+    // (login_shell_path() always returns None on Windows — Git Bash paths are
+    // POSIX-shaped and poison native children; cmd.env("PATH", …) replaces
+    // rather than extends, so without inherited the install shell loses npm).
     let login_path = crate::managed_agents::login_shell_path();
-    if let Some(ref path) = login_path {
-        path_parts.extend(std::env::split_paths(path));
-    }
-    // On Windows, `login_shell_path()` always returns `None` because Git Bash
-    // returns POSIX-shaped colon-delimited paths that poison native children.
-    // `cmd.env("PATH", …)` replaces rather than extends, so without this the
-    // install shell loses node/npm and the install fails with
-    // `'npm' is not recognized`. Append the inherited process PATH last so
-    // Buzz-managed dirs (when present) keep precedence.
-    #[cfg(windows)]
-    if login_path.is_none() {
-        if let Some(proc_path) = std::env::var_os("PATH") {
-            path_parts.extend(std::env::split_paths(&proc_path));
-        }
-    }
+    let had_login = login_path.is_some();
+    let managed: Vec<std::path::PathBuf> = [
+        crate::managed_agents::buzz_managed_node_bin_dir(),
+        crate::managed_agents::buzz_managed_npm_bin_dir(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let login: Vec<std::path::PathBuf> = login_path
+        .as_deref()
+        .map(|p| std::env::split_paths(p).collect())
+        .unwrap_or_default();
+    let inherited: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    let use_inherited = !had_login && cfg!(windows);
+    let path_parts =
+        crate::managed_agents::compose_path_entries(managed, login, inherited, use_inherited);
     if !path_parts.is_empty() {
         if let Ok(path) = std::env::join_paths(path_parts) {
             cmd.env("PATH", path);
@@ -1333,19 +1336,19 @@ mod tests {
             .get_envs()
             .find(|(key, _)| *key == "PATH")
             .and_then(|(_, val)| val)
-            .map(|v| v.to_string_lossy().into_owned());
+            .map(|v| v.to_string_lossy().into_owned())
+            .expect("install_shell_command must always set a PATH env var on Windows");
 
-        // PATH may or may not be set (depends on whether managed dirs or
-        // sentinel contributed entries). If set, it must contain the sentinel.
-        if let Some(path) = path_value {
-            assert!(
-                path.contains(sentinel),
-                "install_shell_command PATH must include the inherited process PATH; got: {path}"
-            );
-        }
-        // If PATH is not set, the child inherits it — also acceptable, but our
-        // fix guarantees at least the sentinel is reachable. The absence of
-        // PATH env override is safe because the child inherits the process PATH.
+        // The sentinel (inherited process PATH) must appear in the composed PATH.
+        assert!(
+            path_value.contains(sentinel),
+            "install_shell_command PATH must include the inherited process PATH; got: {path_value}"
+        );
+        // The sentinel must appear LAST — managed Buzz dirs must have precedence.
+        assert!(
+            path_value.ends_with(sentinel),
+            "inherited process PATH must be appended LAST so managed dirs keep precedence; got: {path_value}"
+        );
     }
 
     // ── Phase B: per-OS install commands ──────────────────────────────────────

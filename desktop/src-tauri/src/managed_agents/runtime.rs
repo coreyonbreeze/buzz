@@ -16,6 +16,7 @@ use crate::{
 
 mod path;
 pub(in crate::managed_agents) use path::build_augmented_path;
+pub(crate) use path::compose_path_entries;
 
 mod stop;
 pub(crate) use stop::managed_agent_runtime_keys;
@@ -1607,15 +1608,25 @@ pub(crate) fn configure_runtime_cli(
         // adapter tries to spawn them (issue #2397). Skip setting
         // `CLAUDE_CODE_EXECUTABLE` for shim paths so the adapter falls back to
         // its own PATH lookup and finds the real binary instead.
-        #[cfg(windows)]
-        if let Some(ext) = cli_path.extension() {
-            let ext_lower = ext.to_string_lossy().to_lowercase();
-            if ext_lower == "cmd" || ext_lower == "bat" {
-                return;
-            }
+        if is_batch_shim(&cli_path) {
+            return;
         }
         command.env("CLAUDE_CODE_EXECUTABLE", cli_path);
     }
+}
+
+/// Return `true` when `path` is a Windows batch shim (`.cmd` or `.bat`,
+/// case-insensitive) that cannot be passed directly to `CreateProcess`.
+///
+/// Extracted as a pure function so it can be unit-tested on any host without
+/// touching the global PATH or `resolve_command` cache (issue #2397).
+pub(crate) fn is_batch_shim(path: &std::path::Path) -> bool {
+    path.extension()
+        .map(|ext| {
+            let lower = ext.to_string_lossy().to_lowercase();
+            lower == "cmd" || lower == "bat"
+        })
+        .unwrap_or(false)
 }
 
 /// Spawn an agent process without holding any locks on records or runtimes.
