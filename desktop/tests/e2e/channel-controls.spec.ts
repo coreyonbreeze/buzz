@@ -262,4 +262,43 @@ test.describe("channel controls", () => {
     );
     await settle(page);
   });
+
+  test("09 — cancel discards unsaved channel drafts", async ({ page }) => {
+    await installMockBridge(page);
+    await openManagementSheet(page);
+    await openEditDialog(page);
+
+    await page.getByTestId("channel-management-name").fill("discarded-name");
+    await page
+      .getByRole("textbox", { name: "Description" })
+      .fill("This description should be discarded");
+    await selectTemporaryChannelType(page);
+    await expect(
+      page.getByTestId("channel-management-save-changes"),
+    ).toBeEnabled();
+
+    await page.getByRole("button", { name: "Cancel" }).click();
+    await expect(
+      page.getByRole("dialog", {
+        name: /Edit (?:public|private) channel/,
+      }),
+    ).toHaveCount(0);
+
+    await openEditDialog(page);
+    await expect(page.getByTestId("channel-management-name")).toHaveValue(
+      "general",
+    );
+    await expect(
+      page.getByRole("textbox", { name: "Description" }),
+    ).toHaveValue("General discussion for everyone");
+    await expect(
+      page.getByTestId("channel-management-channel-type"),
+    ).toContainText("Ongoing");
+    await expect(
+      page.getByTestId("channel-management-ephemeral-settings"),
+    ).toHaveCount(0);
+    await expect(
+      page.getByTestId("channel-management-save-changes"),
+    ).toBeDisabled();
+  });
 });

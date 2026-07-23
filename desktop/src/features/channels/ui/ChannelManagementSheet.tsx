@@ -204,12 +204,6 @@ export function ChannelManagementSheet({
     setActiveView("summary");
   }, [detail, open]);
 
-  React.useEffect(() => {
-    if (!isEditDialogOpen) {
-      setHasUserEditedChannelDraft(false);
-    }
-  }, [isEditDialogOpen]);
-
   if (!channel) {
     return null;
   }
@@ -268,6 +262,18 @@ export function ChannelManagementSheet({
     : undefined;
   const canOpenCanvas = hasCanvas || canEditNarrative;
 
+  function handleEditDialogOpenChange(next: boolean) {
+    if (!next) {
+      setNameDraft(resolvedChannel.name);
+      setDescriptionDraft(resolvedChannel.description);
+      setIsEphemeralDraft(currentTtlSeconds !== null);
+      setTtlSecondsDraft(currentTtlSeconds ?? DEFAULT_EPHEMERAL_TTL_SECONDS);
+      setHasUserEditedChannelDraft(false);
+    }
+
+    setIsEditDialogOpen(next);
+  }
+
   async function handleSaveChannelEdits() {
     try {
       if (nameDirty || descriptionDirty || lifecycleDirty) {
@@ -283,6 +289,7 @@ export function ChannelManagementSheet({
         });
       }
 
+      setHasUserEditedChannelDraft(false);
       setIsEditDialogOpen(false);
     } catch {
       // React Query stores mutation errors; keep the dialog open and render them.
@@ -417,7 +424,10 @@ export function ChannelManagementSheet({
       )}
 
       {canManageChannel ? (
-        <Dialog onOpenChange={setIsEditDialogOpen} open={isEditDialogOpen}>
+        <Dialog
+          onOpenChange={handleEditDialogOpenChange}
+          open={isEditDialogOpen}
+        >
           <DialogContent
             aria-describedby={undefined}
             className="max-w-lg overflow-hidden p-0"
@@ -528,7 +538,7 @@ export function ChannelManagementSheet({
 
               <div className="flex shrink-0 justify-end gap-2 border-t border-border/60 px-6 py-4">
                 <Button
-                  onClick={() => setIsEditDialogOpen(false)}
+                  onClick={() => handleEditDialogOpenChange(false)}
                   size="sm"
                   type="button"
                   variant="outline"
